@@ -107,7 +107,7 @@ onMounted(load)
         <div class="section-band__body"><VChart class="chart" :option="chartOption" autoresize /></div>
       </section>
       <section class="section-band">
-        <div class="section-band__head"><div><h2>全部 Telegram 用户</h2><p>未绑定 Key 单独聚合且不计费</p></div></div>
+        <div class="section-band__head"><div><h2>Telegram 用户与未绑定 Key</h2><p>已绑定 Key 按 Telegram 用户聚合；未绑定 Key 分别以别名或掩码显示</p></div></div>
         <div class="section-band__body section-band__body--flush">
           <v-data-table :headers="headers" :items="rows" :items-per-page="50" hover>
             <template #item.name="{ item }">

@@ -31,7 +31,7 @@ const metrics = computed(() => [
   { label: 'Tokens', value: compactNumber(summary.value.token_count), hint: number(summary.value.token_count), mono: true },
   { label: 'RPM', value: Number(summary.value.rpm || 0).toFixed(2), mono: true },
   { label: 'TPM', value: compactNumber(summary.value.tpm), mono: true },
-  { label: '上游成本', value: summary.value.cost_available ? money(Number(summary.value.total_cost || 0).toFixed(4)) : '-', mono: true },
+  { label: '本地等效成本', value: summary.value.cost_available ? money(summary.value.total_cost) : '-', mono: true },
   { label: '成功率', value: percent(serviceHealth.value.success_rate, 2), mono: true },
 ])
 
@@ -63,10 +63,18 @@ const responseOption = computed(() => {
 })
 
 function healthTone(item) {
-  if (item.rate < 0) return ''
-  if (item.rate >= 99) return 'health-cell--ok'
-  if (item.rate >= 90) return 'health-cell--warn'
+  const rate = healthRate(item)
+  if (rate < 0) return ''
+  if (rate >= 99) return 'health-cell--ok'
+  if (rate >= 90) return 'health-cell--warn'
   return 'health-cell--error'
+}
+
+function healthRate(item) {
+  const raw = Number(item?.rate ?? -1)
+  if (raw < 0) return raw
+  if (serviceHealth.value.source !== 'billing-panel' && raw <= 1) return raw * 100
+  return raw
 }
 
 async function load() {
@@ -86,7 +94,7 @@ onMounted(load)
 
 <template>
   <div class="content-shell">
-    <PageHeader title="全站状态" subtitle="CPA、Keeper、同步账本与上游服务健康">
+    <PageHeader title="全站状态" subtitle="请求、Token、费用与性能均由本面板计算；Keeper 仅提供运行和额度状态">
       <template #actions>
         <v-select v-model="filters.window" :items="['15m', '30m', '45m', '60m']" label="实时窗口" style="width: 130px" />
         <v-tooltip text="刷新全站状态">
@@ -110,7 +118,10 @@ onMounted(load)
       <v-alert v-if="data?.degraded" type="warning" variant="tonal" border="start" class="mb-4">
         部分状态源不可用：{{ data.errors.join('、') }}
       </v-alert>
-      <MetricRail v-if="data?.keeper?.available" :items="metrics" :columns="6" />
+      <v-alert v-if="summary.unpriced_events" type="warning" variant="tonal" border="start" class="mb-4">
+        当前范围有 {{ number(summary.unpriced_events) }} 条未计价请求，费用仅包含已匹配价格的事件。
+      </v-alert>
+      <MetricRail :items="metrics" :columns="6" />
 
       <section class="section-band">
         <div class="section-band__head">
@@ -138,7 +149,7 @@ onMounted(load)
         </div>
       </section>
 
-      <div v-if="data?.keeper?.available" class="two-column mt-4">
+      <div class="two-column mt-4">
         <section class="section-band">
           <div class="section-band__head"><div><h2>Token 速度</h2><p>{{ realtime.window || filters.window }} 实时窗口</p></div></div>
           <div class="section-band__body"><VChart class="chart" :option="tokenOption" autoresize /></div>
@@ -149,27 +160,27 @@ onMounted(load)
         </section>
       </div>
 
-      <section v-if="data?.keeper?.available" class="section-band">
+      <section class="section-band">
         <div class="section-band__head">
           <div><h2>服务健康轨道</h2><p>{{ number(serviceHealth.total_success) }} 成功 · {{ number(serviceHealth.total_failure) }} 失败</p></div>
           <strong class="mono">{{ percent(serviceHealth.success_rate, 3) }}</strong>
         </div>
         <div class="section-band__body">
           <div class="health-grid">
-            <v-tooltip v-for="(item, index) in serviceHealth.block_details || []" :key="index" :text="`${dateTime(item.start_time)} · 成功 ${item.success} · 失败 ${item.failure}`">
+            <v-tooltip v-for="(item, index) in serviceHealth.block_details || []" :key="index" content-class="health-tooltip" :text="`${dateTime(item.start_time)} · 成功 ${item.success} · 失败 ${item.failure} · 成功率 ${healthRate(item) < 0 ? '-' : `${healthRate(item).toFixed(2)}%`}`">
               <template #activator="{ props }"><span v-bind="props" class="health-cell" :class="healthTone(item)" /></template>
             </v-tooltip>
           </div>
         </div>
       </section>
 
-      <div v-if="data?.keeper?.available" class="two-column mt-4">
+      <div class="two-column mt-4">
         <section class="section-band">
           <div class="section-band__head"><div><h2>当前模型</h2><p>实时窗口内聚合</p></div></div>
           <div class="section-band__body section-band__body--flush">
             <v-table density="compact">
               <thead><tr><th>模型</th><th class="text-right">请求</th><th class="text-right">Tokens</th><th class="text-right">成本</th></tr></thead>
-              <tbody><tr v-for="item in realtime.current_usage?.models || []" :key="item.label"><td>{{ item.label }}</td><td class="text-right mono">{{ number(item.requests) }}</td><td class="text-right mono">{{ number(item.tokens) }}</td><td class="text-right mono">{{ money(Number(item.cost || 0).toFixed(4)) }}</td></tr></tbody>
+              <tbody><tr v-for="item in realtime.current_usage?.models || []" :key="item.label"><td>{{ item.label }}</td><td class="text-right mono">{{ number(item.requests) }}</td><td class="text-right mono">{{ number(item.tokens) }}</td><td class="text-right mono">{{ money(item.cost) }}</td></tr></tbody>
             </v-table>
           </div>
         </section>

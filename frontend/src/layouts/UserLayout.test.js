@@ -50,4 +50,29 @@ describe('UserLayout', () => {
     expect(drawer.props('permanent')).toBe(true)
     expect(wrapper.find('.v-navigation-drawer--active').exists()).toBe(true)
   })
+
+  it('uses exact matching for the dashboard navigation item', async () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1280 })
+    const View = { template: '<div />' }
+    const router = createRouter({
+      history: createMemoryHistory(),
+      routes: ['/', '/requests', '/status', '/accounts', '/rankings', '/pricing', '/keys', '/admin/login']
+        .map((path) => ({ path, component: View })),
+    })
+    await router.push('/status')
+    await router.isReady()
+
+    const wrapper = mount(UserLayout, {
+      global: {
+        plugins: [router, vuetify],
+        stubs: { SystemPulse: true, RouterView: true },
+      },
+    })
+    await flushPromises()
+
+    const dashboard = wrapper.findAllComponents({ name: 'VListItem' })
+      .find((item) => item.props('to') === '/')
+    expect(dashboard.props('exact')).toBe(true)
+    expect(dashboard.classes()).not.toContain('v-list-item--active')
+  })
 })

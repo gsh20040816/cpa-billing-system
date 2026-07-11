@@ -69,7 +69,7 @@ onMounted(loadSession)
       </div>
       <v-divider />
       <v-list nav density="compact" class="pa-2">
-        <v-list-item v-for="item in nav" :key="item.to" :to="item.to" color="primary" rounded="sm">
+        <v-list-item v-for="item in nav" :key="item.to" :to="item.to" :exact="item.to === '/'" color="primary" rounded="sm">
           <template #prepend><component :is="item.icon" :size="19" /></template>
           <v-list-item-title>{{ item.title }}</v-list-item-title>
         </v-list-item>
@@ -113,7 +113,7 @@ onMounted(loadSession)
     </v-main>
 
     <v-bottom-navigation v-if="!mdAndUp" grow color="primary" height="64">
-      <v-btn v-for="item in bottomNav" :key="item.to" :to="item.to" stacked>
+      <v-btn v-for="item in bottomNav" :key="item.to" :to="item.to" :exact="item.to === '/'" stacked>
         <component :is="item.icon" :size="20" />
         <span>{{ item.title.replace('API Key', 'Key') }}</span>
       </v-btn>

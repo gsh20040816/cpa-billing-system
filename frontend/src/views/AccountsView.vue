@@ -105,7 +105,7 @@ onBeforeUnmount(() => timers.forEach((id) => window.clearTimeout(id)))
 
 <template>
   <div class="content-shell">
-    <PageHeader title="上游账号" subtitle="账号健康、5h / Weekly 限额与使用窗口">
+    <PageHeader title="上游账号" subtitle="额度百分比来自 Keeper；请求、Token 与费用由本面板按 CPAMP 事件计算">
       <template #actions>
         <v-btn color="primary" :loading="refreshingAll" @click="refreshAccounts()">
           <RefreshCw :size="17" class="mr-2" />刷新全部额度
@@ -144,8 +144,12 @@ onBeforeUnmount(() => timers.forEach((id) => window.clearTimeout(id)))
               <div><span>请求</span><strong class="mono">{{ number(account.usage.requests) }}</strong></div>
               <div><span>Tokens</span><strong class="mono">{{ number(account.usage.total_tokens) }}</strong></div>
               <div><span>成功率</span><strong class="mono">{{ percent(account.usage.success_rate, 2) }}</strong></div>
+              <div><span>本地等效成本</span><strong class="mono">{{ money(account.usage.cost) }}</strong></div>
               <div><span>最后使用</span><strong>{{ dateTime(account.usage.last_used_at) }}</strong></div>
             </div>
+            <v-alert v-if="account.usage.unpriced" type="warning" variant="tonal" density="compact" class="mt-3">
+              仍有 {{ number(account.usage.unpriced) }} 条请求未匹配价格，当前费用为已计价部分。
+            </v-alert>
             <div v-if="account.quota.length" class="mt-3">
               <div v-for="quota in account.quota" :key="quota.key" class="quota-row">
                 <div>
@@ -158,7 +162,9 @@ onBeforeUnmount(() => timers.forEach((id) => window.clearTimeout(id)))
                 </div>
                 <div class="quota-row__meta">
                   <div>重置 {{ dateTime(quota.reset_at) }}</div>
-                  <div v-if="quota.window_usage_tokens">{{ number(quota.window_usage_tokens) }} tokens · {{ money(Number(quota.window_usage_cost || 0).toFixed(4)) }}</div>
+                  <div>{{ number(quota.window_usage_requests) }} 请求 · {{ number(quota.window_usage_tokens) }} tokens</div>
+                  <div>{{ money(quota.window_usage_cost) }} 本地等效成本</div>
+                  <div v-if="quota.window_unpriced" class="data-error">{{ number(quota.window_unpriced) }} 条未计价</div>
                 </div>
               </div>
             </div>
@@ -181,11 +187,12 @@ onBeforeUnmount(() => timers.forEach((id) => window.clearTimeout(id)))
 .account-card__head { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 14px 16px; }
 .account-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: .98rem; font-weight: 700; }
 .min-w-0 { min-width: 0; }
-.account-usage { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); border: 1px solid #e1e7e4; }
+.account-usage { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); border: 1px solid #e1e7e4; }
 .account-usage > div { min-width: 0; padding: 12px; border-right: 1px solid #e1e7e4; }
 .account-usage > div:last-child { border-right: 0; }
 .account-usage span { display: block; color: #68716e; font-size: .72rem; }
 .account-usage strong { display: block; margin-top: 5px; overflow-wrap: anywhere; }
 .account-foot { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-top: 12px; color: #717a77; font-size: .72rem; }
-@media (max-width: 760px) { .account-card__head { align-items: start; } .account-usage { grid-template-columns: repeat(2, minmax(0, 1fr)); } .account-usage > div:nth-child(2) { border-right: 0; } }
+@media (max-width: 1000px) { .account-usage { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+@media (max-width: 760px) { .account-card__head { align-items: start; } .account-usage { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 </style>

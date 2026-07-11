@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ArrowUpRight, RefreshCw } from '@lucide/vue'
 import { api } from '../api'
@@ -7,7 +7,7 @@ import { VChart } from '../charts'
 import MetricRail from '../components/MetricRail.vue'
 import LoadingState from '../components/LoadingState.vue'
 import PageHeader from '../components/PageHeader.vue'
-import { money, number } from '../lib/format'
+import { dateTime, money, number } from '../lib/format'
 import { toQuery } from '../lib/query'
 
 const router = useRouter()
@@ -15,6 +15,7 @@ const loading = ref(true)
 const error = ref('')
 const data = ref(null)
 const cycle = ref('')
+let refreshTimer = null
 
 const headers = [
   { title: '#', key: 'rank', width: 58, sortable: false },
@@ -35,8 +36,9 @@ const metrics = computed(() => {
     { label: 'Tokens', value: number(totals.tokens), mono: true },
     { label: '实际等效成本', value: money(totals.actual), mono: true },
     { label: '梯度计费用量', value: money(totals.billed), mono: true },
-    { label: '分摊总额', value: money(totals.amount, '¥'), mono: true },
-    { label: '用户与未绑定项', value: number(data.value?.rows?.length), mono: true },
+    { label: '资源池固定成本', value: money(totals.fixed_cost, '¥'), mono: true },
+    { label: '按量 Key 应付', value: money(totals.metered_amount, '¥'), mono: true },
+    { label: '成员分摊', value: money(totals.member_amount, '¥'), mono: true },
   ]
 })
 
@@ -52,8 +54,8 @@ const chartOption = computed(() => {
   }
 })
 
-async function load() {
-  loading.value = true
+async function load(silent = false) {
+  if (!silent) loading.value = true
   error.value = ''
   try {
     data.value = await api(`/api/dashboard${toQuery({ cycle: cycle.value })}`)
@@ -61,7 +63,7 @@ async function load() {
   } catch (exc) {
     error.value = exc.message
   } finally {
-    loading.value = false
+    if (!silent) loading.value = false
   }
 }
 
@@ -73,6 +75,12 @@ watch(cycle, (value, previous) => {
   if (previous && value !== previous) load()
 })
 onMounted(load)
+onMounted(() => {
+  refreshTimer = window.setInterval(() => {
+    if (!document.hidden) load(true)
+  }, 15000)
+})
+onBeforeUnmount(() => window.clearInterval(refreshTimer))
 </script>
 
 <template>
@@ -82,6 +90,9 @@ onMounted(load)
       :subtitle="data?.cycle ? `${data.cycle.start} 至 ${data.cycle.end}` : '尚未创建账期'"
     >
       <template #actions>
+        <v-chip v-if="data?.cycle?.estimate_generated_at" variant="tonal" color="secondary">
+          实时更新 {{ dateTime(data.cycle.estimate_generated_at) }}
+        </v-chip>
         <v-select
           v-if="data?.cycles?.length"
           v-model="cycle"
@@ -107,7 +118,59 @@ onMounted(load)
       <v-alert v-if="data?.cycle?.waiver" type="warning" variant="tonal" border="start" class="mb-4">
         <strong>数据质量说明：</strong>{{ data.cycle.waiver }}
       </v-alert>
+      <v-alert v-if="data?.cycle?.unpriced_events" type="warning" variant="tonal" border="start" class="mb-4">
+        当前账期仍有 {{ number(data.cycle.unpriced_events) }} 条未计价请求，以下金额是已计价部分的实时估算，暂不能关闭账期。
+      </v-alert>
       <MetricRail :items="metrics" :columns="6" />
+
+      <section class="section-band">
+        <div class="section-band__head">
+          <div><h2>资源池结算进度</h2><p>固定成本先扣除未绑定按量 Key，再分摊给 Telegram 用户</p></div>
+          <strong class="mono">合计 {{ money(data?.totals?.amount, '¥') }}</strong>
+        </div>
+        <div class="section-band__body section-band__body--flush">
+          <v-table density="compact">
+            <thead><tr><th>资源池</th><th class="text-right">固定成本</th><th class="text-right">按量抵扣</th><th class="text-right">成员剩余成本</th><th class="text-right">成员已分摊</th><th class="text-right">超额按量收入</th></tr></thead>
+            <tbody>
+              <tr v-for="pool in data?.pool_totals || []" :key="pool.pool_id">
+                <td>{{ pool.pool }}</td>
+                <td class="text-right mono">{{ money(pool.fixed_cost, '¥') }}</td>
+                <td class="text-right mono">{{ money(pool.metered_amount, '¥') }}</td>
+                <td class="text-right mono">{{ money(pool.residual_cost, '¥') }}</td>
+                <td class="text-right mono">{{ money(pool.member_amount, '¥') }}</td>
+                <td class="text-right mono">{{ money((Number(pool.surplus_cents || 0) / 100).toFixed(2), '¥') }}</td>
+              </tr>
+              <tr v-if="!data?.pool_totals?.length"><td colspan="6" class="text-center data-muted pa-5">当前账期尚未配置资源池成本</td></tr>
+            </tbody>
+          </v-table>
+        </div>
+      </section>
+
+      <section v-if="data?.metered_keys?.length" class="section-band">
+        <div class="section-band__head"><div><h2>未绑定按量 Key</h2><p>金额 = 本地等效成本 USD × 管理员设置倍率</p></div></div>
+        <div class="section-band__body section-band__body--flush">
+          <v-data-table
+            :headers="[
+              { title: 'API Key', key: 'label' },
+              { title: '资源池', key: 'pool' },
+              { title: '请求', key: 'requests', align: 'end' },
+              { title: 'Tokens', key: 'tokens', align: 'end' },
+              { title: '等效成本', key: 'actual', align: 'end' },
+              { title: '倍率', key: 'multiplier', align: 'end' },
+              { title: '预估付费', key: 'amount', align: 'end' },
+            ]"
+            :items="data.metered_keys.map(item => ({ ...item, label: item.name || item.masked }))"
+            :items-per-page="25"
+          >
+            <template #item.label="{ item }"><span class="mono">{{ item.label }}</span></template>
+            <template #item.requests="{ item }"><span class="mono">{{ number(item.requests) }}</span></template>
+            <template #item.tokens="{ item }"><span class="mono">{{ number(item.tokens) }}</span></template>
+            <template #item.actual="{ item }"><span class="mono">{{ money(item.actual) }}</span></template>
+            <template #item.multiplier="{ item }"><span class="mono">{{ item.multiplier }}x</span></template>
+            <template #item.amount="{ item }"><span class="mono">{{ money(item.amount, '¥') }}</span></template>
+          </v-data-table>
+        </div>
+      </section>
 
       <section class="section-band">
         <div class="section-band__head">

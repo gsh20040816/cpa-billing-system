@@ -76,6 +76,7 @@ button, input, textarea, select { letter-spacing: 0; }
 .health-cell--ok { background: #4a9b84; }
 .health-cell--warn { background: #d49847; }
 .health-cell--error { background: #c6534c; }
+.health-tooltip { background: #202427 !important; color: #f7faf9 !important; border: 1px solid #3f4745; }
 
 .login-surface { min-height: 100vh; display: grid; place-items: center; padding: 28px; background: #eef3f1; }
 .login-tool { width: min(470px, 100%); background: #fff; border: 1px solid #cfd8d4; border-radius: 6px; box-shadow: 0 20px 60px rgba(32, 36, 39, 0.12); overflow: hidden; }

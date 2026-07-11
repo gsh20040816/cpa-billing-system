@@ -6,7 +6,7 @@ import { api } from '../api'
 import LoadingState from '../components/LoadingState.vue'
 import MetricRail from '../components/MetricRail.vue'
 import PageHeader from '../components/PageHeader.vue'
-import { money, number } from '../lib/format'
+import { dateTime, money, number } from '../lib/format'
 import { toQuery } from '../lib/query'
 
 const route = useRoute()
@@ -58,6 +58,9 @@ onMounted(load)
 
     <LoadingState :loading="loading" :error="error" :empty="!data?.cycle" empty-text="该用户当前没有账期数据" @retry="load">
       <MetricRail :items="metrics" :columns="6" />
+      <v-alert v-if="data?.statement?.live" type="info" variant="tonal" density="compact" class="mb-4">
+        当前为开放账期实时估算，更新于 {{ dateTime(data.statement.generated_at) }}。
+      </v-alert>
       <div v-if="data?.statement" class="metric-rail" style="--metric-columns: 3">
         <div class="metric-rail__item"><div class="metric-rail__label">实际等效</div><div class="metric-rail__value mono">{{ money(data.statement.actual) }}</div></div>
         <div class="metric-rail__item"><div class="metric-rail__label">梯度计费</div><div class="metric-rail__value mono">{{ money(data.statement.billed) }}</div></div>

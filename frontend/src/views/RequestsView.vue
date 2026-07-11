@@ -19,7 +19,7 @@ const detail = ref(null)
 const defaults = {
   start: '', end: '', model: [], tier: '', provider: '', status: 'all', key_id: '', failure_code: '',
   min_tokens: '', max_tokens: '', min_cost: '', max_cost: '', min_latency: '', max_latency: '',
-  min_ttft: '', max_ttft: '', long_context: '', q: '', sort: 'time_desc', page: 1, page_size: 50,
+  min_ttft: '', max_ttft: '', min_tps: '', max_tps: '', long_context: '', q: '', sort: 'time_desc', page: 1, page_size: 50,
 }
 const filters = reactive({ ...defaults })
 
@@ -37,6 +37,7 @@ const sortItems = [
   { title: '成本从高到低', value: 'cost_desc' },
   { title: '延迟从高到低', value: 'latency_desc' },
   { title: 'TTFT 从高到低', value: 'ttft_desc' },
+  { title: '真实 TPS 从高到低', value: 'tps_desc' },
 ]
 const longContextItems = [
   { title: '全部上下文', value: '' },
@@ -48,7 +49,9 @@ const headers = [
   { title: 'Key', key: 'key', minWidth: 145 },
   { title: '模型', key: 'model', minWidth: 150 },
   { title: 'Tier', key: 'service_tier', width: 92 },
-  { title: 'Tokens', key: 'tokens', align: 'end' },
+  { title: 'Input', key: 'input_tokens', align: 'end' },
+  { title: 'Output', key: 'output_tokens', align: 'end' },
+  { title: '真实 TPS', key: 'tps', align: 'end' },
   { title: 'TTFT', key: 'ttft_ms', align: 'end' },
   { title: '延迟', key: 'latency_ms', align: 'end' },
   { title: '成本', key: 'cost', align: 'end' },
@@ -60,7 +63,8 @@ const metrics = computed(() => {
   const summary = data.value?.summary || {}
   return [
     { label: '筛选后请求', value: number(summary.requests), mono: true },
-    { label: 'Tokens', value: number(summary.tokens), mono: true },
+    { label: 'Input Tokens', value: number(summary.input_tokens), mono: true },
+    { label: 'Output Tokens', value: number(summary.output_tokens), mono: true },
     { label: '等效成本', value: money(summary.cost), mono: true },
     { label: '失败', value: number(summary.failed), mono: true },
     { label: '未计价', value: number(summary.unpriced), mono: true },
@@ -155,6 +159,8 @@ onMounted(async () => {
             <v-text-field v-model="filters.max_ttft" label="最大 TTFT ms" type="number" min="0" />
             <v-text-field v-model="filters.min_latency" label="最小延迟 ms" type="number" min="0" />
             <v-text-field v-model="filters.max_latency" label="最大延迟 ms" type="number" min="0" />
+            <v-text-field v-model="filters.min_tps" label="最小真实 TPS" type="number" min="0" step="0.01" />
+            <v-text-field v-model="filters.max_tps" label="最大真实 TPS" type="number" min="0" step="0.01" />
             <v-select v-model="filters.sort" :items="sortItems" label="排序" />
           </div>
           <div class="d-flex align-center justify-space-between ga-4 flex-wrap mt-4">
@@ -170,7 +176,7 @@ onMounted(async () => {
       </section>
     </v-expand-transition>
 
-    <MetricRail v-if="data" :items="metrics" :columns="5" />
+    <MetricRail v-if="data" :items="metrics" :columns="6" />
 
     <section class="section-band">
       <div class="section-band__head">
@@ -187,7 +193,9 @@ onMounted(async () => {
               <div v-if="item.requested_model && item.requested_model !== item.resolved_model" class="data-muted text-caption">请求 {{ item.requested_model }}</div>
             </template>
             <template #item.service_tier="{ item }"><v-chip variant="tonal" color="secondary">{{ item.service_tier }}</v-chip></template>
-            <template #item.tokens="{ item }"><span class="mono">{{ number(item.tokens.total) }}</span></template>
+            <template #item.input_tokens="{ item }"><span class="mono">{{ number(item.tokens.input) }}</span></template>
+            <template #item.output_tokens="{ item }"><span class="mono">{{ number(item.tokens.output) }}</span></template>
+            <template #item.tps="{ item }"><span class="mono">{{ item.tps === null ? '-' : Number(item.tps).toFixed(2) }}</span></template>
             <template #item.ttft_ms="{ item }"><span class="mono">{{ duration(item.ttft_ms) }}</span></template>
             <template #item.latency_ms="{ item }"><span class="mono">{{ duration(item.latency_ms) }}</span></template>
             <template #item.cost="{ item }"><span class="mono">{{ item.cost === null ? '未计价' : money(item.cost) }}</span></template>
@@ -215,11 +223,14 @@ onMounted(async () => {
             <div><span>Tier</span><strong>{{ detail.service_tier }}</strong></div>
             <div><span>Input</span><strong class="mono">{{ number(detail.tokens.input) }}</strong></div>
             <div><span>Cached</span><strong class="mono">{{ number(detail.tokens.cached) }}</strong></div>
+            <div><span>Cache read</span><strong class="mono">{{ number(detail.tokens.cache_read) }}</strong></div>
             <div><span>Cache creation</span><strong class="mono">{{ number(detail.tokens.cache_creation) }}</strong></div>
             <div><span>Output</span><strong class="mono">{{ number(detail.tokens.output) }}</strong></div>
             <div><span>Reasoning</span><strong class="mono">{{ number(detail.tokens.reasoning) }}</strong></div>
             <div><span>TTFT</span><strong class="mono">{{ duration(detail.ttft_ms) }}</strong></div>
             <div><span>延迟</span><strong class="mono">{{ duration(detail.latency_ms) }}</strong></div>
+            <div><span>生成阶段</span><strong class="mono">{{ duration(detail.generation_ms) }}</strong></div>
+            <div><span>真实 TPS</span><strong class="mono">{{ detail.tps === null ? '-' : Number(detail.tps).toFixed(2) }}</strong></div>
             <div><span>等效成本</span><strong class="mono">{{ detail.cost === null ? '未计价' : money(detail.cost) }}</strong></div>
           </div>
         </v-card-text>
