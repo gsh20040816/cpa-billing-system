@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, provide, ref } from 'vue'
+import { computed, onMounted, provide, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useDisplay } from 'vuetify'
 import {
@@ -30,6 +30,10 @@ const bottomNav = nav.filter((item) => ['/', '/requests', '/status', '/keys'].in
 const pageTitle = computed(() => route.meta.title || 'CPA Billing')
 
 provide('userSession', session)
+
+watch(mdAndUp, (desktop) => {
+  drawer.value = desktop
+}, { immediate: true })
 
 async function loadSession() {
   try {
