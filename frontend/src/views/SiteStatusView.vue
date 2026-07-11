@@ -1,11 +1,12 @@
 <script setup>
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { RefreshCw } from '@lucide/vue'
 import { api } from '../api'
 import { VChart } from '../charts'
 import LoadingState from '../components/LoadingState.vue'
 import MetricRail from '../components/MetricRail.vue'
 import PageHeader from '../components/PageHeader.vue'
+import { createDebouncedTask } from '../lib/debounce'
 import { compactNumber, dateTime, duration, money, number, percent } from '../lib/format'
 import { toQuery } from '../lib/query'
 
@@ -13,6 +14,7 @@ const loading = ref(true)
 const error = ref('')
 const data = ref(null)
 const filters = reactive({ range: '24h', window: '60m', start: '', end: '' })
+let requestSequence = 0
 const ranges = [
   { title: '今天', value: 'today' },
   { title: '昨天', value: 'yesterday' },
@@ -77,19 +79,39 @@ function healthRate(item) {
   return raw
 }
 
-async function load() {
-  loading.value = true
-  error.value = ''
-  try {
-    data.value = await api(`/api/site/status${toQuery(filters)}`)
-  } catch (exc) {
-    error.value = exc.message
-  } finally {
-    loading.value = false
+function statusParams() {
+  return {
+    range: filters.range,
+    window: filters.window,
+    start: filters.range === 'custom' ? filters.start : null,
+    end: filters.range === 'custom' ? filters.end : null,
   }
 }
 
+async function load() {
+  if (filters.range === 'custom' && (!filters.start || !filters.end)) return
+  const sequence = ++requestSequence
+  loading.value = true
+  error.value = ''
+  try {
+    const result = await api(`/api/site/status${toQuery(statusParams())}`)
+    if (sequence === requestSequence) data.value = result
+  } catch (exc) {
+    if (sequence === requestSequence) error.value = exc.message
+  } finally {
+    if (sequence === requestSequence) loading.value = false
+  }
+}
+
+const autoReload = createDebouncedTask(load, 180)
+
+watch(
+  () => [filters.range, filters.window, filters.start, filters.end],
+  () => autoReload.schedule(),
+)
+
 onMounted(load)
+onBeforeUnmount(autoReload.cancel)
 </script>
 
 <template>
@@ -98,7 +120,7 @@ onMounted(load)
       <template #actions>
         <v-select v-model="filters.window" :items="['15m', '30m', '45m', '60m']" label="实时窗口" style="width: 130px" />
         <v-tooltip text="刷新全站状态">
-          <template #activator="{ props }"><v-btn v-bind="props" icon variant="outlined" :loading="loading" @click="load"><RefreshCw :size="18" /></v-btn></template>
+          <template #activator="{ props }"><v-btn v-bind="props" icon variant="outlined" :loading="loading" @click="autoReload.run()"><RefreshCw :size="18" /></v-btn></template>
         </v-tooltip>
       </template>
     </PageHeader>
@@ -111,10 +133,10 @@ onMounted(load)
         <v-text-field v-model="filters.start" type="date" label="开始" style="max-width: 180px" />
         <v-text-field v-model="filters.end" type="date" label="结束" style="max-width: 180px" />
       </template>
-      <v-btn color="primary" size="small" @click="load">应用</v-btn>
+      <v-progress-circular v-if="loading && data" indeterminate color="primary" size="20" width="2" aria-label="正在更新状态" />
     </div>
 
-    <LoadingState :loading="loading" :error="error" :empty="!data" @retry="load">
+    <LoadingState :loading="loading && !data" :error="error" :empty="!data" @retry="autoReload.run()">
       <v-alert v-if="data?.degraded" type="warning" variant="tonal" border="start" class="mb-4">
         部分状态源不可用：{{ data.errors.join('、') }}
       </v-alert>

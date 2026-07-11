@@ -215,7 +215,7 @@ def test_admin_billing_rule_and_key_profile_endpoints(settings, monkeypatch) -> 
     profile = client.patch(
         f"/api/admin/keys/{key_id}/billing-profile",
         headers=headers,
-        json={"name": "external", "multiplier": "7", "reason": "metered customer"},
+        json={"name": "external", "multiplier": "7"},
     )
     assert profile.status_code == 200
     assert profile.json()["multiplier"] == "7"

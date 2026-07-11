@@ -141,10 +141,10 @@ onBeforeUnmount(() => timers.forEach((id) => window.clearTimeout(id)))
           <v-divider />
           <v-card-text>
             <div class="account-usage">
-              <div><span>请求</span><strong class="mono">{{ number(account.usage.requests) }}</strong></div>
-              <div><span>Tokens</span><strong class="mono">{{ number(account.usage.total_tokens) }}</strong></div>
-              <div><span>成功率</span><strong class="mono">{{ percent(account.usage.success_rate, 2) }}</strong></div>
-              <div><span>本地等效成本</span><strong class="mono">{{ money(account.usage.cost) }}</strong></div>
+              <div><span>历史请求</span><strong class="mono">{{ number(account.usage.requests) }}</strong></div>
+              <div><span>历史 Tokens</span><strong class="mono">{{ number(account.usage.total_tokens) }}</strong></div>
+              <div><span>历史成功率</span><strong class="mono">{{ percent(account.usage.success_rate, 2) }}</strong></div>
+              <div><span>历史等效成本</span><strong class="mono">{{ money(account.usage.cost) }}</strong></div>
               <div><span>最后使用</span><strong>{{ dateTime(account.usage.last_used_at) }}</strong></div>
             </div>
             <v-alert v-if="account.usage.unpriced" type="warning" variant="tonal" density="compact" class="mt-3">
@@ -161,9 +161,10 @@ onBeforeUnmount(() => timers.forEach((id) => window.clearTimeout(id)))
                   <v-progress-linear :model-value="quota.used_percent || 0" :color="quotaTone(quota.used_percent)" height="8" rounded="sm" />
                 </div>
                 <div class="quota-row__meta">
+                  <div>统计自 {{ dateTime(quota.window_started_at) }}</div>
                   <div>重置 {{ dateTime(quota.reset_at) }}</div>
                   <div>{{ number(quota.window_usage_requests) }} 请求 · {{ number(quota.window_usage_tokens) }} tokens</div>
-                  <div>{{ money(quota.window_usage_cost) }} 本地等效成本</div>
+                  <div>{{ money(quota.window_usage_cost) }} 本窗口等效成本</div>
                   <div v-if="quota.window_unpriced" class="data-error">{{ number(quota.window_unpriced) }} 条未计价</div>
                 </div>
               </div>

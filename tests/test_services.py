@@ -341,17 +341,29 @@ def test_keeper_accounts_are_sanitized_and_refresh_uses_public_account_ids(servi
             "file_name": "secret.json",
             "status": "completed",
             "refreshed_at": "2026-07-11T12:00:00+08:00",
-            "quota": {"quota": [{
-                "key": "rate_limit.primary_window",
-                "label": "5h",
-                "usedPercent": 42,
-                "allowed": True,
-                "limitReached": False,
-                "window": {"seconds": 18000},
-                "resetAt": reset_at,
-                "window_usage_tokens": 999999999,
-                "window_usage_cost": 999999,
-            }]},
+            "quota": {"quota": [
+                {
+                    "key": "rate_limit.primary_window",
+                    "label": "5h",
+                    "scope": "window",
+                    "usedPercent": 42,
+                    "allowed": True,
+                    "limitReached": False,
+                    "window": {"seconds": 18000},
+                    "resetAt": reset_at,
+                    "window_usage_tokens": 999999999,
+                    "window_usage_cost": 999999,
+                },
+                {
+                    "key": "additional_rate_limits.gpt-test.primary_window",
+                    "label": "gpt-test 5h",
+                    "scope": "additional",
+                    "metric": "gpt-test",
+                    "usedPercent": 7,
+                    "window": {"seconds": 18000},
+                    "resetAt": reset_at,
+                },
+            ]},
         }]},
         "inspection": {"total": 1, "normal": 1, "results": [{
             "auth_index": "raw-auth-index", "file_name": "secret.json", "name": "Shared Pro", "status": "normal",
@@ -370,8 +382,25 @@ def test_keeper_accounts_are_sanitized_and_refresh_uses_public_account_ids(servi
     insert_event(
         service.settings,
         "account-key",
-        current,
+        current - 4 * 3_600_000 - 1,
+        event_hash="account-outside-window",
+        auth_index="raw-auth-index",
+        account_snapshot="Shared Pro",
+    )
+    insert_event(
+        service.settings,
+        "account-key",
+        current - 1000,
         event_hash="account-local",
+        auth_index="raw-auth-index",
+        account_snapshot="Shared Pro",
+    )
+    insert_event(
+        service.settings,
+        "account-key",
+        current - 500,
+        event_hash="account-other-model",
+        model="gpt-5.6-luna",
         auth_index="raw-auth-index",
         account_snapshot="Shared Pro",
     )
@@ -384,11 +413,37 @@ def test_keeper_accounts_are_sanitized_and_refresh_uses_public_account_ids(servi
     assert "/root/private" not in serialized
     assert snapshot["accounts"][0]["id"] == "7"
     assert snapshot["accounts"][0]["quota"][0]["used_percent"] == 42
-    assert snapshot["accounts"][0]["usage"]["requests"] == 1
-    assert snapshot["accounts"][0]["usage"]["total_tokens"] == 1100
+    assert snapshot["accounts"][0]["usage"]["requests"] == 3
+    assert snapshot["accounts"][0]["usage"]["total_tokens"] == 3300
     assert snapshot["accounts"][0]["usage"]["source"] == "billing-panel"
-    assert snapshot["accounts"][0]["quota"][0]["window_usage_tokens"] == 1100
-    assert snapshot["accounts"][0]["quota"][0]["window_usage_cost"] == "0.0015"
+    primary = snapshot["accounts"][0]["quota"][0]
+    assert primary["window_usage_requests"] == 2
+    assert primary["window_usage_tokens"] == 2200
+    assert primary["window_started_at"] == datetime.fromtimestamp(
+        (current - 4 * 3_600_000) / 1000,
+        ZoneInfo("Asia/Shanghai"),
+    ).isoformat()
+    additional = snapshot["accounts"][0]["quota"][1]
+    assert additional["window_usage_requests"] == 1
+    assert additional["window_usage_tokens"] == 1100
+    assert additional["window_usage_cost"] == "0.0015"
+
+    raw["quota"]["items"][0]["quota"]["quota"][0]["resetAt"] = datetime.fromtimestamp(
+        (current + 3_600_000 + 4 * 60_000) / 1000,
+        ZoneInfo("Asia/Shanghai"),
+    ).isoformat()
+    jittered = service.accounts_snapshot()["accounts"][0]["quota"][0]
+    assert jittered["window_started_at"] == primary["window_started_at"]
+
+    raw["quota"]["items"][0]["quota"]["quota"][0]["resetAt"] = datetime.fromtimestamp(
+        (current + 3_600_000 + 6 * 60_000) / 1000,
+        ZoneInfo("Asia/Shanghai"),
+    ).isoformat()
+    shifted = service.accounts_snapshot()["accounts"][0]["quota"][0]
+    assert shifted["window_started_at"] == datetime.fromtimestamp(
+        (current - 4 * 3_600_000 + 6 * 60_000) / 1000,
+        ZoneInfo("Asia/Shanghai"),
+    ).isoformat()
 
     refresh = service.refresh_account_quotas(["7"])
     assert refresh["tasks"] == [{"account_id": "7", "status": "queued"}]

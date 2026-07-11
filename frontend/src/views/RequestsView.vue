@@ -1,10 +1,11 @@
 <script setup>
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { Filter, RefreshCw, RotateCcw, Search, SlidersHorizontal } from '@lucide/vue'
 import { api } from '../api'
 import LoadingState from '../components/LoadingState.vue'
 import MetricRail from '../components/MetricRail.vue'
 import PageHeader from '../components/PageHeader.vue'
+import { createDebouncedTask } from '../lib/debounce'
 import { dateTime, duration, money, number } from '../lib/format'
 import { activeFilterCount, toQuery } from '../lib/query'
 
@@ -15,6 +16,7 @@ const options = ref({ models: [], tiers: [], providers: [], failure_codes: [], k
 const data = ref(null)
 const filtersOpen = ref(true)
 const detail = ref(null)
+let requestSequence = 0
 
 const defaults = {
   start: '', end: '', model: [], tier: '', provider: '', status: 'all', key_id: '', failure_code: '',
@@ -80,6 +82,11 @@ function requestParams() {
   }
 }
 
+const filterSignature = computed(() => {
+  const { page: _page, ...params } = requestParams()
+  return JSON.stringify(params)
+})
+
 async function loadOptions() {
   optionsLoading.value = true
   try {
@@ -89,22 +96,42 @@ async function loadOptions() {
   }
 }
 
-async function load(resetPage = false) {
-  if (resetPage) filters.page = 1
+async function load() {
+  const sequence = ++requestSequence
   loading.value = true
   error.value = ''
   try {
-    data.value = await api(`/api/me/usage/events${toQuery(requestParams())}`)
+    const result = await api(`/api/me/usage/events${toQuery(requestParams())}`)
+    if (sequence === requestSequence) data.value = result
   } catch (exc) {
-    error.value = exc.message
+    if (sequence === requestSequence) error.value = exc.message
   } finally {
-    loading.value = false
+    if (sequence === requestSequence) loading.value = false
   }
 }
 
+function reloadFromFirstPage() {
+  if (filters.page !== 1) {
+    filters.page = 1
+    return
+  }
+  return load()
+}
+
+const autoReload = createDebouncedTask(reloadFromFirstPage, 300)
+
+function refreshCurrentPage() {
+  autoReload.cancel()
+  return load()
+}
+
+function refreshFromFirstPage() {
+  return autoReload.run()
+}
+
 function resetFilters() {
-  Object.assign(filters, defaults)
-  load()
+  const { page: _page, ...filterDefaults } = defaults
+  Object.assign(filters, filterDefaults)
 }
 
 function keyLabel(item) {
@@ -114,6 +141,9 @@ function keyLabel(item) {
 onMounted(async () => {
   await Promise.all([loadOptions(), load()])
 })
+watch(filterSignature, () => autoReload.schedule())
+watch(() => filters.page, () => load())
+onBeforeUnmount(autoReload.cancel)
 </script>
 
 <template>
@@ -126,7 +156,7 @@ onMounted(async () => {
         </v-btn>
         <v-tooltip text="刷新请求列表">
           <template #activator="{ props }">
-            <v-btn v-bind="props" icon variant="outlined" :loading="loading" @click="load()"><RefreshCw :size="18" /></v-btn>
+            <v-btn v-bind="props" icon variant="outlined" :loading="loading" @click="refreshCurrentPage"><RefreshCw :size="18" /></v-btn>
           </template>
         </v-tooltip>
       </template>
@@ -140,7 +170,7 @@ onMounted(async () => {
         </div>
         <div class="section-band__body">
           <div class="filter-grid filter-grid--six">
-            <v-text-field v-model="filters.q" label="Request ID / 模型" clearable @keyup.enter="load(true)">
+            <v-text-field v-model="filters.q" label="Request ID / 模型" clearable @keyup.enter="refreshFromFirstPage">
               <template #prepend-inner><Search :size="16" /></template>
             </v-text-field>
             <v-text-field v-model="filters.start" label="开始时间" type="datetime-local" />
@@ -169,7 +199,7 @@ onMounted(async () => {
             </v-btn-toggle>
             <div class="filter-actions mt-0">
               <v-select v-model="filters.page_size" :items="[25, 50, 100]" label="每页" style="width: 110px" />
-              <v-btn color="primary" :loading="loading" @click="load(true)">应用筛选</v-btn>
+              <v-progress-circular v-if="loading && data" indeterminate color="primary" size="20" width="2" aria-label="正在更新请求" />
             </div>
           </div>
         </div>
@@ -184,8 +214,8 @@ onMounted(async () => {
         <span v-if="data" class="data-muted text-body-2">共 {{ number(data.pagination.total) }} 条</span>
       </div>
       <div class="section-band__body section-band__body--flush">
-        <LoadingState :loading="loading" :error="error" :empty="!data?.items?.length" empty-text="当前筛选条件下没有请求" @retry="load()">
-          <v-data-table :headers="headers" :items="data?.items || []" :items-per-page="-1" hide-default-footer hover @click:row="(_, row) => detail = row.item">
+        <LoadingState :loading="loading && !data" :error="error" :empty="!data?.items?.length" empty-text="当前筛选条件下没有请求" @retry="refreshCurrentPage">
+          <v-data-table :headers="headers" :items="data?.items || []" :items-per-page="-1" :loading="loading" hide-default-footer hover @click:row="(_, row) => detail = row.item">
             <template #item.occurred_at="{ item }"><span class="nowrap">{{ dateTime(item.occurred_at) }}</span></template>
             <template #item.key="{ item }"><span class="mono">{{ item.key.name || item.key.masked }}</span></template>
             <template #item.model="{ item }">
@@ -206,7 +236,7 @@ onMounted(async () => {
             </template>
           </v-data-table>
           <div class="d-flex justify-center pa-4 border-t">
-            <v-pagination v-model="filters.page" :length="data?.pagination?.total_pages || 1" :total-visible="7" @update:model-value="load()" />
+            <v-pagination v-model="filters.page" :length="data?.pagination?.total_pages || 1" :total-visible="7" />
           </div>
         </LoadingState>
       </div>

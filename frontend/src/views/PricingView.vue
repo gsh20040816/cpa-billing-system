@@ -42,6 +42,27 @@ function rateText(item, field) {
   return rate ? money(rate.usd_per_million) : '-'
 }
 
+const priceFieldNames = {
+  input: 'Input',
+  output: 'Output',
+  cache_read: 'Cache read',
+  cache_creation: 'Cache creation',
+}
+
+function priceSourceText(item) {
+  const missing = Object.entries(item.configured || {})
+    .filter(([, configured]) => !configured)
+    .map(([field]) => field)
+  if (!missing.length) return '上游完整价格'
+
+  const zeroPrice = missing.filter((field) => Number(item.default?.[field]?.usd_per_million || 0) === 0)
+  const compatible = missing.filter((field) => !zeroPrice.includes(field))
+  const parts = []
+  if (zeroPrice.length) parts.push(`${zeroPrice.map((field) => priceFieldNames[field]).join('、')} 未提供，按 $0`)
+  if (compatible.length) parts.push(`${compatible.map((field) => priceFieldNames[field]).join('、')} 使用兼容价`)
+  return parts.join('；')
+}
+
 const models = computed(() => {
   const needle = search.value.trim().toLowerCase()
   return (data.value?.models || []).filter((item) => !needle || item.model.toLowerCase().includes(needle)).map((item) => ({
@@ -50,7 +71,7 @@ const models = computed(() => {
     output: rateText(item, 'output'),
     cache_read: rateText(item, 'cache_read'),
     cache_creation: rateText(item, 'cache_creation'),
-    price_source: Object.values(item.configured || {}).every(Boolean) ? '上游完整价格' : '含 CPAMP 兼容回退',
+    price_source: priceSourceText(item),
     threshold: item.long_context.threshold_tokens ? number(item.long_context.threshold_tokens) : '-',
     multipliers: item.long_context.threshold_tokens
       ? `${(item.long_context.input_multiplier_ppm / 1_000_000).toFixed(2)}x / ${(item.long_context.output_multiplier_ppm / 1_000_000).toFixed(2)}x`

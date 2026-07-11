@@ -289,7 +289,7 @@ async function saveKeyProfile() {
   const result = await mutate(`/api/admin/keys/${keyProfileDialog.key.id}/billing-profile`, {
     name: keyProfileDialog.name || null,
     multiplier: keyProfileDialog.multiplier || null,
-    reason: keyProfileDialog.reason,
+    reason: keyProfileDialog.reason || null,
   }, '未绑定 Key 计费档案已更新', 'PATCH')
   if (result) keyProfileDialog.open = false
 }
@@ -493,7 +493,7 @@ onMounted(load)
 
     <v-dialog v-model="deleteGradientDialog.open" max-width="520"><v-card><v-card-title>停用梯度规则</v-card-title><v-card-text><v-alert type="warning" variant="tonal" class="mb-4">仍被未关闭账期使用的规则不能停用。</v-alert><v-textarea v-model="deleteGradientDialog.reason" label="停用原因" rows="2" /></v-card-text><v-card-actions><v-spacer /><v-btn variant="text" @click="deleteGradientDialog.open = false">取消</v-btn><v-btn color="error" :loading="mutating" @click="deleteGradient"><Trash2 :size="16" class="mr-2" />停用</v-btn></v-card-actions></v-card></v-dialog>
 
-    <v-dialog v-model="keyProfileDialog.open" max-width="560"><v-card><v-card-title>未绑定 Key 计费档案</v-card-title><v-card-text><v-alert type="info" variant="tonal" class="mb-4"><span class="mono">{{ keyProfileDialog.key?.masked }}</span><br>预估付费 = 本地等效成本 USD × 倍率，结果计入人民币资源池抵扣。</v-alert><v-text-field v-model="keyProfileDialog.name" label="显示别名" /><v-text-field v-model="keyProfileDialog.multiplier" label="倍率（人民币 / USD）" type="number" min="0" step="0.01" /><v-textarea v-model="keyProfileDialog.reason" label="修改原因" rows="2" /></v-card-text><v-card-actions><v-spacer /><v-btn variant="text" @click="keyProfileDialog.open = false">取消</v-btn><v-btn color="primary" :loading="mutating" @click="saveKeyProfile"><Save :size="16" class="mr-2" />保存</v-btn></v-card-actions></v-card></v-dialog>
+    <v-dialog v-model="keyProfileDialog.open" max-width="560"><v-card><v-card-title>未绑定 Key 计费档案</v-card-title><v-card-text><v-alert type="info" variant="tonal" class="mb-4"><span class="mono">{{ keyProfileDialog.key?.masked }}</span><br>预估付费 = 本地等效成本 USD × 倍率，结果计入人民币资源池抵扣。</v-alert><v-text-field v-model="keyProfileDialog.name" label="显示别名" /><v-text-field v-model="keyProfileDialog.multiplier" label="倍率（人民币 / USD）" type="number" min="0" step="0.01" /><v-textarea v-model="keyProfileDialog.reason" label="修改原因（选填）" rows="2" /></v-card-text><v-card-actions><v-spacer /><v-btn variant="text" @click="keyProfileDialog.open = false">取消</v-btn><v-btn color="primary" :loading="mutating" @click="saveKeyProfile"><Save :size="16" class="mr-2" />保存</v-btn></v-card-actions></v-card></v-dialog>
 
     <v-dialog v-model="pricingDialog.open" max-width="560"><v-card><v-card-title>同步上游模型价格</v-card-title><v-card-text><v-alert type="warning" variant="tonal" class="mb-4">同步会创建新价格版本，并重新计价所有未关闭账期的请求。关闭账期保持不变。</v-alert><v-text-field v-model="pricingDialog.name" label="版本名称（留空自动生成）" /><v-textarea v-model="pricingDialog.reason" label="同步原因" rows="2" /></v-card-text><v-card-actions><v-spacer /><v-btn variant="text" @click="pricingDialog.open = false">取消</v-btn><v-btn color="secondary" :loading="mutating" @click="syncPricing"><CloudDownload :size="16" class="mr-2" />同步并重算</v-btn></v-card-actions></v-card></v-dialog>
 

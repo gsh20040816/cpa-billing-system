@@ -181,7 +181,7 @@ class CycleConfigurationPayload(BaseModel):
 class KeyBillingProfilePayload(BaseModel):
     name: str | None = Field(default=None, max_length=120)
     multiplier: str | None = Field(default=None, max_length=40)
-    reason: str = Field(min_length=1, max_length=1000)
+    reason: str | None = Field(default=None, max_length=1000)
 
 
 def _client_address(request: Request) -> str:

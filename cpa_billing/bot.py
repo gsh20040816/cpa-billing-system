@@ -97,8 +97,10 @@ class BillingBot:
         chat, user = message.get("chat") or {}, message.get("from") or {}
         if not user or user.get("is_bot"):
             return ""
-        await asyncio.to_thread(self.service.upsert_user, user)
         text = str(message.get("text") or "").strip()
+        if not text.startswith("/"):
+            return ""
+        await asyncio.to_thread(self.service.upsert_user, user)
         command, _, args = text.partition(" ")
         command = command.split("@", 1)[0].lower()
         private = chat.get("type") == "private"

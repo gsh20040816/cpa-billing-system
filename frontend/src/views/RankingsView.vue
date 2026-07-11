@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { RefreshCw } from '@lucide/vue'
 import { useRouter } from 'vue-router'
 import { api } from '../api'
@@ -7,6 +7,7 @@ import { VChart } from '../charts'
 import LoadingState from '../components/LoadingState.vue'
 import MetricRail from '../components/MetricRail.vue'
 import PageHeader from '../components/PageHeader.vue'
+import { createDebouncedTask } from '../lib/debounce'
 import { money, number, percent } from '../lib/format'
 import { toQuery } from '../lib/query'
 
@@ -15,6 +16,7 @@ const loading = ref(true)
 const error = ref('')
 const data = ref(null)
 const filters = reactive({ range: '24h', start: '', end: '', cycle: '', sort: 'cost' })
+let requestSequence = 0
 const ranges = [
   { title: '24h', value: '24h' },
   { title: '7d', value: '7d' },
@@ -63,19 +65,40 @@ const chartOption = computed(() => {
   }
 })
 
-async function load() {
-  loading.value = true
-  error.value = ''
-  try {
-    data.value = await api(`/api/rankings${toQuery(filters)}`)
-  } catch (exc) {
-    error.value = exc.message
-  } finally {
-    loading.value = false
+function rankingParams() {
+  return {
+    range: filters.range,
+    start: filters.range === 'custom' ? filters.start : null,
+    end: filters.range === 'custom' ? filters.end : null,
+    cycle: filters.range === 'cycle' ? filters.cycle : null,
+    sort: filters.sort,
   }
 }
 
+async function load() {
+  if (filters.range === 'custom' && (!filters.start || !filters.end)) return
+  const sequence = ++requestSequence
+  loading.value = true
+  error.value = ''
+  try {
+    const result = await api(`/api/rankings${toQuery(rankingParams())}`)
+    if (sequence === requestSequence) data.value = result
+  } catch (exc) {
+    if (sequence === requestSequence) error.value = exc.message
+  } finally {
+    if (sequence === requestSequence) loading.value = false
+  }
+}
+
+const autoReload = createDebouncedTask(load, 180)
+
+watch(
+  () => [filters.range, filters.start, filters.end, filters.cycle, filters.sort],
+  () => autoReload.schedule(),
+)
+
 onMounted(load)
+onBeforeUnmount(autoReload.cancel)
 </script>
 
 <template>
@@ -84,7 +107,7 @@ onMounted(load)
       <template #actions>
         <v-select v-model="filters.sort" :items="sorts" label="排序指标" style="width: 160px" />
         <v-tooltip text="刷新排行">
-          <template #activator="{ props }"><v-btn v-bind="props" icon variant="outlined" :loading="loading" @click="load"><RefreshCw :size="18" /></v-btn></template>
+          <template #activator="{ props }"><v-btn v-bind="props" icon variant="outlined" :loading="loading" @click="autoReload.run()"><RefreshCw :size="18" /></v-btn></template>
         </v-tooltip>
       </template>
     </PageHeader>
@@ -97,10 +120,10 @@ onMounted(load)
         <v-text-field v-model="filters.start" type="date" label="开始" style="max-width: 180px" />
         <v-text-field v-model="filters.end" type="date" label="结束" style="max-width: 180px" />
       </template>
-      <v-btn color="primary" size="small" @click="load">应用</v-btn>
+      <v-progress-circular v-if="loading && data" indeterminate color="primary" size="20" width="2" aria-label="正在更新排行" />
     </div>
 
-    <LoadingState :loading="loading" :error="error" :empty="!data" @retry="load">
+    <LoadingState :loading="loading && !data" :error="error" :empty="!data" @retry="autoReload.run()">
       <MetricRail :items="metrics" :columns="5" />
       <section class="section-band">
         <div class="section-band__head"><div><h2>排行分布</h2><p>前 12 个聚合项</p></div></div>
@@ -109,7 +132,7 @@ onMounted(load)
       <section class="section-band">
         <div class="section-band__head"><div><h2>Telegram 用户与未绑定 Key</h2><p>已绑定 Key 按 Telegram 用户聚合；未绑定 Key 分别以别名或掩码显示</p></div></div>
         <div class="section-band__body section-band__body--flush">
-          <v-data-table :headers="headers" :items="rows" :items-per-page="50" hover>
+          <v-data-table :headers="headers" :items="rows" :items-per-page="50" :loading="loading" hover>
             <template #item.name="{ item }">
               <button v-if="item.telegram_user_id !== null" class="table-link bg-transparent border-0 pa-0" @click="router.push(`/users/${item.telegram_user_id}`)">{{ item.name }}</button>
               <span v-else class="data-muted">{{ item.name }}</span>

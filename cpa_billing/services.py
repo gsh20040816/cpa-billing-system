@@ -7,6 +7,7 @@ import logging
 import math
 import re
 import sqlite3
+import threading
 import time
 from collections import defaultdict
 from contextlib import contextmanager
@@ -317,6 +318,8 @@ class BillingService:
         self.cpa = CPAClient(settings)
         self.cpamp = CPAMPClient(settings)
         self.keeper = KeeperClient(settings)
+        self._quota_window_starts: dict[tuple[str, str], int] = {}
+        self._quota_window_lock = threading.Lock()
 
     def bootstrap(self) -> None:
         self.db.initialize()
@@ -900,9 +903,8 @@ class BillingService:
         return int((multiplier * 1_000_000).to_integral_value(rounding=ROUND_HALF_UP))
 
     def update_unowned_key_profile(self, key_id: int, name: str | None, multiplier: str | None,
-                                   reason: str, operator_id: str = "admin-token") -> dict[str, Any]:
-        if not reason.strip():
-            raise BillingError("修改未绑定 Key 必须填写原因")
+                                   reason: str | None, operator_id: str = "admin-token") -> dict[str, Any]:
+        normalized_reason = (reason or "").strip() or None
         multiplier_ppm = self._multiplier_ppm(multiplier)
         with self.db.session() as session:
             key = session.get(APIKey, key_id)
@@ -920,7 +922,7 @@ class BillingService:
                 target=str(key.id),
                 before_json=json.dumps(before),
                 after_json=json.dumps({"name": key.display_name, "multiplier_ppm": multiplier_ppm}),
-                reason=reason.strip(),
+                reason=normalized_reason,
                 created_at_ms=now_ms(),
             ))
             return {
@@ -2380,6 +2382,17 @@ class BillingService:
             parsed = parsed.replace(tzinfo=ZoneInfo(self.settings.timezone))
         return int(parsed.timestamp() * 1000)
 
+    def _stable_quota_window_start(self, account_id: str, quota_key: str, candidate_ms: int | None) -> int | None:
+        if candidate_ms is None:
+            return None
+        cache_key = (account_id, quota_key)
+        with self._quota_window_lock:
+            current = self._quota_window_starts.get(cache_key)
+            if current is None or abs(candidate_ms - current) >= 5 * 60_000:
+                self._quota_window_starts[cache_key] = candidate_ms
+                return candidate_ms
+            return current
+
     def _account_usage_aggregate(
         self,
         session: Any,
@@ -2387,12 +2400,27 @@ class BillingService:
         auth_index: str,
         start_ms: int | None = None,
         end_ms: int | None = None,
+        model_metric: str | None = None,
     ) -> dict[str, Any]:
         filters: list[Any] = [RawUsageEvent.auth_index == auth_index]
         if start_ms is not None:
             filters.append(RawUsageEvent.occurred_at_ms >= start_ms)
         if end_ms is not None:
             filters.append(RawUsageEvent.occurred_at_ms < end_ms)
+        if model_metric:
+            metric = _model_slug(model_metric)
+            model_columns = (
+                RawUsageEvent.model,
+                RawUsageEvent.requested_model,
+                RawUsageEvent.resolved_model,
+            )
+            model_filters = []
+            for column in model_columns:
+                model_filters.extend((
+                    func.lower(func.coalesce(column, "")) == metric,
+                    func.lower(func.coalesce(column, "")).like(f"%/{metric}"),
+                ))
+            filters.append(or_(*model_filters))
         compatible_cached = func.max(
             func.max(RawUsageEvent.cached_tokens, RawUsageEvent.cache_tokens)
             - func.max(RawUsageEvent.cache_read_tokens, 0)
@@ -2466,14 +2494,26 @@ class BillingService:
                     if reset_at_ms is None and quota.get("reset_after_seconds") is not None:
                         reset_at_ms = current + int(quota["reset_after_seconds"] or 0) * 1000
                     window_end_ms = min(current, reset_at_ms) if reset_at_ms is not None else current
-                    window_start_ms = window_end_ms - window_seconds * 1000 if window_seconds > 0 else None
+                    if reset_at_ms is not None and window_seconds > 0:
+                        candidate_start_ms = reset_at_ms - window_seconds * 1000
+                    else:
+                        candidate_start_ms = current - window_seconds * 1000 if window_seconds > 0 else None
+                    window_start_ms = self._stable_quota_window_start(
+                        str(account["id"]),
+                        str(quota.get("key") or quota.get("label") or "unknown"),
+                        candidate_start_ms,
+                    )
+                    model_metric = quota.get("metric") if quota.get("scope") == "additional" else None
                     usage = self._account_usage_aggregate(
                         session,
                         version_id,
                         auth_index,
                         start_ms=window_start_ms,
                         end_ms=window_end_ms + 1,
+                        model_metric=model_metric,
                     )
+                    quota["window_started_at"] = self._iso_timestamp(window_start_ms)
+                    quota["window_ended_at"] = self._iso_timestamp(window_end_ms)
                     quota["window_usage_requests"] = usage["requests"]
                     quota["window_usage_tokens"] = usage["total_tokens"]
                     quota["window_usage_cost"] = usage["cost"]
