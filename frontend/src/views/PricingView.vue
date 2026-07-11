@@ -5,6 +5,7 @@ import { api } from '../api'
 import LoadingState from '../components/LoadingState.vue'
 import PageHeader from '../components/PageHeader.vue'
 import { dateTime, money, number } from '../lib/format'
+import { effectiveRate, priceSourceText } from '../lib/pricing'
 import { toQuery } from '../lib/query'
 
 const loading = ref(true)
@@ -30,37 +31,9 @@ const modelHeaders = [
   { title: '长上下文倍率', key: 'multipliers', align: 'end' },
 ]
 
-function effectiveRate(item, field) {
-  if (tier.value === 'default') return item.default[field]
-  if (tier.value === 'priority') return item.priority[field] || item.default[field]
-  if (field === 'cache_read' || field === 'cache_creation') return item.default[field]
-  return item.flex[field] || item.default[field]
-}
-
 function rateText(item, field) {
-  const rate = effectiveRate(item, field)
+  const rate = effectiveRate(item, field, tier.value)
   return rate ? money(rate.usd_per_million) : '-'
-}
-
-const priceFieldNames = {
-  input: 'Input',
-  output: 'Output',
-  cache_read: 'Cache read',
-  cache_creation: 'Cache creation',
-}
-
-function priceSourceText(item) {
-  const missing = Object.entries(item.configured || {})
-    .filter(([, configured]) => !configured)
-    .map(([field]) => field)
-  if (!missing.length) return '上游完整价格'
-
-  const zeroPrice = missing.filter((field) => Number(item.default?.[field]?.usd_per_million || 0) === 0)
-  const compatible = missing.filter((field) => !zeroPrice.includes(field))
-  const parts = []
-  if (zeroPrice.length) parts.push(`${zeroPrice.map((field) => priceFieldNames[field]).join('、')} 未提供，按 $0`)
-  if (compatible.length) parts.push(`${compatible.map((field) => priceFieldNames[field]).join('、')} 使用兼容价`)
-  return parts.join('；')
 }
 
 const models = computed(() => {
