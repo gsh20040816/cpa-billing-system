@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from collections import defaultdict, deque
 from pathlib import Path
@@ -17,7 +18,7 @@ from .database import Database
 from .services import BillingError, BillingService
 
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(os.getenv("BILLING_ASSET_ROOT", str(Path.cwd())))
 
 
 class LoginLimiter:
