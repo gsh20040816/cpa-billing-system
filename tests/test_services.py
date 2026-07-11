@@ -28,6 +28,7 @@ from cpa_billing.models import (
     RawUsageEvent,
     ResourcePool,
     Statement,
+    SyncCheckpoint,
     TelegramUser,
 )
 from cpa_billing.security import cpamp_key_hash
@@ -661,3 +662,22 @@ def test_rankings_keep_unowned_keys_separate_and_masked(service, settings) -> No
     assert {row["name"] for row in bot_rows} == {"external-one", "sk-cpa-****two"}
     _, chart = service.hourly_usage(24)
     assert {row["name"] for row in chart} == {"external-one", "sk-cpa-****two"}
+
+
+def test_reconciliation_does_not_warn_for_fresh_transient_sync_lag(service, settings) -> None:
+    insert_event(settings, "first", 1000, event_hash="first")
+    service.sync_cpamp()
+    service.rate_events()
+    insert_event(settings, "second", 2000, event_hash="second")
+
+    result = service.reconciliation()
+    assert result["sync_backlog"] == 1
+    assert result["sync_pending"] is True
+    assert result["sync_stale"] is False
+    assert result["sync_degraded"] is False
+    assert result["ok"] is True
+
+    with service.db.session() as session:
+        checkpoint = session.scalar(select(SyncCheckpoint))
+        checkpoint.last_success_at_ms = 1
+    assert service.reconciliation()["sync_degraded"] is True

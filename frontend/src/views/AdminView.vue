@@ -313,8 +313,8 @@ onMounted(load)
       <v-alert v-if="!reconciliation.ok" type="error" variant="tonal" border="start" class="mb-4">
         对账完整性异常：Dead letter {{ number(reconciliation.dead_letters) }}，镜像多出 {{ number(reconciliation.raw_excess) }}，未分池 {{ number(reconciliation.unassigned_events) }}。
       </v-alert>
-      <v-alert v-else-if="reconciliation.sync_pending || reconciliation.rating_pending" type="warning" variant="tonal" border="start" class="mb-4">
-        数据仍在追赶：同步待处理 {{ number(reconciliation.sync_backlog) }}，未计价 {{ number(reconciliation.unpriced_events) }}。这不是数据库完整性错误，但当前不满足结算条件。
+      <v-alert v-else-if="reconciliation.sync_degraded || reconciliation.rating_pending" type="warning" variant="tonal" border="start" class="mb-4">
+        数据处理需要关注：同步待处理 {{ number(reconciliation.sync_backlog) }}，未计价 {{ number(reconciliation.unpriced_events) }}，最后同步 {{ dateTime(reconciliation.last_sync_at) }}。
       </v-alert>
       <MetricRail :items="metrics" :columns="6" />
 

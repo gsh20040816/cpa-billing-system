@@ -3510,9 +3510,18 @@ class BillingService:
                 RatedEvent.pricing_version_id == version_id, RatedEvent.telegram_user_id.is_(None))) or 0
             unassigned = session.scalar(select(func.count()).select_from(RatedEvent).where(
                 RatedEvent.pricing_version_id == version_id, RatedEvent.pool_id.is_(None))) or 0
+            checkpoint_state = session.execute(select(
+                func.max(SyncCheckpoint.last_success_at_ms),
+                func.sum(case((SyncCheckpoint.last_error.is_not(None), 1), else_=0)),
+            )).one()
             sync_backlog = max(0, int(source_count) - int(raw_count))
             raw_excess = max(0, int(raw_count) - int(source_count))
             unpriced = max(0, int(raw_count) - int(rated_count))
+            last_sync_at_ms = int(checkpoint_state[0]) if checkpoint_state[0] is not None else None
+            stale_after_ms = max(60_000, int(self.settings.worker_interval_seconds * 5_000))
+            sync_stale = last_sync_at_ms is None or now_ms() - last_sync_at_ms > stale_after_ms
+            sync_has_error = int(checkpoint_state[1] or 0) > 0
+            sync_degraded = sync_has_error or sync_backlog > 5_000 or (sync_backlog > 0 and sync_stale)
             integrity_ok = raw_excess == 0 and dead == 0 and unassigned == 0
             result = {
                 "cpamp_events": int(source_count),
@@ -3525,6 +3534,10 @@ class BillingService:
                 "sync_backlog": sync_backlog,
                 "raw_excess": raw_excess,
                 "sync_pending": sync_backlog > 0,
+                "sync_stale": sync_stale,
+                "sync_has_error": sync_has_error,
+                "sync_degraded": sync_degraded,
+                "last_sync_at": self._iso_timestamp(last_sync_at_ms),
                 "rating_pending": unpriced > 0,
                 "ok": integrity_ok,
                 "settlement_ready": integrity_ok and sync_backlog == 0 and unpriced == 0,
