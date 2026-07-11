@@ -23,6 +23,7 @@ const headers = [
   { title: '请求', key: 'requests', align: 'end' },
   { title: 'Tokens', key: 'tokens', align: 'end' },
   { title: '实际等效', key: 'actual', align: 'end' },
+  { title: '人工补录', key: 'manual_actual', align: 'end' },
   { title: '梯度计费', key: 'billed', align: 'end' },
   { title: '应付', key: 'amount', align: 'end' },
   { title: 'Keys', key: 'key_count', align: 'end' },
@@ -187,6 +188,7 @@ onBeforeUnmount(() => window.clearInterval(refreshTimer))
             <template #item.requests="{ item }"><span class="mono">{{ number(item.requests) }}</span></template>
             <template #item.tokens="{ item }"><span class="mono">{{ number(item.tokens) }}</span></template>
             <template #item.actual="{ item }"><span class="mono">{{ money(item.actual) }}</span></template>
+            <template #item.manual_actual="{ item }"><span class="mono">{{ money(item.manual_actual) }}</span></template>
             <template #item.billed="{ item }"><span class="mono">{{ money(item.billed) }}</span></template>
             <template #item.amount="{ item }"><span class="mono">{{ money(item.amount, '¥') }}</span></template>
           </v-data-table>

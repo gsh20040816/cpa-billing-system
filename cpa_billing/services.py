@@ -39,6 +39,7 @@ from .models import (
     GroupMembership,
     KeyActionRequest,
     KeyOwnershipPeriod,
+    ManualUsageAdjustment,
     ModelPriceRule,
     MeteredKeyCharge,
     PoolAssignmentRule,
@@ -1266,6 +1267,20 @@ class BillingService:
             .group_by(RatedEvent.pool_id, RatedEvent.telegram_user_id)
         ):
             pool_users[int(pool_id)][int(user_id)] = int(weight or 0)
+        for pool_id, user_id, weight in session.execute(
+            select(
+                ManualUsageAdjustment.pool_id,
+                ManualUsageAdjustment.telegram_user_id,
+                func.sum(ManualUsageAdjustment.amount_nano_usd),
+            )
+            .where(ManualUsageAdjustment.cycle_id == cycle.id)
+            .group_by(ManualUsageAdjustment.pool_id, ManualUsageAdjustment.telegram_user_id)
+        ):
+            manual_weight = int(weight or 0)
+            if manual_weight < 0:
+                raise BillingError("手动原始用量余额不能为负数")
+            pool = pool_users[int(pool_id)]
+            pool[int(user_id)] = pool.get(int(user_id), 0) + manual_weight
 
         unowned_usage = session.execute(
             select(
@@ -1440,7 +1455,8 @@ class BillingService:
             if cycle is None:
                 return {"cycle": None, "cycles": [{"name": item.name, "status": item.status} for item in cycles],
                         "rows": [], "models": [], "metered_keys": [], "pool_totals": [],
-                        "totals": {"requests": 0, "tokens": 0, "actual": "0.0000", "billed": "0.0000",
+                        "totals": {"requests": 0, "tokens": 0, "actual": "0.0000",
+                                   "request_actual": "0.0000", "manual_actual": "0.0000", "billed": "0.0000",
                                    "member_amount": "0.00", "metered_amount": "0.00", "amount": "0.00"}}
 
             period = (
@@ -1457,6 +1473,17 @@ class BillingService:
             ).all()
             usage = {user_id: (int(requests or 0), int(tokens or 0), int(cost or 0))
                      for user_id, requests, tokens, cost in usage_rows}
+            manual_usage = {
+                int(user_id): int(weight or 0)
+                for user_id, weight in session.execute(
+                    select(
+                        ManualUsageAdjustment.telegram_user_id,
+                        func.sum(ManualUsageAdjustment.amount_nano_usd),
+                    )
+                    .where(ManualUsageAdjustment.cycle_id == cycle.id)
+                    .group_by(ManualUsageAdjustment.telegram_user_id)
+                )
+            }
             if cycle.status == "closed":
                 statements = {row.telegram_user_id: row for row in session.scalars(
                     select(Statement).where(Statement.cycle_id == cycle.id)
@@ -1540,8 +1567,10 @@ class BillingService:
             ))
             rows: list[dict[str, Any]] = []
             for user in users:
-                requests, tokens, actual = usage.get(user.telegram_user_id, (0, 0, 0))
+                requests, tokens, request_actual = usage.get(user.telegram_user_id, (0, 0, 0))
                 estimate_values = live_user.get(user.telegram_user_id, (0, 0, 0))
+                manual_actual = manual_usage.get(user.telegram_user_id, 0)
+                actual = request_actual + manual_actual
                 rows.append({
                     "telegram_user_id": user.telegram_user_id,
                     "name": self._user_name(user, user.telegram_user_id),
@@ -1549,6 +1578,10 @@ class BillingService:
                     "tokens": tokens,
                     "actual": format_usd_nano(actual),
                     "actual_nano": actual,
+                    "request_actual": format_usd_nano(request_actual),
+                    "request_actual_nano": request_actual,
+                    "manual_actual": format_usd_nano(manual_actual),
+                    "manual_actual_nano": manual_actual,
                     "billed": format_usd_nano(estimate_values[1]),
                     "amount": format_cents(estimate_values[2]),
                     "amount_cents": estimate_values[2],
@@ -1570,6 +1603,10 @@ class BillingService:
                     "tokens": tokens,
                     "actual": format_usd_nano(actual),
                     "actual_nano": actual,
+                    "request_actual": format_usd_nano(actual),
+                    "request_actual_nano": actual,
+                    "manual_actual": "0.0000",
+                    "manual_actual_nano": 0,
                     "billed": "0.0000",
                     "amount": format_cents(sum(item["amount_cents"] for item in metered_keys)),
                     "amount_cents": sum(item["amount_cents"] for item in metered_keys),
@@ -1634,6 +1671,8 @@ class BillingService:
                     "requests": sum(item["requests"] for item in rows),
                     "tokens": sum(item["tokens"] for item in rows),
                     "actual": format_usd_nano(sum(item["actual_nano"] for item in rows)),
+                    "request_actual": format_usd_nano(sum(item["request_actual_nano"] for item in rows)),
+                    "manual_actual": format_usd_nano(sum(item["manual_actual_nano"] for item in rows)),
                     "billed": format_usd_nano(sum(value[1] for value in live_user.values())),
                     "member_amount": format_cents(member_amount_cents),
                     "metered_amount": format_cents(metered_amount_cents),
@@ -1660,6 +1699,8 @@ class BillingService:
             data: dict[str, Any] = {"telegram_user_id": user_id, "username": user.username, "first_name": user.first_name, "last_name": user.last_name,
                                     "statement": None if billing_row is None else {
                                         "actual": billing_row["actual"],
+                                        "request_actual": billing_row["request_actual"],
+                                        "manual_actual": billing_row["manual_actual"],
                                         "billed": billing_row["billed"],
                                         "amount": billing_row["amount"],
                                         "live": bool(billing["cycle"]["estimate_live"]),
@@ -3124,6 +3165,70 @@ class BillingService:
                                  operation="adjustment.create",
                                  target=f"{cycle_name}:{user_id}", after_json=json.dumps({"amount_cents": amount_cents}), reason=reason, created_at_ms=now_ms()))
 
+    def add_manual_usage_adjustment(
+        self,
+        cycle_name: str,
+        pool_id: int,
+        user_id: int,
+        amount_nano_usd: int,
+        reason: str,
+        operator_id: int | None,
+        operator_type: str = "telegram",
+    ) -> int:
+        normalized_reason = reason.strip()
+        if not normalized_reason:
+            raise BillingError("手动原始用量必须填写原因")
+        if amount_nano_usd == 0:
+            raise BillingError("手动原始用量不能为零")
+        if abs(amount_nano_usd) > 9_223_372_036_854_775_807:
+            raise BillingError("手动原始用量超出可记录范围")
+        with self.db.session() as session:
+            cycle = session.scalar(select(BillingCycle).where(BillingCycle.name == cycle_name))
+            if cycle is None or cycle.status == "closed":
+                raise BillingError("账期不存在或已经关闭")
+            user = session.get(TelegramUser, user_id)
+            if user is None or user.registered_at_ms is None:
+                raise BillingError("Telegram 用户不存在或尚未注册")
+            pool = session.get(ResourcePool, pool_id)
+            configured = session.get(CyclePoolCost, {"cycle_id": cycle.id, "pool_id": pool_id})
+            if pool is None or configured is None:
+                raise BillingError("资源池未配置到该账期")
+            current_manual = int(session.scalar(
+                select(func.sum(ManualUsageAdjustment.amount_nano_usd)).where(
+                    ManualUsageAdjustment.cycle_id == cycle.id,
+                    ManualUsageAdjustment.pool_id == pool_id,
+                    ManualUsageAdjustment.telegram_user_id == user_id,
+                )
+            ) or 0)
+            if current_manual + amount_nano_usd < 0:
+                raise BillingError("冲销金额不能超过该用户在此资源池的手动原始用量")
+            created_at = now_ms()
+            row = ManualUsageAdjustment(
+                cycle_id=cycle.id,
+                pool_id=pool_id,
+                telegram_user_id=user_id,
+                amount_nano_usd=amount_nano_usd,
+                reason=normalized_reason,
+                operator_user_id=operator_id,
+                created_at_ms=created_at,
+            )
+            session.add(row)
+            session.flush()
+            self._invalidate_cycle_previews(session, [cycle.id])
+            session.add(AuditLog(
+                operator_type=operator_type,
+                operator_id=str(operator_id if operator_id is not None else "admin-token"),
+                operation="manual-usage.create",
+                target=f"{cycle_name}:{pool_id}:{user_id}",
+                after_json=json.dumps({
+                    "amount_nano_usd": amount_nano_usd,
+                    "amount_usd": format(Decimal(amount_nano_usd) / Decimal(NANO_USD), "f"),
+                }),
+                reason=normalized_reason,
+                created_at_ms=created_at,
+            ))
+            return row.id
+
     def transfer_key(self, key_id: int, new_user_id: int, operator_id: int | None, reason: str,
                      effective_at_ms: int | None = None, operator_type: str = "telegram") -> None:
         if not reason.strip():
@@ -3270,6 +3375,21 @@ class BillingService:
                                  "reason": row.reason, "operator": row.operator_user_id,
                                  "at": self._format_timestamp(row.created_at_ms)}
                                 for row in session.scalars(select(Adjustment).order_by(Adjustment.id.desc()).limit(100))],
+                "manual_usage_adjustments": [{
+                    "id": row.id,
+                    "cycle": next((cycle.name for cycle in cycles if cycle.id == row.cycle_id), str(row.cycle_id)),
+                    "pool_id": row.pool_id,
+                    "pool": pool_map[row.pool_id].name if row.pool_id in pool_map else str(row.pool_id),
+                    "user_id": row.telegram_user_id,
+                    "user": self._user_name(users.get(row.telegram_user_id), row.telegram_user_id),
+                    "amount_nano_usd": row.amount_nano_usd,
+                    "amount_usd": format(Decimal(row.amount_nano_usd) / Decimal(NANO_USD), "f"),
+                    "reason": row.reason,
+                    "operator": row.operator_user_id,
+                    "at": self._format_timestamp(row.created_at_ms),
+                } for row in session.scalars(
+                    select(ManualUsageAdjustment).order_by(ManualUsageAdjustment.id.desc()).limit(100)
+                )],
                 "dead_letters": [{"id": d.id, "source_event_id": d.source_event_id, "error": d.error,
                                   "at": self._format_timestamp(d.created_at_ms)}
                                  for d in session.scalars(select(DeadLetter).where(DeadLetter.resolved_at_ms.is_(None)).order_by(DeadLetter.id.desc()).limit(50))],

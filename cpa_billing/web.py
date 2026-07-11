@@ -20,6 +20,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .config import Settings
 from .database import Database
+from .domain import NANO_USD
 from .security import constant_equal
 from .services import BillingDependencyError, BillingError, BillingService
 
@@ -137,6 +138,14 @@ class AdjustmentPayload(BaseModel):
     reason: str = Field(min_length=1, max_length=1000)
 
 
+class ManualUsageAdjustmentPayload(BaseModel):
+    cycle: str = Field(min_length=1, max_length=80)
+    pool_id: int = Field(ge=1)
+    telegram_user_id: int
+    amount_usd: str = Field(min_length=1, max_length=80)
+    reason: str = Field(min_length=1, max_length=1000)
+
+
 class OwnershipTransferPayload(BaseModel):
     key_id: int = Field(ge=1)
     telegram_user_id: int
@@ -205,6 +214,24 @@ def _money_to_cents(value: str) -> int:
     if amount != quantized:
         raise BillingError("固定成本最多保留两位小数")
     return int(quantized * 100)
+
+
+def _manual_usage_to_nano(value: str) -> int:
+    try:
+        amount = Decimal(value.strip())
+        quantized = amount.quantize(Decimal("0.000000001"))
+    except (InvalidOperation, ValueError) as exc:
+        raise BillingError("原始等效用量格式无效") from exc
+    if not amount.is_finite():
+        raise BillingError("原始等效用量必须是有限数值")
+    if amount != quantized:
+        raise BillingError("原始等效用量最多保留九位小数")
+    amount_nano_usd = int(quantized * NANO_USD)
+    if amount_nano_usd == 0:
+        raise BillingError("原始等效用量不能为零")
+    if abs(amount_nano_usd) > 9_223_372_036_854_775_807:
+        raise BillingError("原始等效用量超出可记录范围")
+    return amount_nano_usd
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -684,6 +711,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             operator_type="web-admin",
         )
         return {"ok": True}
+
+    @app.post("/api/admin/manual-usage-adjustments")
+    def api_manual_usage_adjustment(
+        payload: ManualUsageAdjustmentPayload,
+        request: Request,
+        auth: Any = Depends(admin_current),
+    ) -> dict[str, Any]:
+        verify_csrf(request, auth)
+        adjustment_id = service.add_manual_usage_adjustment(
+            payload.cycle,
+            payload.pool_id,
+            payload.telegram_user_id,
+            _manual_usage_to_nano(payload.amount_usd),
+            payload.reason,
+            None,
+            operator_type="web-admin",
+        )
+        return {"ok": True, "id": adjustment_id}
 
     @app.post("/api/admin/ownership-transfers")
     def api_transfer(payload: OwnershipTransferPayload, request: Request,

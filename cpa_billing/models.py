@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from sqlalchemy import BigInteger, Boolean, ForeignKey, Index, Integer, String, Text, UniqueConstraint
+from sqlalchemy import BigInteger, Boolean, CheckConstraint, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -306,6 +306,22 @@ class Adjustment(Base):
     cycle_id: Mapped[int] = mapped_column(ForeignKey("billing_cycles.id"))
     telegram_user_id: Mapped[int] = mapped_column(ForeignKey("telegram_users.telegram_user_id"))
     amount_cents: Mapped[int] = mapped_column(BigInteger)
+    reason: Mapped[str] = mapped_column(Text)
+    operator_user_id: Mapped[int | None] = mapped_column(BigInteger)
+    created_at_ms: Mapped[int] = mapped_column(BigInteger)
+
+
+class ManualUsageAdjustment(Base):
+    __tablename__ = "manual_usage_adjustments"
+    __table_args__ = (
+        CheckConstraint("amount_nano_usd != 0", name="ck_manual_usage_adjustments_nonzero"),
+        Index("idx_manual_usage_cycle_pool_user", "cycle_id", "pool_id", "telegram_user_id"),
+    )
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    cycle_id: Mapped[int] = mapped_column(ForeignKey("billing_cycles.id"))
+    pool_id: Mapped[int] = mapped_column(ForeignKey("resource_pools.id"))
+    telegram_user_id: Mapped[int] = mapped_column(ForeignKey("telegram_users.telegram_user_id"))
+    amount_nano_usd: Mapped[int] = mapped_column(BigInteger)
     reason: Mapped[str] = mapped_column(Text)
     operator_user_id: Mapped[int | None] = mapped_column(BigInteger)
     created_at_ms: Mapped[int] = mapped_column(BigInteger)

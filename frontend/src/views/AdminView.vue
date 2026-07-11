@@ -1,7 +1,7 @@
 <script setup>
 import { computed, onMounted, reactive, ref } from 'vue'
 import {
-  ArrowDown, ArrowUp, CloudDownload, Edit3, KeyRound, Plus, RefreshCw,
+  Activity, ArrowDown, ArrowUp, CloudDownload, Edit3, KeyRound, Plus, RefreshCw,
   Save, Scale, Shuffle, Trash2, XCircle,
 } from '@lucide/vue'
 import { api } from '../api'
@@ -25,6 +25,9 @@ const cycleConfigDialog = reactive({
 })
 const closeDialog = reactive({ open: false, cycle: null, confirm_close: false, confirm_waiver: false })
 const adjustmentDialog = reactive({ open: false, cycle: '', telegram_user_id: '', amount_cents: '', reason: '' })
+const manualUsageDialog = reactive({
+  open: false, cycle: '', pool_id: null, telegram_user_id: null, amount_usd: '', reason: '',
+})
 const transferDialog = reactive({ open: false, key_id: '', telegram_user_id: '', reason: '', confirm_transfer: false })
 const poolDialog = reactive({ open: false, name: '', auth_pattern: '', model_pattern: '', priority: 100 })
 const pricingDialog = reactive({ open: false, name: '', reason: '' })
@@ -36,6 +39,12 @@ const reconciliation = computed(() => data.value?.reconciliation || {})
 const admin = computed(() => data.value?.admin || {})
 const activeGradients = computed(() => (admin.value.gradients || []).filter((item) => item.active))
 const activePools = computed(() => (admin.value.pools || []).filter((item) => item.active))
+const openCycles = computed(() => (admin.value.cycles || []).filter((item) => item.status !== 'closed'))
+const registeredUsers = computed(() => (admin.value.users || []).filter((item) => item.registered))
+const manualUsagePools = computed(() => {
+  const cycle = openCycles.value.find((item) => item.name === manualUsageDialog.cycle)
+  return cycle?.pool_costs || []
+})
 const metrics = computed(() => [
   { label: 'CPAMP 事件', value: number(reconciliation.value.cpamp_events), mono: true },
   { label: '镜像事件', value: number(reconciliation.value.raw_events), mono: true },
@@ -162,6 +171,35 @@ async function createAdjustment() {
     reason: adjustmentDialog.reason,
   }, '人工调整已添加')
   if (result) adjustmentDialog.open = false
+}
+
+function selectManualUsageCycle(cycleName) {
+  manualUsageDialog.cycle = cycleName
+  const cycle = openCycles.value.find((item) => item.name === cycleName)
+  manualUsageDialog.pool_id = cycle?.pool_costs?.[0]?.pool_id || null
+}
+
+function openManualUsage() {
+  const cycle = openCycles.value[0]
+  Object.assign(manualUsageDialog, {
+    open: true,
+    cycle: cycle?.name || '',
+    pool_id: cycle?.pool_costs?.[0]?.pool_id || null,
+    telegram_user_id: registeredUsers.value[0]?.id || null,
+    amount_usd: '',
+    reason: '',
+  })
+}
+
+async function createManualUsage() {
+  const result = await mutate('/api/admin/manual-usage-adjustments', {
+    cycle: manualUsageDialog.cycle,
+    pool_id: Number(manualUsageDialog.pool_id),
+    telegram_user_id: Number(manualUsageDialog.telegram_user_id),
+    amount_usd: String(manualUsageDialog.amount_usd),
+    reason: manualUsageDialog.reason,
+  }, '原始等效用量已计入账期')
+  if (result) manualUsageDialog.open = false
 }
 
 async function transferOwnership() {
@@ -459,9 +497,22 @@ onMounted(load)
         </v-window-item>
 
         <v-window-item value="adjustments">
-          <div class="d-flex ga-2 mb-4"><v-btn color="primary" @click="adjustmentDialog.open = true"><Scale :size="16" class="mr-2" />人工调整</v-btn><v-btn color="secondary" @click="transferDialog.open = true"><Shuffle :size="16" class="mr-2" />变更归属</v-btn></div>
+          <div class="d-flex flex-wrap ga-2 mb-4"><v-btn color="primary" :disabled="!openCycles.length || !registeredUsers.length" @click="openManualUsage"><Activity :size="16" class="mr-2" />添加原始用量</v-btn><v-btn variant="outlined" @click="adjustmentDialog.open = true"><Scale :size="16" class="mr-2" />调整最终费用</v-btn><v-btn color="secondary" @click="transferDialog.open = true"><Shuffle :size="16" class="mr-2" />变更归属</v-btn></div>
           <section class="section-band">
-            <div class="section-band__head"><div><h2>最近人工调整</h2><p>最近 100 条</p></div></div>
+            <div class="section-band__head"><div><h2>最近手动原始用量</h2><p>在梯度计算前计入指定资源池；请求数、Token 和请求历史不变</p></div></div>
+            <div class="section-band__body section-band__body--flush">
+              <v-data-table
+                :headers="[{title:'账期',key:'cycle'},{title:'资源池',key:'pool'},{title:'用户',key:'user'},{title:'等效用量',key:'amount_usd'},{title:'原因',key:'reason'},{title:'时间',key:'at'}]"
+                :items="admin.manual_usage_adjustments || []"
+                :items-per-page="25"
+              >
+                <template #item.user="{ item }"><div>{{ item.user }}</div><div class="data-muted text-caption mono">{{ item.user_id }}</div></template>
+                <template #item.amount_usd="{ item }"><span class="mono">{{ money(item.amount_usd) }}</span></template>
+              </v-data-table>
+            </div>
+          </section>
+          <section class="section-band">
+            <div class="section-band__head"><div><h2>最近最终费用调整</h2><p>在资源池分摊完成后直接增减人民币应付金额</p></div></div>
             <div class="section-band__body section-band__body--flush"><v-data-table :headers="[{title:'账期',key:'cycle'},{title:'用户',key:'user_id'},{title:'金额',key:'amount'},{title:'原因',key:'reason'},{title:'时间',key:'at'}]" :items="admin.adjustments || []" :items-per-page="25"><template #item.amount="{ item }"><span class="mono">{{ money(item.amount, '¥') }}</span></template></v-data-table></div>
           </section>
         </v-window-item>
@@ -499,7 +550,26 @@ onMounted(load)
 
     <v-dialog v-model="closeDialog.open" max-width="520"><v-card><v-card-title>关闭账期 {{ closeDialog.cycle?.name }}</v-card-title><v-card-text><v-alert type="error" variant="tonal" border="start" class="mb-4">关闭后价格版本、梯度规则和账单金额被冻结且不可修改。</v-alert><v-checkbox v-model="closeDialog.confirm_close" label="确认冻结账单" /><v-checkbox v-if="closeDialog.cycle?.waiver" v-model="closeDialog.confirm_waiver" label="确认数据质量说明" /></v-card-text><v-card-actions><v-spacer /><v-btn variant="text" @click="closeDialog.open = false">取消</v-btn><v-btn color="error" :loading="mutating" @click="closeCycle">关闭账期</v-btn></v-card-actions></v-card></v-dialog>
 
-    <v-dialog v-model="adjustmentDialog.open" max-width="560"><v-card><v-card-title>人工调整</v-card-title><v-card-text><v-select v-model="adjustmentDialog.cycle" :items="admin.cycles || []" item-title="name" item-value="name" label="账期" /><v-text-field v-model="adjustmentDialog.telegram_user_id" label="Telegram 用户 ID" type="number" /><v-text-field v-model="adjustmentDialog.amount_cents" label="金额（分，可为负数）" type="number" /><v-textarea v-model="adjustmentDialog.reason" label="原因" rows="2" /></v-card-text><v-card-actions><v-spacer /><v-btn variant="text" @click="adjustmentDialog.open = false">取消</v-btn><v-btn color="primary" :loading="mutating" @click="createAdjustment">添加</v-btn></v-card-actions></v-card></v-dialog>
+    <v-dialog v-model="adjustmentDialog.open" max-width="560"><v-card><v-card-title>调整最终费用</v-card-title><v-card-text><v-select v-model="adjustmentDialog.cycle" :items="admin.cycles || []" item-title="name" item-value="name" label="账期" /><v-text-field v-model="adjustmentDialog.telegram_user_id" label="Telegram 用户 ID" type="number" /><v-text-field v-model="adjustmentDialog.amount_cents" label="最终应付调整（人民币分，可为负数）" type="number" /><v-textarea v-model="adjustmentDialog.reason" label="原因" rows="2" /></v-card-text><v-card-actions><v-spacer /><v-btn variant="text" @click="adjustmentDialog.open = false">取消</v-btn><v-btn color="primary" :loading="mutating" @click="createAdjustment">添加</v-btn></v-card-actions></v-card></v-dialog>
+
+    <v-dialog v-model="manualUsageDialog.open" max-width="620">
+      <v-card>
+        <v-card-title>添加原始等效用量</v-card-title>
+        <v-card-text>
+          <v-alert type="info" variant="tonal" class="mb-4">
+            该数值以 USD 等效成本计入梯度和资源池分摊，不会生成请求、Token 或 CPAMP 事件。负数仅可冲销此前手动添加的用量。
+          </v-alert>
+          <div class="dialog-grid">
+            <v-select :model-value="manualUsageDialog.cycle" :items="openCycles" item-title="name" item-value="name" label="未关闭账期" @update:model-value="selectManualUsageCycle" />
+            <v-select v-model="manualUsageDialog.pool_id" :items="manualUsagePools" item-title="pool" item-value="pool_id" label="资源池" />
+            <v-autocomplete v-model="manualUsageDialog.telegram_user_id" :items="registeredUsers" item-title="name" item-value="id" label="Telegram 用户" />
+            <v-text-field v-model="manualUsageDialog.amount_usd" label="原始等效用量（USD）" type="number" step="0.000000001" prefix="$" />
+            <v-textarea v-model="manualUsageDialog.reason" label="原因" rows="2" class="dialog-wide" />
+          </div>
+        </v-card-text>
+        <v-card-actions><v-spacer /><v-btn variant="text" @click="manualUsageDialog.open = false">取消</v-btn><v-btn color="primary" :loading="mutating" :disabled="!manualUsageDialog.cycle || !manualUsageDialog.pool_id || !manualUsageDialog.telegram_user_id || !manualUsageDialog.amount_usd || !manualUsageDialog.reason.trim()" @click="createManualUsage"><Activity :size="16" class="mr-2" />计入账期</v-btn></v-card-actions>
+      </v-card>
+    </v-dialog>
 
     <v-dialog v-model="transferDialog.open" max-width="560"><v-card><v-card-title>变更 Key 归属</v-card-title><v-card-text><v-text-field v-model="transferDialog.key_id" label="Key ID" type="number" min="1" /><v-text-field v-model="transferDialog.telegram_user_id" label="新 Telegram 用户 ID" type="number" /><v-textarea v-model="transferDialog.reason" label="原因" rows="2" /><v-checkbox v-model="transferDialog.confirm_transfer" label="确认默认仅影响未来用量" /></v-card-text><v-card-actions><v-spacer /><v-btn variant="text" @click="transferDialog.open = false">取消</v-btn><v-btn color="error" :loading="mutating" @click="transferOwnership">执行</v-btn></v-card-actions></v-card></v-dialog>
 

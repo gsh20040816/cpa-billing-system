@@ -241,3 +241,46 @@ def test_admin_billing_rule_and_key_profile_endpoints(settings, monkeypatch) -> 
     )
     assert pricing.status_code == 200
     assert pricing.json()["rated_events"] == 10
+
+
+def test_admin_can_add_exact_manual_usage_with_independent_auth_and_csrf(settings) -> None:
+    app = create_app(settings)
+    add_user(app, settings, 2, "sk-cpa-user-two-secret")
+    app.state.service.create_cycle("manual-web", "1970-01-01T08:00", "1970-01-02T08:00", 1000)
+    client = TestClient(app, base_url="https://billing.example")
+    payload = {
+        "cycle": "manual-web",
+        "pool_id": 1,
+        "telegram_user_id": 2,
+        "amount_usd": "1.234567891",
+        "reason": "补录测试用量",
+    }
+
+    assert client.post("/api/admin/manual-usage-adjustments", json=payload).status_code == 401
+    login = client.post("/auth/admin/login", json={"management_token": settings.admin_token})
+    csrf = login.json()["csrf_token"]
+    assert client.post("/api/admin/manual-usage-adjustments", json=payload).status_code == 403
+    created = client.post(
+        "/api/admin/manual-usage-adjustments",
+        headers={"X-CSRF-Token": csrf},
+        json=payload,
+    )
+    assert created.status_code == 200
+    assert created.json()["id"] >= 1
+
+    snapshot = client.get("/api/admin/snapshot").json()["admin"]
+    row = snapshot["manual_usage_adjustments"][0]
+    assert row["cycle"] == "manual-web"
+    assert row["pool"] == "default-cpa"
+    assert row["user_id"] == 2
+    assert row["amount_usd"] == "1.234567891"
+    assert row["reason"] == "补录测试用量"
+    assert snapshot["audits"][0]["operation"] == "manual-usage.create"
+
+    invalid_precision = client.post(
+        "/api/admin/manual-usage-adjustments",
+        headers={"X-CSRF-Token": csrf},
+        json={**payload, "amount_usd": "0.0000000001"},
+    )
+    assert invalid_precision.status_code == 400
+    assert "九位小数" in invalid_precision.json()["error"]

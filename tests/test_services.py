@@ -15,6 +15,7 @@ import pytest
 from sqlalchemy import func, select
 
 from cpa_billing.database import Database
+from cpa_billing.domain import NANO_USD
 from cpa_billing.models import (
     APIKey,
     Adjustment,
@@ -22,12 +23,14 @@ from cpa_billing.models import (
     CyclePoolCost,
     GradientRule,
     KeyOwnershipPeriod,
+    ManualUsageAdjustment,
     MeteredKeyCharge,
     PricingVersion,
     RatedEvent,
     RawUsageEvent,
     ResourcePool,
     Statement,
+    StatementLine,
     SyncCheckpoint,
     TelegramUser,
 )
@@ -142,6 +145,112 @@ def test_adjustment_only_user_gets_statement(service) -> None:
     assert len(statements) == 1
     assert statements[0].amount_cents == 250
     assert statements[0].adjustment_cents == 250
+
+
+def test_manual_usage_is_applied_before_gradient_without_creating_requests(service) -> None:
+    create_owner(service, "key", 2, 0)
+    service.create_cycle("manual-cycle", "1970-01-01T08:00", "1970-01-02T08:00", 10000)
+    with service.db.session() as session:
+        pool_id = session.scalar(select(ResourcePool.id).where(ResourcePool.name == "default-cpa"))
+
+    adjustment_id = service.add_manual_usage_adjustment(
+        "manual-cycle",
+        pool_id,
+        2,
+        400 * NANO_USD,
+        "补录线下消耗",
+        None,
+        operator_type="web-admin",
+    )
+    statements = service.preview_cycle("manual-cycle")
+    assert len(statements) == 1
+    assert statements[0].actual_weight_nano_usd == 400 * NANO_USD
+    assert statements[0].billed_weight_nano_usd == 390 * NANO_USD
+    assert statements[0].amount_cents == 10000
+
+    dashboard = service.dashboard("manual-cycle")
+    row = next(item for item in dashboard["rows"] if item["telegram_user_id"] == 2)
+    assert row["requests"] == 0
+    assert row["tokens"] == 0
+    assert row["request_actual"] == "0.0000"
+    assert row["manual_actual"] == "400.0000"
+    assert row["actual"] == "400.0000"
+    assert dashboard["totals"]["manual_actual"] == "400.0000"
+    assert dashboard["totals"]["actual"] == "400.0000"
+    assert service.request_history(2)["pagination"]["total"] == 0
+    with service.db.session() as session:
+        assert session.get(ManualUsageAdjustment, adjustment_id).amount_nano_usd == 400 * NANO_USD
+        assert session.scalar(select(func.count()).select_from(RawUsageEvent)) == 0
+
+
+def test_manual_usage_only_affects_its_configured_resource_pool(service) -> None:
+    create_owner(service, "key-two", 2, 0)
+    create_owner(service, "key-three", 3, 0)
+    with service.db.session() as session:
+        default_pool = session.scalar(select(ResourcePool).where(ResourcePool.name == "default-cpa"))
+        second_pool = ResourcePool(name="second-pool", active=True, created_at_ms=1)
+        session.add(second_pool)
+        session.flush()
+        default_pool_id, second_pool_id = default_pool.id, second_pool.id
+    service.create_cycle(
+        "multi-pool",
+        "1970-01-01T08:00",
+        "1970-01-02T08:00",
+        0,
+        pool_costs=[
+            {"pool_id": default_pool_id, "fixed_cost_cents": 1000},
+            {"pool_id": second_pool_id, "fixed_cost_cents": 2000},
+        ],
+    )
+    service.add_manual_usage_adjustment("multi-pool", default_pool_id, 2, NANO_USD, "pool one", None)
+    service.add_manual_usage_adjustment("multi-pool", second_pool_id, 3, 2 * NANO_USD, "pool two", None)
+    statements = service.preview_cycle("multi-pool")
+    assert {row.telegram_user_id: row.amount_cents for row in statements} == {2: 1000, 3: 2000}
+    with service.db.session() as session:
+        lines = list(session.scalars(select(StatementLine).join(Statement).where(
+            Statement.cycle_id == session.scalar(select(BillingCycle.id).where(BillingCycle.name == "multi-pool"))
+        )))
+    assert {(line.pool_id, line.actual_weight_nano_usd) for line in lines} == {
+        (default_pool_id, NANO_USD),
+        (second_pool_id, 2 * NANO_USD),
+    }
+
+
+def test_manual_usage_reversals_are_append_only_and_cannot_overdraw(service) -> None:
+    create_owner(service, "key", 2, 0)
+    service.create_cycle("manual-reversal", "1970-01-01T08:00", "1970-01-02T08:00", 0)
+    with service.db.session() as session:
+        pool_id = session.scalar(select(ResourcePool.id).where(ResourcePool.name == "default-cpa"))
+    service.add_manual_usage_adjustment("manual-reversal", pool_id, 2, 1_234_567_890, "initial", None)
+    service.add_manual_usage_adjustment("manual-reversal", pool_id, 2, -234_567_890, "reverse error", None)
+    statement = service.preview_cycle("manual-reversal")[0]
+    assert statement.actual_weight_nano_usd == NANO_USD
+    with service.db.session() as session:
+        rows = list(session.scalars(select(ManualUsageAdjustment).order_by(ManualUsageAdjustment.id)))
+    assert [row.amount_nano_usd for row in rows] == [1_234_567_890, -234_567_890]
+    with pytest.raises(BillingError, match="冲销金额不能超过"):
+        service.add_manual_usage_adjustment("manual-reversal", pool_id, 2, -NANO_USD - 1, "overdraw", None)
+    with pytest.raises(BillingError, match="不能为零"):
+        service.add_manual_usage_adjustment("manual-reversal", pool_id, 2, 0, "zero", None)
+
+
+def test_manual_usage_rejects_invalid_subject_pool_and_closed_cycle(service) -> None:
+    create_owner(service, "key", 2, 0)
+    service.create_cycle("manual-closed", "1970-01-01T08:00", "1970-01-02T08:00", 0)
+    with service.db.session() as session:
+        pool_id = session.scalar(select(ResourcePool.id).where(ResourcePool.name == "default-cpa"))
+        unregistered = TelegramUser(telegram_user_id=9, username="u9", registered_at_ms=None, last_seen_at_ms=1)
+        unconfigured_pool = ResourcePool(name="unconfigured-pool", active=True, created_at_ms=1)
+        session.add_all([unregistered, unconfigured_pool])
+        session.flush()
+        unconfigured_pool_id = unconfigured_pool.id
+    with pytest.raises(BillingError, match="尚未注册"):
+        service.add_manual_usage_adjustment("manual-closed", pool_id, 9, NANO_USD, "invalid user", None)
+    with pytest.raises(BillingError, match="未配置到该账期"):
+        service.add_manual_usage_adjustment("manual-closed", unconfigured_pool_id, 2, NANO_USD, "invalid pool", None)
+    service.close_cycle("manual-closed", 1, False)
+    with pytest.raises(BillingError, match="已经关闭"):
+        service.add_manual_usage_adjustment("manual-closed", pool_id, 2, NANO_USD, "too late", None)
 
 
 def test_closed_cycle_is_immutable(service, settings) -> None:

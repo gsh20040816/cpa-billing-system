@@ -22,7 +22,7 @@ const own = computed(() => Number(session?.value?.telegram_user_id) === Number(r
 const metrics = computed(() => [
   { label: '请求', value: number(data.value?.summary?.requests), mono: true },
   { label: 'Tokens', value: number(data.value?.summary?.tokens), mono: true },
-  { label: '等效成本', value: money(data.value?.summary?.cost), mono: true },
+  { label: '请求等效成本', value: money(data.value?.summary?.cost), mono: true },
   { label: '成功率', value: data.value?.summary?.success_rate || '-', mono: true },
   { label: '失败', value: number(data.value?.summary?.failed), mono: true },
   { label: '长上下文', value: number(data.value?.summary?.long_context), mono: true },
@@ -61,8 +61,9 @@ onMounted(load)
       <v-alert v-if="data?.statement?.live" type="info" variant="tonal" density="compact" class="mb-4">
         当前为开放账期实时估算，更新于 {{ dateTime(data.statement.generated_at) }}。
       </v-alert>
-      <div v-if="data?.statement" class="metric-rail" style="--metric-columns: 3">
+      <div v-if="data?.statement" class="metric-rail" style="--metric-columns: 4">
         <div class="metric-rail__item"><div class="metric-rail__label">实际等效</div><div class="metric-rail__value mono">{{ money(data.statement.actual) }}</div></div>
+        <div class="metric-rail__item"><div class="metric-rail__label">人工补录</div><div class="metric-rail__value mono">{{ money(data.statement.manual_actual) }}</div></div>
         <div class="metric-rail__item"><div class="metric-rail__label">梯度计费</div><div class="metric-rail__value mono">{{ money(data.statement.billed) }}</div></div>
         <div class="metric-rail__item"><div class="metric-rail__label">应付</div><div class="metric-rail__value mono">{{ money(data.statement.amount, '¥') }}</div></div>
       </div>
