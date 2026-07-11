@@ -21,4 +21,11 @@ export default defineConfig({
       '/auth': 'http://127.0.0.1:18417',
     },
   },
+  test: {
+    server: {
+      deps: {
+        inline: [/vuetify/],
+      },
+    },
+  },
 })
