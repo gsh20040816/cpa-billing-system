@@ -32,6 +32,7 @@ def test_web_has_no_registration_and_hides_other_users_keys(settings, monkeypatc
     unauthenticated = client.get("/", follow_redirects=False)
     assert unauthenticated.status_code == 303
     assert unauthenticated.headers["location"] == "/login"
+    assert client.get("/favicon.ico").status_code == 200
     assert client.get("/register").status_code == 404
     response = client.post("/auth/api-key/login", data={"api_key": "sk-cpa-user-two-secret"}, follow_redirects=False)
     assert response.status_code == 303

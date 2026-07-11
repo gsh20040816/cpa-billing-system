@@ -12,7 +12,7 @@ from typing import Any
 import httpx
 from fastapi import Depends, FastAPI, Form, HTTPException, Query, Request, status
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from jinja2 import StrictUndefined
@@ -179,6 +179,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/healthz")
     def health() -> dict[str, str]:
         return {"status": "ok"}
+
+    @app.get("/favicon.ico", include_in_schema=False)
+    def favicon() -> FileResponse:
+        return FileResponse(ROOT / "static" / "favicon.svg", media_type="image/svg+xml")
 
     @app.get("/login", response_class=HTMLResponse)
     def login_page(request: Request) -> Any:
