@@ -26,7 +26,7 @@ const cycleConfigDialog = reactive({
 const closeDialog = reactive({ open: false, cycle: null, confirm_close: false, confirm_waiver: false })
 const adjustmentDialog = reactive({ open: false, cycle: '', telegram_user_id: '', amount_cents: '', reason: '' })
 const manualUsageDialog = reactive({
-  open: false, cycle: '', pool_id: null, telegram_user_id: null, amount_usd: '', reason: '',
+  open: false, id: null, cycle: '', pool_id: null, telegram_user_id: null, amount_usd: '', reason: '',
 })
 const transferDialog = reactive({ open: false, key_id: '', telegram_user_id: '', reason: '', confirm_transfer: false })
 const poolDialog = reactive({ open: false, name: '', auth_pattern: '', model_pattern: '', priority: 100 })
@@ -179,10 +179,23 @@ function selectManualUsageCycle(cycleName) {
   manualUsageDialog.pool_id = cycle?.pool_costs?.[0]?.pool_id || null
 }
 
-function openManualUsage() {
+function openManualUsage(item = null) {
+  if (item) {
+    Object.assign(manualUsageDialog, {
+      open: true,
+      id: item.id,
+      cycle: item.cycle,
+      pool_id: item.pool_id,
+      telegram_user_id: item.user_id,
+      amount_usd: item.amount_usd,
+      reason: item.reason,
+    })
+    return
+  }
   const cycle = openCycles.value[0]
   Object.assign(manualUsageDialog, {
     open: true,
+    id: null,
     cycle: cycle?.name || '',
     pool_id: cycle?.pool_costs?.[0]?.pool_id || null,
     telegram_user_id: registeredUsers.value[0]?.id || null,
@@ -191,14 +204,18 @@ function openManualUsage() {
   })
 }
 
-async function createManualUsage() {
-  const result = await mutate('/api/admin/manual-usage-adjustments', {
+async function saveManualUsage() {
+  const editing = Boolean(manualUsageDialog.id)
+  const path = editing
+    ? `/api/admin/manual-usage-adjustments/${manualUsageDialog.id}`
+    : '/api/admin/manual-usage-adjustments'
+  const result = await mutate(path, {
     cycle: manualUsageDialog.cycle,
     pool_id: Number(manualUsageDialog.pool_id),
     telegram_user_id: Number(manualUsageDialog.telegram_user_id),
     amount_usd: String(manualUsageDialog.amount_usd),
     reason: manualUsageDialog.reason,
-  }, '原始等效用量已计入账期')
+  }, editing ? '补录信息已更新并重新计算账期' : '原始等效用量已计入账期', editing ? 'PUT' : 'POST')
   if (result) manualUsageDialog.open = false
 }
 
@@ -497,17 +514,19 @@ onMounted(load)
         </v-window-item>
 
         <v-window-item value="adjustments">
-          <div class="d-flex flex-wrap ga-2 mb-4"><v-btn color="primary" :disabled="!openCycles.length || !registeredUsers.length" @click="openManualUsage"><Activity :size="16" class="mr-2" />添加原始用量</v-btn><v-btn variant="outlined" @click="adjustmentDialog.open = true"><Scale :size="16" class="mr-2" />调整最终费用</v-btn><v-btn color="secondary" @click="transferDialog.open = true"><Shuffle :size="16" class="mr-2" />变更归属</v-btn></div>
+          <div class="d-flex flex-wrap ga-2 mb-4"><v-btn color="primary" :disabled="!openCycles.length || !registeredUsers.length" @click="openManualUsage()"><Activity :size="16" class="mr-2" />添加原始用量</v-btn><v-btn variant="outlined" @click="adjustmentDialog.open = true"><Scale :size="16" class="mr-2" />调整最终费用</v-btn><v-btn color="secondary" @click="transferDialog.open = true"><Shuffle :size="16" class="mr-2" />变更归属</v-btn></div>
           <section class="section-band">
-            <div class="section-band__head"><div><h2>最近手动原始用量</h2><p>在梯度计算前计入指定资源池；请求数、Token 和请求历史不变</p></div></div>
+            <div class="section-band__head"><div><h2>手动原始用量记录</h2><p>全部记录均可分页查看；未关闭账期中的记录可以编辑更新</p></div></div>
             <div class="section-band__body section-band__body--flush">
               <v-data-table
-                :headers="[{title:'账期',key:'cycle'},{title:'资源池',key:'pool'},{title:'用户',key:'user'},{title:'等效用量',key:'amount_usd'},{title:'原因',key:'reason'},{title:'时间',key:'at'}]"
+                :headers="[{title:'账期',key:'cycle'},{title:'资源池',key:'pool'},{title:'用户',key:'user'},{title:'等效用量',key:'amount_usd'},{title:'原因',key:'reason'},{title:'最近变更',key:'at'},{title:'操作',key:'actions',sortable:false}]"
                 :items="admin.manual_usage_adjustments || []"
                 :items-per-page="25"
               >
                 <template #item.user="{ item }"><div>{{ item.user }}</div><div class="data-muted text-caption mono">{{ item.user_id }}</div></template>
                 <template #item.amount_usd="{ item }"><span class="mono">{{ money(item.amount_usd) }}</span></template>
+                <template #item.at="{ item }"><div>{{ item.updated_at || item.created_at }}</div><div v-if="item.updated_at" class="data-muted text-caption">创建于 {{ item.created_at }}</div></template>
+                <template #item.actions="{ item }"><v-btn v-if="item.editable" size="small" variant="text" @click="openManualUsage(item)"><Edit3 :size="15" class="mr-1" />编辑</v-btn><span v-else class="data-muted">已冻结</span></template>
               </v-data-table>
             </div>
           </section>
@@ -554,10 +573,10 @@ onMounted(load)
 
     <v-dialog v-model="manualUsageDialog.open" max-width="620">
       <v-card>
-        <v-card-title>添加原始等效用量</v-card-title>
+        <v-card-title>{{ manualUsageDialog.id ? '编辑原始等效用量' : '添加原始等效用量' }}</v-card-title>
         <v-card-text>
           <v-alert type="info" variant="tonal" class="mb-4">
-            该数值以 USD 等效成本计入梯度和资源池分摊，不会生成请求、Token 或 CPAMP 事件。负数仅可冲销此前手动添加的用量。
+            所有业务字段均可更新，保存后会重新计算原账期和目标账期。不会生成请求、Token 或 CPAMP 事件；负数不能使补录余额低于零。
           </v-alert>
           <div class="dialog-grid">
             <v-select :model-value="manualUsageDialog.cycle" :items="openCycles" item-title="name" item-value="name" label="未关闭账期" @update:model-value="selectManualUsageCycle" />
@@ -567,7 +586,7 @@ onMounted(load)
             <v-textarea v-model="manualUsageDialog.reason" label="原因" rows="2" class="dialog-wide" />
           </div>
         </v-card-text>
-        <v-card-actions><v-spacer /><v-btn variant="text" @click="manualUsageDialog.open = false">取消</v-btn><v-btn color="primary" :loading="mutating" :disabled="!manualUsageDialog.cycle || !manualUsageDialog.pool_id || !manualUsageDialog.telegram_user_id || !manualUsageDialog.amount_usd || !manualUsageDialog.reason.trim()" @click="createManualUsage"><Activity :size="16" class="mr-2" />计入账期</v-btn></v-card-actions>
+        <v-card-actions><v-spacer /><v-btn variant="text" @click="manualUsageDialog.open = false">取消</v-btn><v-btn color="primary" :loading="mutating" :disabled="!manualUsageDialog.cycle || !manualUsageDialog.pool_id || !manualUsageDialog.telegram_user_id || !manualUsageDialog.amount_usd || !manualUsageDialog.reason.trim()" @click="saveManualUsage"><Save :size="16" class="mr-2" />{{ manualUsageDialog.id ? '保存修改' : '计入账期' }}</v-btn></v-card-actions>
       </v-card>
     </v-dialog>
 

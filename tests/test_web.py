@@ -266,7 +266,8 @@ def test_admin_can_add_exact_manual_usage_with_independent_auth_and_csrf(setting
         json=payload,
     )
     assert created.status_code == 200
-    assert created.json()["id"] >= 1
+    adjustment_id = created.json()["id"]
+    assert adjustment_id >= 1
 
     snapshot = client.get("/api/admin/snapshot").json()["admin"]
     row = snapshot["manual_usage_adjustments"][0]
@@ -275,7 +276,24 @@ def test_admin_can_add_exact_manual_usage_with_independent_auth_and_csrf(setting
     assert row["user_id"] == 2
     assert row["amount_usd"] == "1.234567891"
     assert row["reason"] == "补录测试用量"
+    assert row["editable"] is True
+    assert row["updated_at"] is None
     assert snapshot["audits"][0]["operation"] == "manual-usage.create"
+
+    updated_payload = {**payload, "amount_usd": "2.500000001", "reason": "更新后的补录说明"}
+    assert client.put(f"/api/admin/manual-usage-adjustments/{adjustment_id}", json=updated_payload).status_code == 403
+    updated = client.put(
+        f"/api/admin/manual-usage-adjustments/{adjustment_id}",
+        headers={"X-CSRF-Token": csrf},
+        json=updated_payload,
+    )
+    assert updated.status_code == 200
+    snapshot = client.get("/api/admin/snapshot").json()["admin"]
+    row = snapshot["manual_usage_adjustments"][0]
+    assert row["amount_usd"] == "2.500000001"
+    assert row["reason"] == "更新后的补录说明"
+    assert row["updated_at"] is not None
+    assert snapshot["audits"][0]["operation"] == "manual-usage.update"
 
     invalid_precision = client.post(
         "/api/admin/manual-usage-adjustments",

@@ -12,7 +12,7 @@ Required secrets are `CPA_MANAGEMENT_KEY`, `BILLING_KEY_PEPPER`, `BILLING_SESSIO
 
 Keeper integration additionally uses `KEEPER_BASE_URL` and `KEEPER_LOGIN_PASSWORD`. The user-facing API only exposes sanitized account IDs and never returns Keeper auth indexes, credential files, or paths. Quota refresh calls Keeper's refresh task API; no quota reset endpoint is exposed.
 
-The administrator console can append manual raw equivalent usage in USD to a registered Telegram user and a configured cycle resource pool. These entries are applied before gradient billing and allocation, do not create request or token records, and are never edited in place. A mistaken entry is corrected with a negative reversal that cannot exceed the previously appended manual balance.
+The administrator console can add manual raw equivalent usage in USD to a registered Telegram user and a configured cycle resource pool. These entries are applied before gradient billing and allocation and do not create request or token records. While the source and target cycles remain open, administrators may update every business field; each update preserves creation metadata, records before/after audit values, and recalculates both affected cycles. Negative values cannot make a cycle, pool, and user manual balance fall below zero.
 
 ## Web development
 

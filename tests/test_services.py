@@ -19,6 +19,7 @@ from cpa_billing.domain import NANO_USD
 from cpa_billing.models import (
     APIKey,
     Adjustment,
+    AuditLog,
     BillingCycle,
     CyclePoolCost,
     GradientRule,
@@ -216,7 +217,7 @@ def test_manual_usage_only_affects_its_configured_resource_pool(service) -> None
     }
 
 
-def test_manual_usage_reversals_are_append_only_and_cannot_overdraw(service) -> None:
+def test_manual_usage_reversals_preserve_balance_and_cannot_overdraw(service) -> None:
     create_owner(service, "key", 2, 0)
     service.create_cycle("manual-reversal", "1970-01-01T08:00", "1970-01-02T08:00", 0)
     with service.db.session() as session:
@@ -232,6 +233,125 @@ def test_manual_usage_reversals_are_append_only_and_cannot_overdraw(service) -> 
         service.add_manual_usage_adjustment("manual-reversal", pool_id, 2, -NANO_USD - 1, "overdraw", None)
     with pytest.raises(BillingError, match="不能为零"):
         service.add_manual_usage_adjustment("manual-reversal", pool_id, 2, 0, "zero", None)
+
+
+def test_manual_usage_update_moves_all_business_fields_and_recalculates_cycles(service) -> None:
+    create_owner(service, "key-two", 2, 0)
+    create_owner(service, "key-three", 3, 0)
+    with service.db.session() as session:
+        default_pool_id = session.scalar(select(ResourcePool.id).where(ResourcePool.name == "default-cpa"))
+        target_pool = ResourcePool(name="target-pool", active=True, created_at_ms=1)
+        session.add(target_pool)
+        session.flush()
+        target_pool_id = target_pool.id
+    service.create_cycle("manual-source", "1970-01-01T08:00", "1970-01-02T08:00", 1000)
+    service.create_cycle(
+        "manual-target",
+        "1970-01-02T08:00",
+        "1970-01-03T08:00",
+        0,
+        pool_costs=[{"pool_id": target_pool_id, "fixed_cost_cents": 2000}],
+    )
+    adjustment_id = service.add_manual_usage_adjustment(
+        "manual-source", default_pool_id, 2, 400 * NANO_USD, "source usage", None,
+    )
+    service.preview_cycle("manual-source")
+
+    service.update_manual_usage_adjustment(
+        adjustment_id,
+        "manual-target",
+        target_pool_id,
+        3,
+        50 * NANO_USD,
+        "moved usage",
+        None,
+        operator_type="web-admin",
+    )
+
+    source = service.dashboard("manual-source")
+    target = service.dashboard("manual-target")
+    assert next(row for row in source["rows"] if row["telegram_user_id"] == 2)["manual_actual"] == "0.0000"
+    target_row = next(row for row in target["rows"] if row["telegram_user_id"] == 3)
+    assert target_row["manual_actual"] == "50.0000"
+    assert target_row["amount"] == "20.00"
+    with service.db.session() as session:
+        row = session.get(ManualUsageAdjustment, adjustment_id)
+        source_cycle = session.scalar(select(BillingCycle).where(BillingCycle.name == "manual-source"))
+        target_cycle = session.scalar(select(BillingCycle).where(BillingCycle.name == "manual-target"))
+        audit = session.scalar(select(AuditLog).where(AuditLog.operation == "manual-usage.update"))
+        assert (row.cycle_id, row.pool_id, row.telegram_user_id) == (target_cycle.id, target_pool_id, 3)
+        assert row.amount_nano_usd == 50 * NANO_USD
+        assert row.reason == "moved usage"
+        assert row.updated_at_ms is not None
+        assert source_cycle.status == "open"
+        assert session.scalar(select(func.count()).select_from(Statement).where(Statement.cycle_id == source_cycle.id)) == 0
+        assert json.loads(audit.before_json)["cycle"] == "manual-source"
+        assert json.loads(audit.after_json)["cycle"] == "manual-target"
+    snapshot = service.admin_snapshot()["manual_usage_adjustments"][0]
+    assert snapshot["editable"] is True
+    assert snapshot["updated_at"] is not None
+
+
+def test_manual_usage_update_preserves_group_balances_and_closed_cycles(service) -> None:
+    create_owner(service, "key", 2, 0)
+    service.create_cycle("manual-edit", "1970-01-01T08:00", "1970-01-02T08:00", 0)
+    service.create_cycle("manual-edit-target", "1970-01-02T08:00", "1970-01-03T08:00", 0)
+    with service.db.session() as session:
+        pool_id = session.scalar(select(ResourcePool.id).where(ResourcePool.name == "default-cpa"))
+    positive_id = service.add_manual_usage_adjustment("manual-edit", pool_id, 2, 1_200_000_000, "positive", None)
+    negative_id = service.add_manual_usage_adjustment("manual-edit", pool_id, 2, -200_000_000, "reversal", None)
+
+    with pytest.raises(BillingError, match="目标补录余额为负数"):
+        service.update_manual_usage_adjustment(positive_id, "manual-edit", pool_id, 2, 100_000_000, "too small", None)
+    with pytest.raises(BillingError, match="已有后续冲销"):
+        service.update_manual_usage_adjustment(
+            positive_id, "manual-edit-target", pool_id, 2, 1_200_000_000, "move positive", None,
+        )
+    with pytest.raises(BillingError, match="目标补录余额为负数"):
+        service.update_manual_usage_adjustment(negative_id, "manual-edit", pool_id, 2, -1_300_000_000, "too negative", None)
+    with pytest.raises(BillingError, match="没有变化"):
+        service.update_manual_usage_adjustment(positive_id, "manual-edit", pool_id, 2, 1_200_000_000, "positive", None)
+
+    service.close_cycle("manual-edit", 1, False)
+    with pytest.raises(BillingError, match="已关闭账期"):
+        service.update_manual_usage_adjustment(positive_id, "manual-edit", pool_id, 2, NANO_USD, "late edit", None)
+
+
+def test_manual_usage_update_rejects_closed_target_cycle(service) -> None:
+    create_owner(service, "key", 2, 0)
+    service.create_cycle("manual-open-source", "1970-01-01T08:00", "1970-01-02T08:00", 0)
+    service.create_cycle("manual-closed-target", "1970-01-02T08:00", "1970-01-03T08:00", 0)
+    with service.db.session() as session:
+        pool_id = session.scalar(select(ResourcePool.id).where(ResourcePool.name == "default-cpa"))
+    adjustment_id = service.add_manual_usage_adjustment(
+        "manual-open-source", pool_id, 2, NANO_USD, "source", None,
+    )
+    service.close_cycle("manual-closed-target", 1, False)
+    with pytest.raises(BillingError, match="已经关闭"):
+        service.update_manual_usage_adjustment(
+            adjustment_id, "manual-closed-target", pool_id, 2, NANO_USD, "closed target", None,
+        )
+
+
+def test_admin_snapshot_lists_all_manual_usage_records(service) -> None:
+    create_owner(service, "key", 2, 0)
+    service.create_cycle("manual-list", "1970-01-01T08:00", "1970-01-02T08:00", 0)
+    with service.db.session() as session:
+        cycle_id = session.scalar(select(BillingCycle.id).where(BillingCycle.name == "manual-list"))
+        pool_id = session.scalar(select(ResourcePool.id).where(ResourcePool.name == "default-cpa"))
+        session.add_all([
+            ManualUsageAdjustment(
+                cycle_id=cycle_id,
+                pool_id=pool_id,
+                telegram_user_id=2,
+                amount_nano_usd=NANO_USD,
+                reason=f"record {index}",
+                operator_user_id=None,
+                created_at_ms=index + 1,
+            )
+            for index in range(101)
+        ])
+    assert len(service.admin_snapshot()["manual_usage_adjustments"]) == 101
 
 
 def test_manual_usage_rejects_invalid_subject_pool_and_closed_cycle(service) -> None:

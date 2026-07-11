@@ -730,6 +730,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         return {"ok": True, "id": adjustment_id}
 
+    @app.put("/api/admin/manual-usage-adjustments/{adjustment_id}")
+    def api_update_manual_usage_adjustment(
+        adjustment_id: int,
+        payload: ManualUsageAdjustmentPayload,
+        request: Request,
+        auth: Any = Depends(admin_current),
+    ) -> dict[str, Any]:
+        verify_csrf(request, auth)
+        updated_id = service.update_manual_usage_adjustment(
+            adjustment_id,
+            payload.cycle,
+            payload.pool_id,
+            payload.telegram_user_id,
+            _manual_usage_to_nano(payload.amount_usd),
+            payload.reason,
+            None,
+            operator_type="web-admin",
+        )
+        return {"ok": True, "id": updated_id}
+
     @app.post("/api/admin/ownership-transfers")
     def api_transfer(payload: OwnershipTransferPayload, request: Request,
                      auth: Any = Depends(admin_current)) -> dict[str, bool]:

@@ -325,6 +325,7 @@ class ManualUsageAdjustment(Base):
     reason: Mapped[str] = mapped_column(Text)
     operator_user_id: Mapped[int | None] = mapped_column(BigInteger)
     created_at_ms: Mapped[int] = mapped_column(BigInteger)
+    updated_at_ms: Mapped[int | None] = mapped_column(BigInteger)
 
 
 class AuditLog(Base):

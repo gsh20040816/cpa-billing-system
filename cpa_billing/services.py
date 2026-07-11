@@ -321,6 +321,7 @@ class BillingService:
         self.keeper = KeeperClient(settings)
         self._quota_window_starts: dict[tuple[str, str], int] = {}
         self._quota_window_lock = threading.Lock()
+        self._manual_usage_lock = threading.Lock()
 
     def bootstrap(self) -> None:
         self.db.initialize()
@@ -3165,6 +3166,64 @@ class BillingService:
                                  operation="adjustment.create",
                                  target=f"{cycle_name}:{user_id}", after_json=json.dumps({"amount_cents": amount_cents}), reason=reason, created_at_ms=now_ms()))
 
+    @staticmethod
+    def _normalize_manual_usage_input(amount_nano_usd: int, reason: str) -> str:
+        normalized_reason = reason.strip()
+        if not normalized_reason:
+            raise BillingError("手动原始用量必须填写原因")
+        if amount_nano_usd == 0:
+            raise BillingError("手动原始用量不能为零")
+        if abs(amount_nano_usd) > 9_223_372_036_854_775_807:
+            raise BillingError("手动原始用量超出可记录范围")
+        return normalized_reason
+
+    @staticmethod
+    def _manual_usage_balance(
+        session: Any,
+        cycle_id: int,
+        pool_id: int,
+        user_id: int,
+        exclude_id: int | None = None,
+    ) -> int:
+        query = select(func.sum(ManualUsageAdjustment.amount_nano_usd)).where(
+            ManualUsageAdjustment.cycle_id == cycle_id,
+            ManualUsageAdjustment.pool_id == pool_id,
+            ManualUsageAdjustment.telegram_user_id == user_id,
+        )
+        if exclude_id is not None:
+            query = query.where(ManualUsageAdjustment.id != exclude_id)
+        return int(session.scalar(query) or 0)
+
+    @staticmethod
+    def _manual_usage_state(row: ManualUsageAdjustment, cycle_name: str) -> dict[str, Any]:
+        return {
+            "cycle": cycle_name,
+            "pool_id": row.pool_id,
+            "telegram_user_id": row.telegram_user_id,
+            "amount_nano_usd": row.amount_nano_usd,
+            "amount_usd": format(Decimal(row.amount_nano_usd) / Decimal(NANO_USD), "f"),
+            "reason": row.reason,
+        }
+
+    @staticmethod
+    def _manual_usage_target(
+        session: Any,
+        cycle_name: str,
+        pool_id: int,
+        user_id: int,
+    ) -> BillingCycle:
+        cycle = session.scalar(select(BillingCycle).where(BillingCycle.name == cycle_name))
+        if cycle is None or cycle.status == "closed":
+            raise BillingError("账期不存在或已经关闭")
+        user = session.get(TelegramUser, user_id)
+        if user is None or user.registered_at_ms is None:
+            raise BillingError("Telegram 用户不存在或尚未注册")
+        pool = session.get(ResourcePool, pool_id)
+        configured = session.get(CyclePoolCost, {"cycle_id": cycle.id, "pool_id": pool_id})
+        if pool is None or configured is None:
+            raise BillingError("资源池未配置到该账期")
+        return cycle
+
     def add_manual_usage_adjustment(
         self,
         cycle_name: str,
@@ -3175,31 +3234,10 @@ class BillingService:
         operator_id: int | None,
         operator_type: str = "telegram",
     ) -> int:
-        normalized_reason = reason.strip()
-        if not normalized_reason:
-            raise BillingError("手动原始用量必须填写原因")
-        if amount_nano_usd == 0:
-            raise BillingError("手动原始用量不能为零")
-        if abs(amount_nano_usd) > 9_223_372_036_854_775_807:
-            raise BillingError("手动原始用量超出可记录范围")
-        with self.db.session() as session:
-            cycle = session.scalar(select(BillingCycle).where(BillingCycle.name == cycle_name))
-            if cycle is None or cycle.status == "closed":
-                raise BillingError("账期不存在或已经关闭")
-            user = session.get(TelegramUser, user_id)
-            if user is None or user.registered_at_ms is None:
-                raise BillingError("Telegram 用户不存在或尚未注册")
-            pool = session.get(ResourcePool, pool_id)
-            configured = session.get(CyclePoolCost, {"cycle_id": cycle.id, "pool_id": pool_id})
-            if pool is None or configured is None:
-                raise BillingError("资源池未配置到该账期")
-            current_manual = int(session.scalar(
-                select(func.sum(ManualUsageAdjustment.amount_nano_usd)).where(
-                    ManualUsageAdjustment.cycle_id == cycle.id,
-                    ManualUsageAdjustment.pool_id == pool_id,
-                    ManualUsageAdjustment.telegram_user_id == user_id,
-                )
-            ) or 0)
+        normalized_reason = self._normalize_manual_usage_input(amount_nano_usd, reason)
+        with self._manual_usage_lock, self.db.session() as session:
+            cycle = self._manual_usage_target(session, cycle_name, pool_id, user_id)
+            current_manual = self._manual_usage_balance(session, cycle.id, pool_id, user_id)
             if current_manual + amount_nano_usd < 0:
                 raise BillingError("冲销金额不能超过该用户在此资源池的手动原始用量")
             created_at = now_ms()
@@ -3219,13 +3257,65 @@ class BillingService:
                 operator_type=operator_type,
                 operator_id=str(operator_id if operator_id is not None else "admin-token"),
                 operation="manual-usage.create",
-                target=f"{cycle_name}:{pool_id}:{user_id}",
-                after_json=json.dumps({
-                    "amount_nano_usd": amount_nano_usd,
-                    "amount_usd": format(Decimal(amount_nano_usd) / Decimal(NANO_USD), "f"),
-                }),
+                target=str(row.id),
+                after_json=json.dumps(self._manual_usage_state(row, cycle.name)),
                 reason=normalized_reason,
                 created_at_ms=created_at,
+            ))
+            return row.id
+
+    def update_manual_usage_adjustment(
+        self,
+        adjustment_id: int,
+        cycle_name: str,
+        pool_id: int,
+        user_id: int,
+        amount_nano_usd: int,
+        reason: str,
+        operator_id: int | None,
+        operator_type: str = "telegram",
+    ) -> int:
+        normalized_reason = self._normalize_manual_usage_input(amount_nano_usd, reason)
+        with self._manual_usage_lock, self.db.session() as session:
+            row = session.get(ManualUsageAdjustment, adjustment_id)
+            if row is None:
+                raise BillingError("补录记录不存在")
+            source_cycle = session.get(BillingCycle, row.cycle_id)
+            if source_cycle is None or source_cycle.status == "closed":
+                raise BillingError("已关闭账期的补录不能修改")
+            target_cycle = self._manual_usage_target(session, cycle_name, pool_id, user_id)
+            before = self._manual_usage_state(row, source_cycle.name)
+            source_group = (row.cycle_id, row.pool_id, row.telegram_user_id)
+            target_group = (target_cycle.id, pool_id, user_id)
+            source_without = self._manual_usage_balance(session, *source_group, exclude_id=row.id)
+            if source_group != target_group and source_without < 0:
+                raise BillingError("该补录已有后续冲销，不能移动到其他账期、资源池或用户")
+            target_without = self._manual_usage_balance(session, *target_group, exclude_id=row.id)
+            if target_without + amount_nano_usd < 0:
+                raise BillingError("更新后会导致目标补录余额为负数")
+            if (
+                source_group == target_group
+                and row.amount_nano_usd == amount_nano_usd
+                and row.reason == normalized_reason
+            ):
+                raise BillingError("补录信息没有变化")
+            changed_at = now_ms()
+            row.cycle_id = target_cycle.id
+            row.pool_id = pool_id
+            row.telegram_user_id = user_id
+            row.amount_nano_usd = amount_nano_usd
+            row.reason = normalized_reason
+            row.updated_at_ms = changed_at
+            self._invalidate_cycle_previews(session, sorted({source_cycle.id, target_cycle.id}))
+            session.add(AuditLog(
+                operator_type=operator_type,
+                operator_id=str(operator_id if operator_id is not None else "admin-token"),
+                operation="manual-usage.update",
+                target=str(row.id),
+                before_json=json.dumps(before),
+                after_json=json.dumps(self._manual_usage_state(row, target_cycle.name)),
+                reason=normalized_reason,
+                created_at_ms=changed_at,
             ))
             return row.id
 
@@ -3386,9 +3476,12 @@ class BillingService:
                     "amount_usd": format(Decimal(row.amount_nano_usd) / Decimal(NANO_USD), "f"),
                     "reason": row.reason,
                     "operator": row.operator_user_id,
-                    "at": self._format_timestamp(row.created_at_ms),
+                    "created_at": self._format_timestamp(row.created_at_ms),
+                    "updated_at": None if row.updated_at_ms is None else self._format_timestamp(row.updated_at_ms),
+                    "at": self._format_timestamp(row.updated_at_ms or row.created_at_ms),
+                    "editable": next((cycle.status != "closed" for cycle in cycles if cycle.id == row.cycle_id), False),
                 } for row in session.scalars(
-                    select(ManualUsageAdjustment).order_by(ManualUsageAdjustment.id.desc()).limit(100)
+                    select(ManualUsageAdjustment).order_by(ManualUsageAdjustment.id.desc())
                 )],
                 "dead_letters": [{"id": d.id, "source_event_id": d.source_event_id, "error": d.error,
                                   "at": self._format_timestamp(d.created_at_ms)}
