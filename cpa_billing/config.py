@@ -20,6 +20,7 @@ class Settings:
     cpamp_admin_key: str
     key_pepper: str
     session_secret: str
+    admin_token: str
     telegram_token: str
     admin_user_ids: frozenset[int]
     allowed_group_ids: frozenset[int]
@@ -38,6 +39,7 @@ class Settings:
             "CPA_MANAGEMENT_KEY": os.getenv("CPA_MANAGEMENT_KEY", "").strip(),
             "BILLING_KEY_PEPPER": os.getenv("BILLING_KEY_PEPPER", "").strip(),
             "BILLING_SESSION_SECRET": os.getenv("BILLING_SESSION_SECRET", "").strip(),
+            "BILLING_ADMIN_TOKEN": os.getenv("BILLING_ADMIN_TOKEN", "").strip(),
         }
         missing = [name for name, value in required.items() if not value]
         if missing:
@@ -52,6 +54,7 @@ class Settings:
             cpamp_admin_key=os.getenv("CPAMP_ADMIN_KEY", "").strip(),
             key_pepper=required["BILLING_KEY_PEPPER"],
             session_secret=required["BILLING_SESSION_SECRET"],
+            admin_token=required["BILLING_ADMIN_TOKEN"],
             telegram_token=os.getenv("TG_BOT_TOKEN", "").strip(),
             admin_user_ids=_ids("ADMIN_CHAT_IDS"),
             allowed_group_ids=_ids("ALLOWED_GROUP_CHAT_IDS"),
@@ -64,4 +67,3 @@ class Settings:
             sub2_state_file=Path(os.getenv("SUB2API_TG_STATE_FILE", "/legacy-sub2/sub2api-tg.state.json")),
             sub2_postgres_dsn=os.getenv("SUB2API_POSTGRES_DSN") or None,
         )
-

@@ -20,6 +20,7 @@ from .database import Database, now_ms
 from .domain import NANO_USD, format_cents, format_usd_nano, largest_remainder, parse_tiers, tiered_weight
 from .models import (
     APIKey,
+    AdminWebSession,
     AllowedChat,
     Adjustment,
     AuditLog,
@@ -221,13 +222,20 @@ class BillingService:
                 checkpoint.last_error = None
         return imported
 
-    def import_cpamp_prices(self, name: str) -> int:
+    def import_cpamp_prices(self, name: str, operator_type: str | None = None, operator_id: str | None = None,
+                            allow_existing: bool = True) -> int:
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,80}", name):
+            raise BillingError("pricing version name must use letters, numbers, dot, underscore, or hyphen")
         with self.db.session() as session:
             existing = session.scalar(select(PricingVersion).where(PricingVersion.name == name))
             if existing is not None:
-                return existing.id
+                if allow_existing:
+                    return existing.id
+                raise BillingError("pricing version already exists")
         with self._cpamp() as source_db:
             rows = source_db.execute("select * from model_prices order by model").fetchall()
+        if not rows:
+            raise BillingError("CPAMP model_prices is empty")
         with self.db.session() as session:
             for active in session.scalars(select(PricingVersion).where(PricingVersion.status == "active")):
                 active.status = "retired"
@@ -261,6 +269,9 @@ class BillingService:
                     long_output_multiplier_ppm=_ppm(above_output / base_output) if above_output and base_output else 1_000_000,
                     raw_json=raw_text or None,
                 ))
+            if operator_type and operator_id:
+                session.add(AuditLog(operator_type=operator_type, operator_id=operator_id, operation="pricing.import",
+                                     target=name, after_json=json.dumps({"models": len(rows)}), created_at_ms=now_ms()))
             return version.id
 
     def _active_pricing_id(self, session: Any) -> int:
@@ -429,6 +440,7 @@ class BillingService:
     def create_session(self, user_id: int, api_key_id: int) -> tuple[str, str]:
         token, csrf = secure_token(), secure_token(18)
         with self.db.session() as session:
+            session.execute(delete(WebSession).where(WebSession.expires_at_ms <= now_ms()))
             session.add(WebSession(session_hash=hash_token(token, self.settings.session_secret), telegram_user_id=user_id, api_key_id=api_key_id,
                                    csrf_token=csrf, created_at_ms=now_ms(), expires_at_ms=now_ms() + self.settings.session_ttl_seconds * 1000))
         return token, csrf
@@ -441,11 +453,53 @@ class BillingService:
             if row is None or row.revoked_at_ms is not None or row.expires_at_ms <= now_ms():
                 return None
             user = session.get(TelegramUser, row.telegram_user_id)
-            return (row, user) if user else None
+            key = session.get(APIKey, row.api_key_id)
+            if user is None or key is None or key.status != "active" or key.current_owner_id != user.telegram_user_id:
+                row.revoked_at_ms = now_ms()
+                return None
+            return row, user
 
     def revoke_session(self, token: str) -> None:
         with self.db.session() as session:
             row = session.get(WebSession, hash_token(token, self.settings.session_secret))
+            if row:
+                row.revoked_at_ms = now_ms()
+
+    def authenticate_admin_token(self, raw_token: str) -> bool:
+        return constant_equal(raw_token.strip(), self.settings.admin_token)
+
+    def _admin_credential_fingerprint(self) -> str:
+        return hash_token(self.settings.admin_token, self.settings.session_secret)
+
+    def create_admin_session(self) -> tuple[str, str]:
+        token, csrf = secure_token(), secure_token(18)
+        current = now_ms()
+        with self.db.session() as session:
+            session.execute(delete(AdminWebSession).where(AdminWebSession.expires_at_ms <= current))
+            session.add(AdminWebSession(
+                session_hash=hash_token(token, self.settings.session_secret),
+                credential_fingerprint=self._admin_credential_fingerprint(),
+                csrf_token=csrf,
+                created_at_ms=current,
+                expires_at_ms=current + self.settings.session_ttl_seconds * 1000,
+            ))
+        return token, csrf
+
+    def get_admin_session(self, token: str | None) -> AdminWebSession | None:
+        if not token:
+            return None
+        with self.db.session() as session:
+            row = session.get(AdminWebSession, hash_token(token, self.settings.session_secret))
+            if row is None or row.revoked_at_ms is not None or row.expires_at_ms <= now_ms():
+                return None
+            if not constant_equal(row.credential_fingerprint, self._admin_credential_fingerprint()):
+                row.revoked_at_ms = now_ms()
+                return None
+            return row
+
+    def revoke_admin_session(self, token: str) -> None:
+        with self.db.session() as session:
+            row = session.get(AdminWebSession, hash_token(token, self.settings.session_secret))
             if row:
                 row.revoked_at_ms = now_ms()
 
@@ -510,6 +564,29 @@ class BillingService:
         current = now_ms()
         return session.scalar(query.where(BillingCycle.start_at_ms <= current, BillingCycle.end_at_ms > current).order_by(BillingCycle.start_at_ms.desc()))
 
+    def _display_cycle(self, session: Any, name: str | None = None) -> BillingCycle | None:
+        cycle = self._cycle(session, name)
+        if name and cycle is None:
+            raise BillingError("billing cycle not found")
+        if cycle is not None:
+            return cycle
+        return session.scalar(select(BillingCycle).order_by(BillingCycle.start_at_ms.desc()))
+
+    def _format_timestamp(self, value: int | None) -> str:
+        if value is None:
+            return "-"
+        return datetime.fromtimestamp(value / 1000, ZoneInfo(self.settings.timezone)).strftime("%Y-%m-%d %H:%M")
+
+    @staticmethod
+    def _user_name(user: TelegramUser | None, fallback: int | str) -> str:
+        if user and user.username:
+            return f"@{user.username}"
+        if user:
+            full_name = " ".join(value for value in (user.first_name, user.last_name) if value)
+            if full_name:
+                return full_name
+        return str(fallback)
+
     def preview_cycle(self, cycle_name: str) -> list[Statement]:
         with self.db.session() as session:
             cycle = self._cycle(session, cycle_name)
@@ -537,8 +614,11 @@ class BillingService:
             costs = {row.pool_id: row.fixed_cost_cents for row in session.scalars(select(CyclePoolCost).where(CyclePoolCost.cycle_id == cycle.id))}
             tiers = parse_tiers(json.loads(cycle.tiers_json))
             lines: dict[int, list[tuple[int, int, int, int]]] = defaultdict(list)
-            for pool_id, users in pool_users.items():
+            for pool_id in costs.keys() | pool_users.keys():
+                users = pool_users.get(pool_id, {})
                 billed = {uid: tiered_weight(weight, tiers) for uid, weight in users.items()}
+                if costs.get(pool_id, 0) and not any(weight > 0 for weight in billed.values()):
+                    raise BillingError(f"pool {pool_id} has fixed cost but no billable Telegram usage")
                 allocated = largest_remainder(costs.get(pool_id, 0), billed)
                 for uid, actual in users.items():
                     lines[uid].append((pool_id, actual, billed[uid], allocated[uid]))
@@ -547,7 +627,8 @@ class BillingService:
                 adjustments[row.telegram_user_id] += row.amount_cents
             session.execute(delete(StatementLine).where(StatementLine.statement_id.in_(select(Statement.id).where(Statement.cycle_id == cycle.id))))
             session.execute(delete(Statement).where(Statement.cycle_id == cycle.id))
-            for user_id, user_lines in lines.items():
+            for user_id in lines.keys() | adjustments.keys():
+                user_lines = lines.get(user_id, [])
                 statement = Statement(cycle_id=cycle.id, telegram_user_id=user_id,
                                       actual_weight_nano_usd=sum(v[1] for v in user_lines), billed_weight_nano_usd=sum(v[2] for v in user_lines),
                                       amount_cents=sum(v[3] for v in user_lines) + adjustments[user_id], adjustment_cents=adjustments[user_id],
@@ -562,7 +643,8 @@ class BillingService:
             session.flush()
             return list(session.scalars(select(Statement).where(Statement.cycle_id == cycle.id).order_by(Statement.amount_cents.desc())))
 
-    def close_cycle(self, cycle_name: str, operator_id: int, confirm_waiver: bool) -> None:
+    def close_cycle(self, cycle_name: str, operator_id: int | None, confirm_waiver: bool,
+                    operator_type: str = "telegram") -> None:
         self.preview_cycle(cycle_name)
         with self.db.session() as session:
             cycle = self._cycle(session, cycle_name)
@@ -572,49 +654,150 @@ class BillingService:
                 raise BillingError("data quality waiver confirmation is required")
             cycle.status, cycle.closed_at_ms, cycle.closed_by = "closed", now_ms(), operator_id
             session.execute(update(Statement).where(Statement.cycle_id == cycle.id).values(final=True))
-            session.add(AuditLog(operator_type="telegram", operator_id=str(operator_id), operation="cycle.close", target=cycle.name,
+            session.add(AuditLog(operator_type=operator_type, operator_id=str(operator_id if operator_id is not None else "admin-token"),
+                                 operation="cycle.close", target=cycle.name,
                                  after_json=json.dumps({"waiver": cycle.data_quality_waiver}), created_at_ms=now_ms()))
 
     def dashboard(self, cycle_name: str | None = None) -> dict[str, Any]:
         with self.db.session() as session:
             cycle = self._cycle(session, cycle_name)
-            users = {u.telegram_user_id: u for u in session.scalars(select(TelegramUser))}
+            cycles = list(session.scalars(select(BillingCycle).order_by(BillingCycle.start_at_ms.desc())))
+            if cycle_name and cycle is None:
+                raise BillingError("billing cycle not found")
             if cycle is None:
-                return {"cycle": None, "rows": [], "totals": {}}
-            statements = list(session.scalars(select(Statement).where(Statement.cycle_id == cycle.id).order_by(Statement.amount_cents.desc())))
-            rows = []
-            for statement in statements:
-                user = users.get(statement.telegram_user_id)
-                name = (f"@{user.username}" if user and user.username else " ".join(v for v in [user.first_name if user else None, user.last_name if user else None] if v)) or str(statement.telegram_user_id)
-                rows.append({"telegram_user_id": statement.telegram_user_id, "name": name,
-                             "actual": format_usd_nano(statement.actual_weight_nano_usd), "billed": format_usd_nano(statement.billed_weight_nano_usd),
-                             "amount": format_cents(statement.amount_cents), "amount_cents": statement.amount_cents,
-                             "key_count": session.scalar(select(func.count()).select_from(APIKey).where(APIKey.current_owner_id == statement.telegram_user_id, APIKey.status == "active")) or 0})
-            return {"cycle": {"name": cycle.name, "status": cycle.status, "start_at_ms": cycle.start_at_ms, "end_at_ms": cycle.end_at_ms,
-                              "waiver": cycle.data_quality_waiver}, "rows": rows,
-                    "totals": {"actual": format_usd_nano(sum(s.actual_weight_nano_usd for s in statements)),
-                               "billed": format_usd_nano(sum(s.billed_weight_nano_usd for s in statements)),
-                               "amount": format_cents(sum(s.amount_cents for s in statements))}}
+                return {"cycle": None, "cycles": [{"name": item.name, "status": item.status} for item in cycles],
+                        "rows": [], "models": [],
+                        "totals": {"requests": 0, "tokens": 0, "actual": "0.0000", "billed": "0.0000", "amount": "0.00"}}
+
+            period = (
+                RatedEvent.pricing_version_id == cycle.pricing_version_id,
+                RatedEvent.occurred_at_ms >= cycle.start_at_ms,
+                RatedEvent.occurred_at_ms < cycle.end_at_ms,
+            )
+            usage_rows = session.execute(
+                select(RatedEvent.telegram_user_id, func.count(RatedEvent.id), func.sum(RawUsageEvent.total_tokens),
+                       func.sum(RatedEvent.rated_weight_nano_usd))
+                .join(RawUsageEvent, RawUsageEvent.id == RatedEvent.raw_event_id)
+                .where(*period)
+                .group_by(RatedEvent.telegram_user_id)
+            ).all()
+            usage = {user_id: (int(requests or 0), int(tokens or 0), int(cost or 0))
+                     for user_id, requests, tokens, cost in usage_rows}
+            statements = {row.telegram_user_id: row for row in session.scalars(
+                select(Statement).where(Statement.cycle_id == cycle.id)
+            )}
+            key_counts = {owner_id: int(count or 0) for owner_id, count in session.execute(
+                select(APIKey.current_owner_id, func.count(APIKey.id))
+                .where(APIKey.status == "active", APIKey.current_owner_id.is_not(None))
+                .group_by(APIKey.current_owner_id)
+            )}
+            users = list(session.scalars(
+                select(TelegramUser).where(TelegramUser.registered_at_ms.is_not(None)).order_by(TelegramUser.telegram_user_id)
+            ))
+            rows: list[dict[str, Any]] = []
+            for user in users:
+                requests, tokens, actual = usage.get(user.telegram_user_id, (0, 0, 0))
+                statement = statements.get(user.telegram_user_id)
+                rows.append({
+                    "telegram_user_id": user.telegram_user_id,
+                    "name": self._user_name(user, user.telegram_user_id),
+                    "requests": requests,
+                    "tokens": tokens,
+                    "actual": format_usd_nano(actual),
+                    "actual_nano": actual,
+                    "billed": format_usd_nano(statement.billed_weight_nano_usd if statement else 0),
+                    "amount": format_cents(statement.amount_cents if statement else 0),
+                    "amount_cents": statement.amount_cents if statement else 0,
+                    "key_count": key_counts.get(user.telegram_user_id, 0),
+                    "unowned": False,
+                })
+            if None in usage:
+                requests, tokens, actual = usage[None]
+                unowned_key_count = session.scalar(
+                    select(func.count(func.distinct(RawUsageEvent.api_key_hash)))
+                    .select_from(RatedEvent)
+                    .join(RawUsageEvent, RawUsageEvent.id == RatedEvent.raw_event_id)
+                    .where(*period, RatedEvent.telegram_user_id.is_(None))
+                ) or 0
+                rows.append({
+                    "telegram_user_id": None,
+                    "name": "未绑定 Telegram 的 API Key",
+                    "requests": requests,
+                    "tokens": tokens,
+                    "actual": format_usd_nano(actual),
+                    "actual_nano": actual,
+                    "billed": "0.0000",
+                    "amount": "0.00",
+                    "amount_cents": 0,
+                    "key_count": int(unowned_key_count),
+                    "unowned": True,
+                })
+            rows.sort(key=lambda item: (item["actual_nano"], item["requests"]), reverse=True)
+            model_rows = session.execute(
+                select(RawUsageEvent.model, func.count(RatedEvent.id), func.sum(RawUsageEvent.total_tokens),
+                       func.sum(RatedEvent.rated_weight_nano_usd))
+                .join(RatedEvent, RatedEvent.raw_event_id == RawUsageEvent.id)
+                .where(*period)
+                .group_by(RawUsageEvent.model)
+                .order_by(func.sum(RatedEvent.rated_weight_nano_usd).desc())
+                .limit(20)
+            ).all()
+            return {
+                "cycle": {"name": cycle.name, "status": cycle.status, "start": self._format_timestamp(cycle.start_at_ms),
+                          "end": self._format_timestamp(cycle.end_at_ms), "waiver": cycle.data_quality_waiver},
+                "cycles": [{"name": item.name, "status": item.status} for item in cycles],
+                "rows": rows,
+                "models": [{"model": model, "requests": int(requests or 0), "tokens": int(tokens or 0),
+                            "cost": format_usd_nano(int(cost or 0))} for model, requests, tokens, cost in model_rows],
+                "totals": {
+                    "requests": sum(item["requests"] for item in rows),
+                    "tokens": sum(item["tokens"] for item in rows),
+                    "actual": format_usd_nano(sum(item["actual_nano"] for item in rows)),
+                    "billed": format_usd_nano(sum(item.billed_weight_nano_usd for item in statements.values())),
+                    "amount": format_cents(sum(item.amount_cents for item in statements.values())),
+                },
+            }
 
     def user_summary(self, user_id: int, cycle_name: str | None = None, include_keys: bool = False) -> dict[str, Any]:
         with self.db.session() as session:
             user = session.get(TelegramUser, user_id)
-            if user is None:
+            if user is None or user.registered_at_ms is None:
                 raise BillingError("user not found")
-            cycle = self._cycle(session, cycle_name)
+            cycle = self._display_cycle(session, cycle_name)
             statement = session.scalar(select(Statement).where(Statement.cycle_id == cycle.id, Statement.telegram_user_id == user_id)) if cycle else None
             data: dict[str, Any] = {"telegram_user_id": user_id, "username": user.username, "first_name": user.first_name, "last_name": user.last_name,
                                     "statement": None if statement is None else {"actual": format_usd_nano(statement.actual_weight_nano_usd),
-                                    "billed": format_usd_nano(statement.billed_weight_nano_usd), "amount": format_cents(statement.amount_cents)}}
+                                    "billed": format_usd_nano(statement.billed_weight_nano_usd), "amount": format_cents(statement.amount_cents)},
+                                    "cycle": None, "cycles": [], "summary": {"requests": 0, "tokens": 0, "cost": "0.0000",
+                                    "failed": 0, "success_rate": "-", "long_context": 0}, "models": [], "tiers": []}
+            data["cycles"] = [{"name": item.name, "status": item.status} for item in session.scalars(
+                select(BillingCycle).order_by(BillingCycle.start_at_ms.desc())
+            )]
             if cycle:
+                data["cycle"] = {"name": cycle.name, "status": cycle.status, "start": self._format_timestamp(cycle.start_at_ms),
+                                 "end": self._format_timestamp(cycle.end_at_ms)}
+                period = (RatedEvent.pricing_version_id == cycle.pricing_version_id,
+                          RatedEvent.occurred_at_ms >= cycle.start_at_ms, RatedEvent.occurred_at_ms < cycle.end_at_ms,
+                          RatedEvent.telegram_user_id == user_id)
+                summary = session.execute(
+                    select(func.count(RatedEvent.id), func.sum(RawUsageEvent.total_tokens),
+                           func.sum(RatedEvent.rated_weight_nano_usd), func.sum(RawUsageEvent.failed),
+                           func.sum(RatedEvent.long_context_applied))
+                    .join(RawUsageEvent, RawUsageEvent.id == RatedEvent.raw_event_id)
+                    .where(*period)
+                ).one()
+                requests = int(summary[0] or 0)
+                failed = int(summary[3] or 0)
+                data["summary"] = {"requests": requests, "tokens": int(summary[1] or 0),
+                                   "cost": format_usd_nano(int(summary[2] or 0)), "failed": failed,
+                                   "success_rate": f"{(requests - failed) * 100 / requests:.1f}%" if requests else "-",
+                                   "long_context": int(summary[4] or 0)}
                 model_rows = session.execute(select(RawUsageEvent.model, func.count(RawUsageEvent.id), func.sum(RawUsageEvent.total_tokens),
                                                     func.sum(RatedEvent.rated_weight_nano_usd)).join(RatedEvent, RatedEvent.raw_event_id == RawUsageEvent.id)
-                                             .where(RatedEvent.telegram_user_id == user_id, RatedEvent.occurred_at_ms >= cycle.start_at_ms,
-                                                    RatedEvent.occurred_at_ms < cycle.end_at_ms).group_by(RawUsageEvent.model)
+                                             .where(*period).group_by(RawUsageEvent.model)
                                              .order_by(func.sum(RatedEvent.rated_weight_nano_usd).desc())).all()
                 tier_rows = session.execute(select(RatedEvent.service_tier, func.count(RatedEvent.id), func.sum(RatedEvent.rated_weight_nano_usd))
-                                            .where(RatedEvent.telegram_user_id == user_id, RatedEvent.occurred_at_ms >= cycle.start_at_ms,
-                                                   RatedEvent.occurred_at_ms < cycle.end_at_ms).group_by(RatedEvent.service_tier)).all()
+                                            .where(*period).group_by(RatedEvent.service_tier)).all()
                 data["models"] = [{"model": model, "requests": int(requests or 0), "tokens": int(tokens or 0), "cost": format_usd_nano(int(cost or 0))}
                                   for model, requests, tokens, cost in model_rows]
                 data["tiers"] = [{"tier": tier, "requests": int(requests or 0), "cost": format_usd_nano(int(cost or 0))}
@@ -622,13 +805,13 @@ class BillingService:
             if include_keys:
                 data["keys"] = [{"id": key.id, "masked": key.masked_value, "name": key.display_name, "status": key.status}
                                 for key in session.scalars(select(APIKey).where(APIKey.current_owner_id == user_id).order_by(APIKey.id))]
+                data["events"] = []
                 if cycle:
                     events = session.execute(select(RawUsageEvent.timestamp, RawUsageEvent.model, RawUsageEvent.api_key_hash,
                                                     RawUsageEvent.input_tokens, RawUsageEvent.cached_tokens, RawUsageEvent.output_tokens,
                                                     RawUsageEvent.total_tokens, RawUsageEvent.failed, RatedEvent.rated_weight_nano_usd)
                                              .join(RatedEvent, RatedEvent.raw_event_id == RawUsageEvent.id)
-                                             .where(RatedEvent.telegram_user_id == user_id, RatedEvent.occurred_at_ms >= cycle.start_at_ms,
-                                                    RatedEvent.occurred_at_ms < cycle.end_at_ms)
+                                             .where(*period)
                                              .order_by(RatedEvent.occurred_at_ms.desc()).limit(100)).all()
                     key_names = {key.cpamp_hash: key.masked_value for key in session.scalars(select(APIKey).where(APIKey.current_owner_id == user_id))}
                     data["events"] = [{"timestamp": row[0], "model": row[1], "key": key_names.get(row[2], mask_hash(row[2] or "")),
@@ -636,7 +819,8 @@ class BillingService:
                                        "cost": format_usd_nano(int(row[8] or 0))} for row in events]
             return data
 
-    def add_adjustment(self, cycle_name: str, user_id: int, amount_cents: int, reason: str, operator_id: int) -> None:
+    def add_adjustment(self, cycle_name: str, user_id: int, amount_cents: int, reason: str, operator_id: int | None,
+                       operator_type: str = "telegram") -> None:
         if not reason.strip():
             raise BillingError("adjustment reason is required")
         with self.db.session() as session:
@@ -647,10 +831,12 @@ class BillingService:
                 raise BillingError("user not found")
             session.add(Adjustment(cycle_id=cycle.id, telegram_user_id=user_id, amount_cents=amount_cents, reason=reason,
                                    operator_user_id=operator_id, created_at_ms=now_ms()))
-            session.add(AuditLog(operator_type="web", operator_id=str(operator_id), operation="adjustment.create",
+            session.add(AuditLog(operator_type=operator_type, operator_id=str(operator_id if operator_id is not None else "admin-token"),
+                                 operation="adjustment.create",
                                  target=f"{cycle_name}:{user_id}", after_json=json.dumps({"amount_cents": amount_cents}), reason=reason, created_at_ms=now_ms()))
 
-    def transfer_key(self, key_id: int, new_user_id: int, operator_id: int, reason: str, effective_at_ms: int | None = None) -> None:
+    def transfer_key(self, key_id: int, new_user_id: int, operator_id: int | None, reason: str,
+                     effective_at_ms: int | None = None, operator_type: str = "telegram") -> None:
         if not reason.strip():
             raise BillingError("transfer reason is required")
         effective = effective_at_ms or now_ms()
@@ -659,6 +845,8 @@ class BillingService:
             if key is None or session.get(TelegramUser, new_user_id) is None:
                 raise BillingError("key or target user not found")
             old_user = key.current_owner_id
+            if old_user == new_user_id:
+                raise BillingError("key already belongs to this user")
             period = session.scalar(select(KeyOwnershipPeriod).where(KeyOwnershipPeriod.api_key_id == key.id, KeyOwnershipPeriod.valid_to_ms.is_(None)))
             if period:
                 if effective < period.valid_from_ms:
@@ -667,10 +855,20 @@ class BillingService:
             session.add(KeyOwnershipPeriod(api_key_id=key.id, telegram_user_id=new_user_id, valid_from_ms=effective,
                                            source="admin-transfer", reason=reason, operator_user_id=operator_id, created_at_ms=now_ms()))
             key.current_owner_id = new_user_id
-            session.add(AuditLog(operator_type="web", operator_id=str(operator_id), operation="key.transfer", target=str(key_id),
+            session.add(AuditLog(operator_type=operator_type, operator_id=str(operator_id if operator_id is not None else "admin-token"),
+                                 operation="key.transfer", target=str(key_id),
                                  before_json=json.dumps({"owner": old_user}), after_json=json.dumps({"owner": new_user_id}), reason=reason, created_at_ms=now_ms()))
 
-    def create_pool(self, name: str, auth_pattern: str | None, model_pattern: str | None, priority: int = 100) -> int:
+    def create_pool(self, name: str, auth_pattern: str | None, model_pattern: str | None, priority: int = 100,
+                    operator_type: str | None = None, operator_id: str | None = None) -> int:
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,80}", name):
+            raise BillingError("pool name must use letters, numbers, dot, underscore, or hyphen")
+        for pattern in (auth_pattern, model_pattern):
+            if pattern:
+                try:
+                    re.compile(pattern)
+                except re.error as exc:
+                    raise BillingError(f"invalid pool regular expression: {exc}") from exc
         with self.db.session() as session:
             if session.scalar(select(ResourcePool).where(ResourcePool.name == name)):
                 raise BillingError("pool already exists")
@@ -678,54 +876,126 @@ class BillingService:
             session.add(pool); session.flush()
             session.add(PoolAssignmentRule(pool_id=pool.id, priority=priority, auth_index_pattern=auth_pattern or None,
                                            model_pattern=model_pattern or None, active=True))
+            if operator_type and operator_id:
+                session.add(AuditLog(operator_type=operator_type, operator_id=operator_id, operation="pool.create", target=name,
+                                     after_json=json.dumps({"priority": priority, "auth_pattern": auth_pattern,
+                                                            "model_pattern": model_pattern}), created_at_ms=now_ms()))
             return pool.id
 
     def admin_snapshot(self) -> dict[str, Any]:
         with self.db.session() as session:
+            users = {user.telegram_user_id: user for user in session.scalars(select(TelegramUser))}
+            keys = list(session.scalars(select(APIKey).order_by(APIKey.id)))
+            key_map = {key.id: key for key in keys}
+            cycles = list(session.scalars(select(BillingCycle).order_by(BillingCycle.start_at_ms.desc())))
+            costs = {cycle_id: int(total or 0) for cycle_id, total in session.execute(
+                select(CyclePoolCost.cycle_id, func.sum(CyclePoolCost.fixed_cost_cents)).group_by(CyclePoolCost.cycle_id)
+            )}
             return {
-                "cycles": self.list_cycles(),
+                "cycles": [{"name": cycle.name, "start": self._format_timestamp(cycle.start_at_ms),
+                            "end": self._format_timestamp(cycle.end_at_ms), "status": cycle.status,
+                            "waiver": cycle.data_quality_waiver, "fixed_cost": format_cents(costs.get(cycle.id, 0))}
+                           for cycle in cycles],
+                "sync": [{"source": source.name, "last_event_id": checkpoint.last_event_id,
+                          "last_event_at": self._format_timestamp(checkpoint.last_event_at_ms),
+                          "last_success_at": self._format_timestamp(checkpoint.last_success_at_ms),
+                          "backlog": checkpoint.backlog, "last_error": checkpoint.last_error}
+                         for source, checkpoint in session.execute(
+                             select(CPAMPSource, SyncCheckpoint).join(SyncCheckpoint, SyncCheckpoint.source_id == CPAMPSource.id)
+                         )],
+                "users": [{"id": user.telegram_user_id, "name": self._user_name(user, user.telegram_user_id),
+                           "registered": bool(user.registered_at_ms), "manual_allowed": user.manual_allowed,
+                           "active_keys": sum(1 for key in keys if key.current_owner_id == user.telegram_user_id and key.status == "active")}
+                          for user in users.values()],
+                "keys": [{"id": key.id, "masked": key.masked_value, "name": key.display_name,
+                          "status": key.status, "owner_id": key.current_owner_id,
+                          "owner": self._user_name(users.get(key.current_owner_id), key.current_owner_id or "未绑定"),
+                          "created_at": self._format_timestamp(key.created_at_ms),
+                          "revoked_at": self._format_timestamp(key.revoked_at_ms)} for key in keys],
+                "ownership": [{"key_id": row.api_key_id,
+                               "key": key_map[row.api_key_id].masked_value if row.api_key_id in key_map else str(row.api_key_id),
+                               "user_id": row.telegram_user_id,
+                               "user": self._user_name(users.get(row.telegram_user_id), row.telegram_user_id),
+                               "from": self._format_timestamp(row.valid_from_ms), "to": self._format_timestamp(row.valid_to_ms),
+                               "source": row.source, "reason": row.reason}
+                              for row in session.scalars(select(KeyOwnershipPeriod).order_by(KeyOwnershipPeriod.valid_from_ms.desc()).limit(100))],
                 "pools": [{"id": p.id, "name": p.name, "active": p.active} for p in session.scalars(select(ResourcePool).order_by(ResourcePool.id))],
                 "pricing": [{"id": p.id, "name": p.name, "status": p.status, "source": p.source} for p in session.scalars(select(PricingVersion).order_by(PricingVersion.id.desc()))],
-                "dead_letters": [{"id": d.id, "source_event_id": d.source_event_id, "error": d.error} for d in session.scalars(select(DeadLetter).where(DeadLetter.resolved_at_ms.is_(None)).limit(50))],
-                "audits": [{"operation": a.operation, "target": a.target, "operator": a.operator_id, "reason": a.reason, "at": a.created_at_ms}
+                "adjustments": [{"cycle": next((cycle.name for cycle in cycles if cycle.id == row.cycle_id), str(row.cycle_id)),
+                                 "user_id": row.telegram_user_id, "amount": format_cents(row.amount_cents),
+                                 "reason": row.reason, "operator": row.operator_user_id,
+                                 "at": self._format_timestamp(row.created_at_ms)}
+                                for row in session.scalars(select(Adjustment).order_by(Adjustment.id.desc()).limit(100))],
+                "dead_letters": [{"id": d.id, "source_event_id": d.source_event_id, "error": d.error,
+                                  "at": self._format_timestamp(d.created_at_ms)}
+                                 for d in session.scalars(select(DeadLetter).where(DeadLetter.resolved_at_ms.is_(None)).order_by(DeadLetter.id.desc()).limit(50))],
+                "audits": [{"operation": a.operation, "target": a.target,
+                            "operator": f"{a.operator_type}:{a.operator_id}", "reason": a.reason,
+                            "at": self._format_timestamp(a.created_at_ms)}
                            for a in session.scalars(select(AuditLog).order_by(AuditLog.id.desc()).limit(50))],
             }
 
     def usage_summary(self) -> dict[str, Any]:
         with self.db.session() as session:
-            total = session.execute(select(func.count(RawUsageEvent.id), func.sum(RawUsageEvent.total_tokens), func.sum(RatedEvent.rated_weight_nano_usd)).select_from(RawUsageEvent).outerjoin(RatedEvent, RatedEvent.raw_event_id == RawUsageEvent.id)).one()
+            version_id = self._active_pricing_id(session)
+            join_condition = and_(RatedEvent.raw_event_id == RawUsageEvent.id, RatedEvent.pricing_version_id == version_id)
+            total = session.execute(select(func.count(RawUsageEvent.id), func.sum(RawUsageEvent.total_tokens), func.sum(RatedEvent.rated_weight_nano_usd)).select_from(RawUsageEvent).outerjoin(RatedEvent, join_condition)).one()
             cutoff = now_ms() - 86_400_000
-            recent = session.execute(select(func.count(RawUsageEvent.id), func.sum(RawUsageEvent.total_tokens), func.sum(RatedEvent.rated_weight_nano_usd)).select_from(RawUsageEvent).outerjoin(RatedEvent, RatedEvent.raw_event_id == RawUsageEvent.id).where(RawUsageEvent.occurred_at_ms >= cutoff)).one()
+            recent = session.execute(select(func.count(RawUsageEvent.id), func.sum(RawUsageEvent.total_tokens), func.sum(RatedEvent.rated_weight_nano_usd)).select_from(RawUsageEvent).outerjoin(RatedEvent, join_condition).where(RawUsageEvent.occurred_at_ms >= cutoff)).one()
             return {"total_requests": int(total[0] or 0), "total_tokens": int(total[1] or 0), "total_cost": format_usd_nano(int(total[2] or 0)),
                     "recent_requests": int(recent[0] or 0), "recent_tokens": int(recent[1] or 0), "recent_cost": format_usd_nano(int(recent[2] or 0))}
 
-    def rankings(self, since_ms: int | None = None) -> list[dict[str, Any]]:
+    def rankings(self, since_ms: int | None = None, until_ms: int | None = None,
+                 pricing_version_id: int | None = None) -> list[dict[str, Any]]:
         with self.db.session() as session:
+            version_id = pricing_version_id or self._active_pricing_id(session)
             query = select(RatedEvent.telegram_user_id, func.count(RatedEvent.id), func.sum(RawUsageEvent.total_tokens),
-                           func.sum(RatedEvent.rated_weight_nano_usd)).join(RawUsageEvent, RawUsageEvent.id == RatedEvent.raw_event_id)
+                           func.sum(RatedEvent.rated_weight_nano_usd)).join(RawUsageEvent, RawUsageEvent.id == RatedEvent.raw_event_id).where(
+                               RatedEvent.pricing_version_id == version_id)
             if since_ms is not None:
                 query = query.where(RatedEvent.occurred_at_ms >= since_ms)
-            rows = query.group_by(RatedEvent.telegram_user_id).order_by(func.sum(RatedEvent.rated_weight_nano_usd).desc()).all()
-            users = {u.telegram_user_id: u for u in session.scalars(select(TelegramUser))}
+            if until_ms is not None:
+                query = query.where(RatedEvent.occurred_at_ms < until_ms)
+            rows = session.execute(
+                query.group_by(RatedEvent.telegram_user_id)
+                .order_by(func.sum(RatedEvent.rated_weight_nano_usd).desc())
+            ).all()
+            usage = {user_id: (int(requests or 0), int(tokens or 0), int(cost or 0))
+                     for user_id, requests, tokens, cost in rows}
+            users = list(session.scalars(select(TelegramUser).where(TelegramUser.registered_at_ms.is_not(None))))
             result = []
-            for user_id, requests, tokens, cost in rows:
-                if user_id is None:
-                    name = "未绑定 Telegram 的 API Key"
-                    key_count = session.scalar(select(func.count(func.distinct(RawUsageEvent.api_key_hash))).join(RatedEvent, RatedEvent.raw_event_id == RawUsageEvent.id).where(RatedEvent.telegram_user_id.is_(None))) or 0
-                else:
-                    user = users.get(int(user_id))
-                    name = f"@{user.username}" if user and user.username else str(user_id)
-                    key_count = session.scalar(select(func.count()).select_from(APIKey).where(APIKey.current_owner_id == user_id)) or 0
-                result.append({"telegram_user_id": user_id, "name": name, "requests": int(requests or 0), "tokens": int(tokens or 0),
-                               "cost": format_usd_nano(int(cost or 0)), "key_count": int(key_count)})
+            for user in users:
+                requests, tokens, cost = usage.get(user.telegram_user_id, (0, 0, 0))
+                key_count = session.scalar(select(func.count()).select_from(APIKey).where(
+                    APIKey.current_owner_id == user.telegram_user_id, APIKey.status == "active")) or 0
+                result.append({"telegram_user_id": user.telegram_user_id,
+                               "name": self._user_name(user, user.telegram_user_id), "requests": requests,
+                               "tokens": tokens, "cost": format_usd_nano(cost), "cost_nano": cost,
+                               "key_count": int(key_count)})
+            if None in usage:
+                filters = [RatedEvent.pricing_version_id == version_id, RatedEvent.telegram_user_id.is_(None)]
+                if since_ms is not None:
+                    filters.append(RatedEvent.occurred_at_ms >= since_ms)
+                if until_ms is not None:
+                    filters.append(RatedEvent.occurred_at_ms < until_ms)
+                key_count = session.scalar(select(func.count(func.distinct(RawUsageEvent.api_key_hash))).select_from(RatedEvent)
+                                           .join(RawUsageEvent, RatedEvent.raw_event_id == RawUsageEvent.id).where(*filters)) or 0
+                requests, tokens, cost = usage[None]
+                result.append({"telegram_user_id": None, "name": "未绑定 Telegram 的 API Key",
+                               "requests": requests, "tokens": tokens, "cost": format_usd_nano(cost),
+                               "cost_nano": cost, "key_count": int(key_count)})
+            result.sort(key=lambda item: (item["cost_nano"], item["requests"]), reverse=True)
+            for item in result:
+                item.pop("cost_nano")
             return result
 
     def hourly_usage(self, hours: int = 24) -> tuple[list[str], list[dict[str, Any]]]:
         start = now_ms() - hours * 3_600_000
         with self.db.session() as session:
+            version_id = self._active_pricing_id(session)
             rows = session.execute(select(RatedEvent.telegram_user_id, RatedEvent.occurred_at_ms, RawUsageEvent.total_tokens)
                                    .join(RawUsageEvent, RawUsageEvent.id == RatedEvent.raw_event_id)
-                                   .where(RatedEvent.occurred_at_ms >= start)).all()
+                                   .where(RatedEvent.pricing_version_id == version_id, RatedEvent.occurred_at_ms >= start)).all()
             users = {u.telegram_user_id: u for u in session.scalars(select(TelegramUser))}
         labels = [datetime.fromtimestamp((start + index * 3_600_000) / 1000, ZoneInfo(self.settings.timezone)).strftime("%m-%d %H") for index in range(hours + 1)]
         grouped: dict[int | None, dict[str, int]] = defaultdict(lambda: defaultdict(int))
@@ -742,17 +1012,22 @@ class BillingService:
 
     def model_usage(self, limit: int = 20) -> list[dict[str, Any]]:
         with self.db.session() as session:
+            version_id = self._active_pricing_id(session)
             rows = session.execute(select(RawUsageEvent.model, func.count(RawUsageEvent.id), func.sum(RawUsageEvent.total_tokens),
-                                          func.sum(RatedEvent.rated_weight_nano_usd)).outerjoin(RatedEvent, RatedEvent.raw_event_id == RawUsageEvent.id)
+                                          func.sum(RatedEvent.rated_weight_nano_usd)).outerjoin(
+                                              RatedEvent, and_(RatedEvent.raw_event_id == RawUsageEvent.id,
+                                                               RatedEvent.pricing_version_id == version_id))
                                    .group_by(RawUsageEvent.model).order_by(func.sum(RatedEvent.rated_weight_nano_usd).desc()).limit(limit)).all()
             return [{"model": model, "requests": int(requests or 0), "tokens": int(tokens or 0), "cost": format_usd_nano(int(cost or 0))}
                     for model, requests, tokens, cost in rows]
 
     def account_usage(self, limit: int = 20) -> list[dict[str, Any]]:
         with self.db.session() as session:
+            version_id = self._active_pricing_id(session)
             label = func.coalesce(func.nullif(RawUsageEvent.account_snapshot, ""), func.nullif(RawUsageEvent.source_label, ""), "-")
             rows = session.execute(select(label, func.count(RawUsageEvent.id), func.sum(RawUsageEvent.total_tokens), func.sum(RatedEvent.rated_weight_nano_usd))
-                                   .outerjoin(RatedEvent, RatedEvent.raw_event_id == RawUsageEvent.id).group_by(label)
+                                   .outerjoin(RatedEvent, and_(RatedEvent.raw_event_id == RawUsageEvent.id,
+                                                              RatedEvent.pricing_version_id == version_id)).group_by(label)
                                    .order_by(func.sum(RatedEvent.rated_weight_nano_usd).desc()).limit(limit)).all()
             result = []
             for name, requests, tokens, cost in rows:
@@ -768,7 +1043,7 @@ class BillingService:
                     if latest.quota_plan_type:
                         parts.append(f"plan={latest.quota_plan_type}")
                     if latest.quota_recover_at_ms:
-                        parts.append(f"reset={latest.quota_recover_at_ms}")
+                        parts.append(f"reset={self._format_timestamp(latest.quota_recover_at_ms)}")
                     if latest.response_metadata_json:
                         try:
                             metadata = json.loads(latest.response_metadata_json)
@@ -864,27 +1139,46 @@ class BillingService:
                      "keys": session.scalar(select(func.count()).select_from(APIKey).where(APIKey.current_owner_id == user.telegram_user_id, APIKey.status == "active")) or 0}
                     for user in users]
 
-    def reconciliation(self, cycle_name: str | None = None) -> dict[str, Any]:
+    def reconciliation(self, cycle_name: str | None = None, record: bool = False) -> dict[str, Any]:
         with self._cpamp() as cpamp:
             source_count = int(cpamp.execute("select count(*) from usage_events").fetchone()[0])
         with self.db.session() as session:
+            version_id = self._active_pricing_id(session)
             raw_count = session.scalar(select(func.count()).select_from(RawUsageEvent)) or 0
-            rated_count = session.scalar(select(func.count()).select_from(RatedEvent)) or 0
+            rated_count = session.scalar(select(func.count()).select_from(RatedEvent).where(RatedEvent.pricing_version_id == version_id)) or 0
             dead = session.scalar(select(func.count()).select_from(DeadLetter).where(DeadLetter.resolved_at_ms.is_(None))) or 0
-            unowned = session.scalar(select(func.count()).select_from(RatedEvent).where(RatedEvent.telegram_user_id.is_(None))) or 0
-            unassigned = session.scalar(select(func.count()).select_from(RatedEvent).where(RatedEvent.pool_id.is_(None))) or 0
+            unowned = session.scalar(select(func.count()).select_from(RatedEvent).where(
+                RatedEvent.pricing_version_id == version_id, RatedEvent.telegram_user_id.is_(None))) or 0
+            unassigned = session.scalar(select(func.count()).select_from(RatedEvent).where(
+                RatedEvent.pricing_version_id == version_id, RatedEvent.pool_id.is_(None))) or 0
             result = {"cpamp_events": source_count, "raw_events": raw_count, "rated_events": rated_count, "dead_letters": dead,
-                      "unowned_events": unowned, "unassigned_events": unassigned, "ok": source_count == raw_count and dead == 0}
-            session.add(ReconciliationRun(cycle_id=None, result_json=json.dumps(result), ok=bool(result["ok"]), created_at_ms=now_ms()))
+                      "unowned_events": unowned, "unassigned_events": unassigned,
+                      "ok": source_count == raw_count == rated_count and dead == 0 and unassigned == 0}
+            if record:
+                session.add(ReconciliationRun(cycle_id=None, result_json=json.dumps(result), ok=bool(result["ok"]), created_at_ms=now_ms()))
             return result
 
-    def create_cycle(self, name: str, start: str, end: str, fixed_cost_cents: int, waiver: str | None = None) -> None:
+    def create_cycle(self, name: str, start: str, end: str, fixed_cost_cents: int, waiver: str | None = None,
+                     operator_type: str | None = None, operator_id: str | None = None) -> None:
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,80}", name):
+            raise BillingError("cycle name must use letters, numbers, dot, underscore, or hyphen")
+        if fixed_cost_cents < 0:
+            raise BillingError("fixed cost cannot be negative")
         zone = ZoneInfo(self.settings.timezone)
-        start_ms = int(datetime.fromisoformat(start).replace(tzinfo=zone).timestamp() * 1000) if datetime.fromisoformat(start).tzinfo is None else int(datetime.fromisoformat(start).timestamp() * 1000)
-        end_ms = int(datetime.fromisoformat(end).replace(tzinfo=zone).timestamp() * 1000) if datetime.fromisoformat(end).tzinfo is None else int(datetime.fromisoformat(end).timestamp() * 1000)
+        try:
+            start_dt, end_dt = datetime.fromisoformat(start), datetime.fromisoformat(end)
+        except ValueError as exc:
+            raise BillingError("cycle time is invalid") from exc
+        if start_dt.tzinfo is None:
+            start_dt = start_dt.replace(tzinfo=zone)
+        if end_dt.tzinfo is None:
+            end_dt = end_dt.replace(tzinfo=zone)
+        start_ms, end_ms = int(start_dt.timestamp() * 1000), int(end_dt.timestamp() * 1000)
         if end_ms <= start_ms:
             raise BillingError("cycle end must be after start")
         with self.db.session() as session:
+            if session.scalar(select(BillingCycle).where(BillingCycle.name == name)):
+                raise BillingError("billing cycle already exists")
             version_id = self._active_pricing_id(session)
             cycle = BillingCycle(name=name, start_at_ms=start_ms, end_at_ms=end_ms, timezone=self.settings.timezone, status="open",
                                  pricing_version_id=version_id, tiers_json=json.dumps(DEFAULT_TIERS), data_quality_waiver=waiver, created_at_ms=now_ms())
@@ -894,3 +1188,8 @@ class BillingService:
             if pool is None:
                 raise BillingError("default pool is missing")
             session.add(CyclePoolCost(cycle_id=cycle.id, pool_id=pool.id, fixed_cost_cents=fixed_cost_cents))
+            if operator_type and operator_id:
+                session.add(AuditLog(operator_type=operator_type, operator_id=operator_id, operation="cycle.create", target=name,
+                                     after_json=json.dumps({"start_at_ms": start_ms, "end_at_ms": end_ms,
+                                                            "fixed_cost_cents": fixed_cost_cents,
+                                                            "waiver": waiver}), created_at_ms=now_ms()))

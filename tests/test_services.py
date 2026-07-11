@@ -3,11 +3,15 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from dataclasses import replace
 
+import pytest
 from sqlalchemy import func, select
 
-from cpa_billing.models import APIKey, BillingCycle, CyclePoolCost, KeyOwnershipPeriod, RatedEvent, RawUsageEvent, ResourcePool, Statement, TelegramUser
+from cpa_billing.database import Database
+from cpa_billing.models import APIKey, Adjustment, BillingCycle, CyclePoolCost, KeyOwnershipPeriod, RatedEvent, RawUsageEvent, ResourcePool, Statement, TelegramUser
 from cpa_billing.security import cpamp_key_hash
+from cpa_billing.services import BillingError, BillingService
 
 
 def insert_event(settings, key_hash: str, timestamp_ms: int, *, event_hash: str = "e1", input_tokens: int = 1000,
@@ -74,11 +78,25 @@ def test_cycle_allocation_groups_by_user_and_preserves_cost(service, settings) -
     assert {row.telegram_user_id for row in statements} == {2, 3}
 
 
-def test_unowned_events_do_not_create_statement(service, settings) -> None:
+def test_cycle_with_cost_and_no_billable_user_is_blocked(service, settings) -> None:
     insert_event(settings, "unowned", 1000)
     service.sync_cpamp(); service.rate_events()
     service.create_cycle("cycle", "1970-01-01T08:00", "1970-01-02T08:00", 10000)
-    assert service.preview_cycle("cycle") == []
+    with pytest.raises(BillingError, match="no billable Telegram usage"):
+        service.preview_cycle("cycle")
+
+
+def test_adjustment_only_user_gets_statement(service) -> None:
+    create_owner(service, "key", 2, 0)
+    service.create_cycle("cycle", "1970-01-01T08:00", "1970-01-02T08:00", 0)
+    with service.db.session() as session:
+        cycle = session.scalar(select(BillingCycle).where(BillingCycle.name == "cycle"))
+        session.add(Adjustment(cycle_id=cycle.id, telegram_user_id=2, amount_cents=250,
+                               reason="manual credit", operator_user_id=None, created_at_ms=1))
+    statements = service.preview_cycle("cycle")
+    assert len(statements) == 1
+    assert statements[0].amount_cents == 250
+    assert statements[0].adjustment_cents == 250
 
 
 def test_closed_cycle_is_immutable(service, settings) -> None:
@@ -89,3 +107,39 @@ def test_closed_cycle_is_immutable(service, settings) -> None:
     service.close_cycle("cycle", 1, False)
     first = service.preview_cycle("cycle")
     assert first[0].final is True
+
+
+def test_dashboard_and_reconciliation_use_cycle_pricing_version(service, settings) -> None:
+    create_owner(service, "key", 2, 0)
+    insert_event(settings, cpamp_key_hash("key"), 1000)
+    service.sync_cpamp()
+    assert service.rate_events() == 1
+    service.import_cpamp_prices("second-price-version")
+    assert service.rate_events() == 1
+    service.create_cycle("cycle", "1970-01-01T08:00", "1970-01-02T08:00", 10000)
+
+    dashboard = service.dashboard("cycle")
+    assert dashboard["totals"]["requests"] == 1
+    assert next(row for row in dashboard["rows"] if row["telegram_user_id"] == 2)["requests"] == 1
+    assert service.rankings()[0]["requests"] == 1
+    assert service.reconciliation()["rated_events"] == 1
+
+
+def test_user_session_is_invalidated_when_login_key_is_revoked(service) -> None:
+    create_owner(service, "key", 2, 0)
+    with service.db.session() as session:
+        key = session.scalar(select(APIKey).where(APIKey.current_owner_id == 2))
+        key_id = key.id
+    token, _ = service.create_session(2, key_id)
+    assert service.get_session(token) is not None
+
+    with service.db.session() as session:
+        session.get(APIKey, key_id).status = "revoked"
+    assert service.get_session(token) is None
+
+
+def test_admin_token_rotation_invalidates_existing_admin_sessions(service, settings) -> None:
+    token, _ = service.create_admin_session()
+    assert service.get_admin_session(token) is not None
+    rotated = BillingService(replace(settings, admin_token="rotated-admin-token"), Database(settings.database_path))
+    assert rotated.get_admin_session(token) is None

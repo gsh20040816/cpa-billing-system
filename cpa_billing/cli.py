@@ -64,7 +64,7 @@ def main() -> None:
     elif args.command == "close-cycle":
         service.close_cycle(args.cycle, args.operator, args.confirm_waiver)
     elif args.command == "reconcile":
-        print(json.dumps(service.reconciliation(), ensure_ascii=False))
+        print(json.dumps(service.reconciliation(record=True), ensure_ascii=False))
     elif args.command == "bot":
         asyncio.run(run_bot())
     elif args.command == "serve":

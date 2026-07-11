@@ -1,14 +1,17 @@
-{% extends "base.html" %}{% block title %}登录 · CPA Billing{% endblock %}
+{% extends "base.html" %}
+{% block title %}用户登录 · CPA Billing{% endblock %}
 {% block content %}
-<section class="login">
+<section class="login-panel">
   <h1>CPA Billing</h1>
   <p>使用已通过 Telegram Bot 注册的 API Key 登录。</p>
-  {% if error %}<p class="error">{{ error }}</p>{% endif %}
-  <form method="post" action="/auth/api-key/login">
-    <label>API Key<input name="api_key" type="password" autocomplete="current-password" required autofocus></label>
-    <button type="submit">登录</button>
+  {% if error %}<p class="alert error" role="alert">{{ error }}</p>{% endif %}
+  <form method="post" action="/auth/api-key/login" class="stack-form">
+    <label>API Key
+      <input name="api_key" type="password" autocomplete="current-password" required autofocus>
+    </label>
+    <button type="submit">登录用户看板</button>
   </form>
   <p class="muted">首次注册请私聊 Telegram Bot 执行 <code>/register</code>。Web 不开放注册。</p>
+  <a class="text-link" href="/admin/login">管理入口</a>
 </section>
 {% endblock %}
-

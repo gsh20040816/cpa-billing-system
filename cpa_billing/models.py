@@ -269,7 +269,7 @@ class Adjustment(Base):
     telegram_user_id: Mapped[int] = mapped_column(ForeignKey("telegram_users.telegram_user_id"))
     amount_cents: Mapped[int] = mapped_column(BigInteger)
     reason: Mapped[str] = mapped_column(Text)
-    operator_user_id: Mapped[int] = mapped_column(BigInteger)
+    operator_user_id: Mapped[int | None] = mapped_column(BigInteger)
     created_at_ms: Mapped[int] = mapped_column(BigInteger)
 
 
@@ -300,6 +300,16 @@ class WebSession(Base):
     session_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
     telegram_user_id: Mapped[int] = mapped_column(ForeignKey("telegram_users.telegram_user_id"))
     api_key_id: Mapped[int] = mapped_column(ForeignKey("api_keys.id"))
+    csrf_token: Mapped[str] = mapped_column(String(64))
+    created_at_ms: Mapped[int] = mapped_column(BigInteger)
+    expires_at_ms: Mapped[int] = mapped_column(BigInteger)
+    revoked_at_ms: Mapped[int | None] = mapped_column(BigInteger)
+
+
+class AdminWebSession(Base):
+    __tablename__ = "admin_web_sessions"
+    session_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    credential_fingerprint: Mapped[str] = mapped_column(String(64))
     csrf_token: Mapped[str] = mapped_column(String(64))
     created_at_ms: Mapped[int] = mapped_column(BigInteger)
     expires_at_ms: Mapped[int] = mapped_column(BigInteger)

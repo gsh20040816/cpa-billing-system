@@ -1,9 +1,66 @@
-{% extends "base.html" %}{% block content %}
-<div class="page-head"><div><h1>月度成本分摊</h1>{% if data.cycle %}<p>{{ data.cycle.name }} · {{ data.cycle.status }}</p>{% endif %}</div></div>
-{% if data.cycle and data.cycle.waiver %}<div class="warning"><strong>数据质量说明</strong>{{ data.cycle.waiver }}</div>{% endif %}
-<section class="metrics"><div><span>实际等效用量</span><strong>${{ data.totals.actual or '0.0000' }}</strong></div><div><span>梯度计费用量</span><strong>${{ data.totals.billed or '0.0000' }}</strong></div><div><span>分摊总额</span><strong>¥{{ data.totals.amount or '0.00' }}</strong></div></section>
-<section><h2>Telegram 用户</h2><div class="table-wrap"><table><thead><tr><th>用户</th><th>实际</th><th>计费</th><th>应付</th><th>Key</th></tr></thead><tbody>
-{% for row in data.rows %}<tr><td><a href="/users/{{ row.telegram_user_id }}">{{ row.name }}</a></td><td>${{ row.actual }}</td><td>${{ row.billed }}</td><td>¥{{ row.amount }}</td><td>{{ row.key_count }}</td></tr>{% else %}<tr><td colspan="5">当前尚无预览账单。</td></tr>{% endfor %}
-</tbody></table></div></section>
-{% endblock %}
+{% extends "base.html" %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>月度成本分摊</h1>
+    {% if data.cycle %}<p>{{ data.cycle.start }} 至 {{ data.cycle.end }} · {{ data.cycle.status }}</p>{% endif %}
+  </div>
+  {% if data.cycles %}
+  <form method="get" class="cycle-select">
+    <label>账期
+      <select name="cycle">
+        {% for cycle in data.cycles %}
+        <option value="{{ cycle.name }}"{% if data.cycle and cycle.name == data.cycle.name %} selected{% endif %}>{{ cycle.name }} · {{ cycle.status }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <noscript><button type="submit">查看</button></noscript>
+  </form>
+  {% endif %}
+</div>
 
+{% if not data.cycle %}
+<p class="empty-state">尚未创建账期。</p>
+{% else %}
+{% if data.cycle.waiver %}<div class="alert warning"><strong>数据质量说明</strong><span>{{ data.cycle.waiver }}</span></div>{% endif %}
+
+<section class="metrics metrics-six" aria-label="账期汇总">
+  <div><span>请求</span><strong>{{ data.totals.requests|number }}</strong></div>
+  <div><span>Tokens</span><strong>{{ data.totals.tokens|number }}</strong></div>
+  <div><span>实际等效成本</span><strong>${{ data.totals.actual }}</strong></div>
+  <div><span>梯度计费用量</span><strong>${{ data.totals.billed }}</strong></div>
+  <div><span>分摊总额</span><strong>¥{{ data.totals.amount }}</strong></div>
+  <div><span>用户与未绑定项</span><strong>{{ data.rows|length }}</strong></div>
+</section>
+
+<section>
+  <h2>用户排行与账单</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>#</th><th>用户</th><th>请求</th><th>Tokens</th><th>实际等效</th><th>梯度计费</th><th>应付</th><th>Key</th></tr></thead>
+      <tbody>
+      {% for row in data.rows %}
+      <tr>
+        <td>{{ loop.index }}</td>
+        <td>{% if row.telegram_user_id is not none %}<a href="/users/{{ row.telegram_user_id }}?cycle={{ data.cycle.name|urlencode }}">{{ row.name }}</a>{% else %}<span class="muted">{{ row.name }}</span>{% endif %}</td>
+        <td>{{ row.requests|number }}</td><td>{{ row.tokens|number }}</td><td>${{ row.actual }}</td><td>${{ row.billed }}</td><td>¥{{ row.amount }}</td><td>{{ row.key_count }}</td>
+      </tr>
+      {% else %}
+      <tr><td colspan="8" class="empty-cell">当前账期暂无用户。</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section>
+  <h2>模型聚合</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>模型</th><th>请求</th><th>Tokens</th><th>等效成本</th></tr></thead>
+      <tbody>{% for row in data.models %}<tr><td>{{ row.model }}</td><td>{{ row.requests|number }}</td><td>{{ row.tokens|number }}</td><td>${{ row.cost }}</td></tr>{% else %}<tr><td colspan="4" class="empty-cell">当前账期暂无请求。</td></tr>{% endfor %}</tbody>
+    </table>
+  </div>
+</section>
+{% endif %}
+{% endblock %}

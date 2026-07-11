@@ -1,9 +1,26 @@
 document.addEventListener("submit", (event) => {
-  const button = event.submitter || event.target.querySelector("[data-csrf]");
-  if (button && button.dataset.csrf) {
+  const submitter = event.submitter;
+  const message = submitter && submitter.dataset.confirm;
+  if (message && !window.confirm(message)) {
     event.preventDefault();
-    fetch(event.target.action, {method: "POST", body: new FormData(event.target), headers: {"X-CSRF-Token": button.dataset.csrf}})
-      .then((response) => response.redirected ? window.location.assign(response.url) : response.text().then((html) => { document.open(); document.write(html); document.close(); }));
+    return;
+  }
+  if (submitter) {
+    submitter.disabled = true;
+    submitter.setAttribute("aria-busy", "true");
   }
 });
 
+document.querySelectorAll(".cycle-select select").forEach((select) => {
+  select.addEventListener("change", () => select.form.requestSubmit());
+});
+
+document.querySelectorAll("[data-back]").forEach((button) => {
+  button.addEventListener("click", () => {
+    if (window.history.length > 1) {
+      window.history.back();
+    } else {
+      window.location.assign("/");
+    }
+  });
+});

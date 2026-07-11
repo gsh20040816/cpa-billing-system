@@ -7,15 +7,31 @@
   <link rel="stylesheet" href="/static/app.css">
 </head>
 <body>
-{% if auth %}
+{% if auth or admin_auth %}
 <header>
-  <a class="brand" href="/">CPA Billing</a>
-  <nav><a href="/">全局</a><a href="/me">我的 Key</a>{% if auth[1].is_admin %}<a href="/admin">管理</a>{% endif %}</nav>
-  <form method="post" action="/auth/logout"><button class="icon" title="退出" data-csrf="{{ auth[0].csrf_token }}">退出</button></form>
+  <a class="brand" href="{{ '/' if auth else '/admin' }}">CPA Billing</a>
+  <nav aria-label="主导航">
+    {% if auth %}
+    <a href="/">全局账单</a>
+    <a href="/me">我的 Key</a>
+    {% else %}
+    <a href="/admin">系统管理</a>
+    {% endif %}
+  </nav>
+  {% if auth %}
+  <form method="post" action="/auth/logout">
+    <input type="hidden" name="_csrf" value="{{ auth[0].csrf_token }}">
+    <button class="secondary" type="submit">退出</button>
+  </form>
+  {% else %}
+  <form method="post" action="/auth/admin/logout">
+    <input type="hidden" name="_csrf" value="{{ admin_auth.csrf_token }}">
+    <button class="secondary" type="submit">退出管理</button>
+  </form>
+  {% endif %}
 </header>
 {% endif %}
 <main>{% block content %}{% endblock %}</main>
 <script src="/static/app.js"></script>
 </body>
 </html>
-

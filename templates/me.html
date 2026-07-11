@@ -1,6 +1,26 @@
-{% extends "user.html" %}{% block content %}{{ super() }}
-<section><h2>管理 API Key</h2><form method="post" action="/me/key-actions" class="actions">
-<input type="hidden" name="action" value="add"><label>当前有效 API Key<input name="current_api_key" type="password" required></label><button data-csrf="{{ auth[0].csrf_token }}">新增 Key</button></form>
-{% for key in data.keys if key.status == 'active' %}<form method="post" action="/me/key-actions" class="actions"><input type="hidden" name="target_key_id" value="{{ key.id }}"><label><code>{{ key.masked }}</code><input name="current_api_key" type="password" placeholder="重新输入当前有效 Key" required></label><button name="action" value="reset" data-csrf="{{ auth[0].csrf_token }}">重置</button><button class="danger" name="action" value="revoke" data-csrf="{{ auth[0].csrf_token }}">吊销</button></form>{% endfor %}
-</section>{% endblock %}
-
+{% extends "user.html" %}
+{% block content %}
+{{ super() }}
+<section>
+  <h2>管理 API Key</h2>
+  <form method="post" action="/me/key-actions" class="action-row">
+    <input type="hidden" name="_csrf" value="{{ auth[0].csrf_token }}">
+    <input type="hidden" name="action" value="add">
+    <label>当前有效 API Key
+      <input name="current_api_key" type="password" autocomplete="current-password" required>
+    </label>
+    <button type="submit">新增 Key</button>
+  </form>
+  {% for key in data["keys"] if key.status == 'active' %}
+  <form method="post" action="/me/key-actions" class="action-row">
+    <input type="hidden" name="_csrf" value="{{ auth[0].csrf_token }}">
+    <input type="hidden" name="target_key_id" value="{{ key.id }}">
+    <label><code>{{ key.masked }}</code>
+      <input name="current_api_key" type="password" autocomplete="current-password" placeholder="重新输入任一当前有效 Key" required>
+    </label>
+    <button name="action" value="reset" type="submit">重置</button>
+    <button class="danger" name="action" value="revoke" type="submit" data-confirm="确认吊销 {{ key.masked }}？该 Key 的 Web 会话会立即失效。">吊销</button>
+  </form>
+  {% endfor %}
+</section>
+{% endblock %}
