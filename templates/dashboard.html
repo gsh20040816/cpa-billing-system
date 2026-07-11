@@ -1,0 +1,9 @@
+{% extends "base.html" %}{% block content %}
+<div class="page-head"><div><h1>月度成本分摊</h1>{% if data.cycle %}<p>{{ data.cycle.name }} · {{ data.cycle.status }}</p>{% endif %}</div></div>
+{% if data.cycle and data.cycle.waiver %}<div class="warning"><strong>数据质量说明</strong>{{ data.cycle.waiver }}</div>{% endif %}
+<section class="metrics"><div><span>实际等效用量</span><strong>${{ data.totals.actual or '0.0000' }}</strong></div><div><span>梯度计费用量</span><strong>${{ data.totals.billed or '0.0000' }}</strong></div><div><span>分摊总额</span><strong>¥{{ data.totals.amount or '0.00' }}</strong></div></section>
+<section><h2>Telegram 用户</h2><div class="table-wrap"><table><thead><tr><th>用户</th><th>实际</th><th>计费</th><th>应付</th><th>Key</th></tr></thead><tbody>
+{% for row in data.rows %}<tr><td><a href="/users/{{ row.telegram_user_id }}">{{ row.name }}</a></td><td>${{ row.actual }}</td><td>${{ row.billed }}</td><td>¥{{ row.amount }}</td><td>{{ row.key_count }}</td></tr>{% else %}<tr><td colspan="5">当前尚无预览账单。</td></tr>{% endfor %}
+</tbody></table></div></section>
+{% endblock %}
+

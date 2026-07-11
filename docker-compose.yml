@@ -1,0 +1,38 @@
+services:
+  billing-server:
+    build: .
+    restart: unless-stopped
+    command: ["serve", "--host", "0.0.0.0", "--port", "18417"]
+    env_file: [".env"]
+    ports: ["127.0.0.1:18417:18417"]
+    volumes:
+      - ./data:/data
+      - ../cpa-manager-plus:/cpamp:ro
+      - /root/sub2api-tg:/legacy-sub2:ro
+    networks: [cpa-network]
+  billing-worker:
+    build: .
+    restart: unless-stopped
+    command: ["sync"]
+    env_file: [".env"]
+    volumes:
+      - ./data:/data
+      - ../cpa-manager-plus:/cpamp:ro
+    networks: [cpa-network]
+  billing-bot:
+    build: .
+    restart: unless-stopped
+    command: ["bot"]
+    env_file: [".env"]
+    volumes:
+      - ./data:/data
+      - ../cpa-manager-plus:/cpamp:ro
+      - /root/sub2api-tg:/legacy-sub2:ro
+    networks: [cpa-network, sub2api-network]
+networks:
+  cpa-network:
+    external: true
+    name: cpa-deploy_cpa-network
+  sub2api-network:
+    external: true
+    name: sub2api-deploy_sub2api-network
