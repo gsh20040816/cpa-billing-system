@@ -269,12 +269,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def health() -> dict[str, str]:
         return {"status": "ok"}
 
-    @app.get("/favicon.ico", include_in_schema=False)
-    def favicon() -> FileResponse:
+    def favicon_response() -> FileResponse:
         candidate = FRONTEND_DIST / "favicon.svg"
         if not candidate.is_file():
             candidate = ROOT / "static" / "favicon.svg"
         return FileResponse(candidate, media_type="image/svg+xml")
+
+    @app.get("/favicon.ico", include_in_schema=False)
+    def favicon_ico() -> FileResponse:
+        return favicon_response()
+
+    @app.get("/favicon.svg", include_in_schema=False)
+    def favicon_svg() -> FileResponse:
+        return favicon_response()
 
     @app.post("/auth/api-key/login")
     async def login(request: Request, payload: UserLoginPayload) -> JSONResponse:

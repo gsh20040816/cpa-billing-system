@@ -59,6 +59,7 @@ def test_web_has_no_registration_and_hides_other_users_keys(settings, monkeypatc
     assert unauthenticated.status_code == 303
     assert unauthenticated.headers["location"] == "/login"
     assert client.get("/favicon.ico").status_code == 200
+    assert client.get("/favicon.svg").status_code == 200
     assert client.get("/register").status_code == 404
 
     login = login_user(client, "sk-cpa-user-two-secret")
