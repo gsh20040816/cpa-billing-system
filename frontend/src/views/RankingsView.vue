@@ -52,16 +52,32 @@ const metrics = computed(() => [
   { label: '排行用户项', value: number(data.value?.rows?.length), mono: true },
 ])
 
+const chartMetrics = {
+  cost: {
+    axisName: 'USD',
+    value: (item) => Number(String(item.cost || 0).replaceAll(',', '')),
+    format: (value) => `$${new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 4 }).format(Number(value || 0))}`,
+  },
+  tokens: { axisName: 'Tokens', value: (item) => Number(item.tokens || 0), format: number },
+  requests: { axisName: '请求数', value: (item) => Number(item.requests || 0), format: number },
+  failures: { axisName: '失败数', value: (item) => Number(item.failed || 0), format: number },
+}
+
 const chartOption = computed(() => {
   const top = rows.value.slice(0, 12).reverse()
-  const valueKey = filters.sort === 'failures' ? 'failed' : filters.sort === 'cost' ? 'cost_nano_usd' : filters.sort
+  const metric = chartMetrics[filters.sort]
   return {
     animationDuration: 350,
     grid: { top: 16, right: 28, bottom: 32, left: 150 },
-    tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
-    xAxis: { type: 'value', splitLine: { lineStyle: { color: '#e4e9e7' } } },
+    tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' }, valueFormatter: metric.format },
+    xAxis: {
+      type: 'value',
+      name: metric.axisName,
+      axisLabel: { formatter: metric.format },
+      splitLine: { lineStyle: { color: '#e4e9e7' } },
+    },
     yAxis: { type: 'category', data: top.map((item) => item.name), axisLabel: { width: 135, overflow: 'truncate' } },
-    series: [{ type: 'bar', data: top.map((item) => item[valueKey]), itemStyle: { color: '#315ea8' }, barMaxWidth: 18 }],
+    series: [{ type: 'bar', data: top.map(metric.value), itemStyle: { color: '#315ea8' }, barMaxWidth: 18 }],
   }
 })
 
