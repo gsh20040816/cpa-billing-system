@@ -52,6 +52,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
         return auth
 
+    def page_current(request: Request) -> tuple[Any, Any] | None:
+        return service.get_session(request.cookies.get("billing_session"))
+
     def admin(auth: tuple[Any, Any] = Depends(current)) -> tuple[Any, Any]:
         if not auth[1].is_admin:
             raise HTTPException(status_code=403)
@@ -111,16 +114,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return response
 
     @app.get("/", response_class=HTMLResponse)
-    def dashboard(request: Request, auth: tuple[Any, Any] = Depends(current)) -> Any:
+    def dashboard(request: Request) -> Any:
+        auth = page_current(request)
+        if auth is None:
+            return RedirectResponse("/login", status_code=303)
         return templates.TemplateResponse(request, "dashboard.html", {"auth": auth, "data": service.dashboard()})
 
     @app.get("/users/{user_id}", response_class=HTMLResponse)
-    def user_page(user_id: int, request: Request, auth: tuple[Any, Any] = Depends(current)) -> Any:
+    def user_page(user_id: int, request: Request) -> Any:
+        auth = page_current(request)
+        if auth is None:
+            return RedirectResponse("/login", status_code=303)
         include_keys = auth[1].is_admin or auth[1].telegram_user_id == user_id
         return templates.TemplateResponse(request, "user.html", {"auth": auth, "data": service.user_summary(user_id, include_keys=include_keys), "include_keys": include_keys})
 
     @app.get("/me", response_class=HTMLResponse)
-    def me(request: Request, auth: tuple[Any, Any] = Depends(current)) -> Any:
+    def me(request: Request) -> Any:
+        auth = page_current(request)
+        if auth is None:
+            return RedirectResponse("/login", status_code=303)
         return templates.TemplateResponse(request, "me.html", {"auth": auth, "data": service.user_summary(auth[1].telegram_user_id, include_keys=True)})
 
     @app.post("/me/key-actions")
@@ -140,7 +152,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return templates.TemplateResponse(request, "action_pending.html", {"auth": auth, "token": token, "action": action})
 
     @app.get("/admin", response_class=HTMLResponse)
-    def admin_page(request: Request, auth: tuple[Any, Any] = Depends(admin)) -> Any:
+    def admin_page(request: Request) -> Any:
+        auth = page_current(request)
+        if auth is None:
+            return RedirectResponse("/login", status_code=303)
+        if not auth[1].is_admin:
+            raise HTTPException(status_code=403)
         return templates.TemplateResponse(request, "admin.html", {"auth": auth, "reconciliation": service.reconciliation(),
                                                                    "usage": service.usage_summary(), "admin": service.admin_snapshot()})
 
