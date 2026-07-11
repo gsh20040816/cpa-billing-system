@@ -3,7 +3,6 @@ from __future__ import annotations
 import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
-from sqlalchemy import select
 
 from cpa_billing.models import APIKey, KeyOwnershipPeriod, TelegramUser
 from cpa_billing.security import cpamp_key_hash, login_fingerprint, mask_api_key
@@ -13,13 +12,37 @@ from cpa_billing.web import LoginLimiter, create_app
 def add_user(app, settings, user_id: int, raw_key: str, *, is_admin: bool = False) -> None:
     service = app.state.service
     with service.db.session() as session:
-        session.add(TelegramUser(telegram_user_id=user_id, username=f"user{user_id}", is_admin=is_admin,
-                                 registered_at_ms=1, last_seen_at_ms=1))
+        session.add(TelegramUser(
+            telegram_user_id=user_id,
+            username=f"user{user_id}",
+            is_admin=is_admin,
+            registered_at_ms=1,
+            last_seen_at_ms=1,
+        ))
         session.flush()
-        key = APIKey(cpamp_hash=cpamp_key_hash(raw_key), login_fingerprint=login_fingerprint(raw_key, settings.key_pepper),
-                     masked_value=mask_api_key(raw_key), status="active", current_owner_id=user_id, created_at_ms=1)
-        session.add(key); session.flush()
-        session.add(KeyOwnershipPeriod(api_key_id=key.id, telegram_user_id=user_id, valid_from_ms=1, source="test", created_at_ms=1))
+        key = APIKey(
+            cpamp_hash=cpamp_key_hash(raw_key),
+            login_fingerprint=login_fingerprint(raw_key, settings.key_pepper),
+            masked_value=mask_api_key(raw_key),
+            status="active",
+            current_owner_id=user_id,
+            created_at_ms=1,
+        )
+        session.add(key)
+        session.flush()
+        session.add(KeyOwnershipPeriod(
+            api_key_id=key.id,
+            telegram_user_id=user_id,
+            valid_from_ms=1,
+            source="test",
+            created_at_ms=1,
+        ))
+
+
+def login_user(client: TestClient, raw_key: str) -> dict:
+    response = client.post("/auth/api-key/login", json={"api_key": raw_key})
+    assert response.status_code == 200
+    return response.json()
 
 
 def test_web_has_no_registration_and_hides_other_users_keys(settings, monkeypatch) -> None:
@@ -27,30 +50,29 @@ def test_web_has_no_registration_and_hides_other_users_keys(settings, monkeypatc
     add_user(app, settings, 2, "sk-cpa-user-two-secret")
     add_user(app, settings, 3, "sk-cpa-user-three-secret")
     app.state.service.create_cycle("cycle", "1970-01-01T08:00", "1970-01-02T08:00", 0)
-    monkeypatch.setattr(app.state.service.cpa, "list_keys", lambda: ["sk-cpa-user-two-secret", "sk-cpa-user-three-secret"])
+    monkeypatch.setattr(app.state.service.cpa, "list_keys", lambda: [
+        "sk-cpa-user-two-secret", "sk-cpa-user-three-secret",
+    ])
     client = TestClient(app, base_url="https://billing.example")
+
     unauthenticated = client.get("/", follow_redirects=False)
     assert unauthenticated.status_code == 303
     assert unauthenticated.headers["location"] == "/login"
     assert client.get("/favicon.ico").status_code == 200
     assert client.get("/register").status_code == 404
-    response = client.post("/auth/api-key/login", data={"api_key": "sk-cpa-user-two-secret"}, follow_redirects=False)
-    assert response.status_code == 303
-    client.cookies.update(response.cookies)
-    dashboard = client.get("/?cycle=cycle")
-    assert dashboard.status_code == 200
-    assert "用户排行与账单" in dashboard.text
-    me = client.get("/me")
-    assert me.status_code == 200
-    assert "sk-cpa-u...cret" in me.text
+
+    login = login_user(client, "sk-cpa-user-two-secret")
+    assert login["telegram_user_id"] == 2
     own = client.get("/api/users/2/summary").json()
     other = client.get("/api/users/3/summary").json()
-    assert "keys" in own
+    assert "keys" not in own
     assert "keys" not in other
+    assert len(client.get("/api/me/keys").json()["keys"]) == 1
     assert "sk-cpa-user-three-secret" not in str(other)
-    csrf = client.get("/api/session").json()["csrf_token"]
-    logout = client.post("/auth/logout", data={"_csrf": csrf}, follow_redirects=False)
-    assert logout.status_code == 303
+    assert client.get("/api/me/usage/events").status_code == 200
+
+    logout = client.post("/auth/logout", headers={"X-CSRF-Token": login["csrf_token"]})
+    assert logout.status_code == 204
     assert client.get("/api/session").status_code == 401
 
 
@@ -60,8 +82,7 @@ def test_api_key_admin_flag_does_not_grant_web_admin(settings, monkeypatch) -> N
     monkeypatch.setattr(app.state.service.cpa, "list_keys", lambda: ["sk-cpa-telegram-admin-secret"])
     client = TestClient(app, base_url="https://billing.example")
 
-    response = client.post("/auth/api-key/login", data={"api_key": "sk-cpa-telegram-admin-secret"}, follow_redirects=False)
-    client.cookies.update(response.cookies)
+    login_user(client, "sk-cpa-telegram-admin-secret")
     assert client.get("/api/session").json()["is_admin"] is False
     admin_page = client.get("/admin", follow_redirects=False)
     assert admin_page.status_code == 303
@@ -73,25 +94,46 @@ def test_admin_uses_independent_token_and_csrf(settings) -> None:
     app = create_app(settings)
     client = TestClient(app, base_url="https://billing.example")
 
-    invalid = client.post("/auth/admin/login", data={"management_token": "wrong"}, follow_redirects=False)
+    invalid = client.post("/auth/admin/login", json={"management_token": "wrong"})
     assert invalid.status_code == 401
-    assert "管理 token 无效" in invalid.text
+    assert invalid.json()["detail"] == "管理 token 无效。"
 
-    response = client.post("/auth/admin/login", data={"management_token": settings.admin_token}, follow_redirects=False)
-    assert response.status_code == 303
-    assert response.headers["location"] == "/admin"
-    client.cookies.update(response.cookies)
-    assert client.get("/admin").status_code == 200
+    response = client.post("/auth/admin/login", json={"management_token": settings.admin_token})
+    assert response.status_code == 200
+    csrf = response.json()["csrf_token"]
     assert client.get("/api/admin/session").json()["is_admin"] is True
     assert client.get("/api/session").status_code == 401
 
-    missing_csrf = client.post("/admin/cycles/cycle0/preview", data={}, follow_redirects=False)
+    missing_csrf = client.post("/api/admin/cycles/cycle0/preview", json={})
     assert missing_csrf.status_code == 403
-    assert "CSRF" in missing_csrf.text
-    csrf = client.get("/api/admin/session").json()["csrf_token"]
-    logout = client.post("/auth/admin/logout", data={"_csrf": csrf}, follow_redirects=False)
-    assert logout.status_code == 303
+    assert "CSRF" in missing_csrf.json()["detail"]
+    logout = client.post("/auth/admin/logout", headers={"X-CSRF-Token": csrf})
+    assert logout.status_code == 204
     assert client.get("/api/admin/session").status_code == 401
+
+
+def test_site_mutations_require_user_csrf_and_expose_no_quota_reset(settings, monkeypatch) -> None:
+    app = create_app(settings)
+    add_user(app, settings, 2, "sk-cpa-user-two-secret")
+    monkeypatch.setattr(app.state.service.cpa, "list_keys", lambda: ["sk-cpa-user-two-secret"])
+    monkeypatch.setattr(app.state.service, "refresh_account_quotas", lambda account_ids: {"tasks": [], "accepted": 0})
+    client = TestClient(app, base_url="https://billing.example")
+    login = login_user(client, "sk-cpa-user-two-secret")
+
+    assert client.post("/api/site/accounts/refresh", json={"account_ids": []}).status_code == 403
+    response = client.post(
+        "/api/site/accounts/refresh",
+        json={"account_ids": []},
+        headers={"X-CSRF-Token": login["csrf_token"]},
+    )
+    assert response.status_code == 200
+    throttled = client.post(
+        "/api/site/accounts/refresh",
+        json={"account_ids": []},
+        headers={"X-CSRF-Token": login["csrf_token"]},
+    )
+    assert throttled.status_code == 429
+    assert client.post("/api/site/accounts/reset", json={}).status_code in {404, 405}
 
 
 def test_login_limiter_counts_failures_only() -> None:

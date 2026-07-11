@@ -42,7 +42,8 @@ def settings(tmp_path: Path) -> Settings:
     create_cpamp(cpamp)
     return Settings(database_path=tmp_path / "billing.sqlite", cpamp_database_path=cpamp, cpamp_source_name="test",
                     cpa_base_url="http://cpa", cpa_management_key="management", cpamp_base_url="http://cpamp",
-                    cpamp_admin_key="", key_pepper="pepper", session_secret="session", admin_token="admin-secret-token", telegram_token="token",
+                    cpamp_admin_key="", keeper_base_url="http://keeper", keeper_login_password="keeper-secret",
+                    key_pepper="pepper", session_secret="session", admin_token="admin-secret-token", telegram_token="token",
                     admin_user_ids=frozenset({1}), allowed_group_ids=frozenset({-100}), public_base_url="https://billing.example",
                     api_key_prefix="sk-cpa", timezone="Asia/Shanghai", worker_interval_seconds=1,
                     action_ttl_seconds=600, session_ttl_seconds=3600, sub2_state_file=tmp_path / "sub2.json", sub2_postgres_dsn=None)

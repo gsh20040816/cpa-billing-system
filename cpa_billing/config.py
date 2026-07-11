@@ -18,6 +18,8 @@ class Settings:
     cpa_management_key: str
     cpamp_base_url: str
     cpamp_admin_key: str
+    keeper_base_url: str
+    keeper_login_password: str
     key_pepper: str
     session_secret: str
     admin_token: str
@@ -52,6 +54,8 @@ class Settings:
             cpa_management_key=required["CPA_MANAGEMENT_KEY"],
             cpamp_base_url=os.getenv("CPAMP_BASE_URL", "http://cpa-manager-plus:18317").rstrip("/"),
             cpamp_admin_key=os.getenv("CPAMP_ADMIN_KEY", "").strip(),
+            keeper_base_url=os.getenv("KEEPER_BASE_URL", "http://cpa-usage-keeper:8080").rstrip("/"),
+            keeper_login_password=os.getenv("KEEPER_LOGIN_PASSWORD", "").strip(),
             key_pepper=required["BILLING_KEY_PEPPER"],
             session_secret=required["BILLING_SESSION_SECRET"],
             admin_token=required["BILLING_ADMIN_TOKEN"],

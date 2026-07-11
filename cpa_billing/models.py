@@ -200,7 +200,11 @@ class PoolAssignmentRule(Base):
 
 class RatedEvent(Base):
     __tablename__ = "rated_events"
-    __table_args__ = (UniqueConstraint("raw_event_id", "pricing_version_id"), Index("idx_rated_cycle", "occurred_at_ms", "pool_id", "telegram_user_id"))
+    __table_args__ = (
+        UniqueConstraint("raw_event_id", "pricing_version_id"),
+        Index("idx_rated_cycle", "occurred_at_ms", "pool_id", "telegram_user_id"),
+        Index("idx_rated_user_time", "telegram_user_id", "occurred_at_ms"),
+    )
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     raw_event_id: Mapped[int] = mapped_column(ForeignKey("raw_usage_events.id"))
     pricing_version_id: Mapped[int] = mapped_column(ForeignKey("pricing_versions.id"))
