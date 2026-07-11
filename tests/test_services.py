@@ -528,6 +528,35 @@ def test_request_history_exposes_and_filters_true_tps(service, settings) -> None
     assert history["summary"]["output_tokens"] == 100
 
 
+def test_request_history_exposes_one_effective_cache_read_value(service, settings) -> None:
+    create_owner(service, "key", 2, 0)
+    insert_event(
+        settings,
+        cpamp_key_hash("key"),
+        1000,
+        cached_tokens=65024,
+        cache_read_tokens=0,
+        cache_creation_tokens=0,
+    )
+    insert_event(
+        settings,
+        cpamp_key_hash("key"),
+        2000,
+        event_hash="fine-grained-cache",
+        cached_tokens=150,
+        cache_read_tokens=100,
+        cache_creation_tokens=50,
+    )
+    service.sync_cpamp()
+    service.rate_events()
+
+    items = service.request_history(2, sort="time_asc")["items"]
+    assert items[0]["tokens"]["cache_read"] == 65024
+    assert items[1]["tokens"]["cache_read"] == 100
+    assert items[1]["tokens"]["cache_creation"] == 50
+    assert all("cached" not in item["tokens"] for item in items)
+
+
 def test_gradient_updates_only_open_cycles_and_cannot_be_deleted_while_bound(service) -> None:
     rule_id = service.create_gradient_rule(
         "team-gradient",

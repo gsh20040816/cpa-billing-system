@@ -651,6 +651,10 @@ class BillingService:
         fine_grained = max(int(event.cache_read_tokens or 0), 0) + max(int(event.cache_creation_tokens or 0), 0)
         return max(cached - fine_grained, 0)
 
+    @classmethod
+    def _effective_cache_read_tokens(cls, event: RawUsageEvent) -> int:
+        return cls._compatible_cached_tokens(event) + max(int(event.cache_read_tokens or 0), 0)
+
     def _rate_event(self, behavior_model: str, price_model: str, rule: ModelPriceRule,
                     event: RawUsageEvent, tier: str) -> tuple[int, bool, dict[str, Any]]:
         input_rate = rule.input_nano_per_token
@@ -1996,8 +2000,7 @@ class BillingService:
                     "key": {"id": key.id, "masked": key.masked_value, "name": key.display_name},
                     "tokens": {
                         "input": event.input_tokens,
-                        "cached": self._compatible_cached_tokens(event),
-                        "cache_read": event.cache_read_tokens,
+                        "cache_read": self._effective_cache_read_tokens(event),
                         "cache_creation": event.cache_creation_tokens,
                         "output": event.output_tokens,
                         "reasoning": event.reasoning_tokens,

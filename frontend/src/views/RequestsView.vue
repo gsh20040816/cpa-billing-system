@@ -61,6 +61,12 @@ const headers = [
 ]
 
 const filterCount = computed(() => activeFilterCount(filters, ['page', 'page_size', 'sort']))
+const detailOpen = computed({
+  get: () => detail.value !== null,
+  set: (open) => {
+    if (!open) detail.value = null
+  },
+})
 const metrics = computed(() => {
   const summary = data.value?.summary || {}
   return [
@@ -242,7 +248,7 @@ onBeforeUnmount(autoReload.cancel)
       </div>
     </section>
 
-    <v-dialog v-model="detail" max-width="760">
+    <v-dialog v-model="detailOpen" max-width="760">
       <v-card v-if="detail">
         <v-card-title>请求 {{ detail.request_id || `#${detail.id}` }}</v-card-title>
         <v-card-text>
@@ -252,15 +258,15 @@ onBeforeUnmount(autoReload.cancel)
             <div><span>模型</span><strong>{{ detail.resolved_model || detail.model }}</strong></div>
             <div><span>Tier</span><strong>{{ detail.service_tier }}</strong></div>
             <div><span>Input</span><strong class="mono">{{ number(detail.tokens.input) }}</strong></div>
-            <div><span>Cached</span><strong class="mono">{{ number(detail.tokens.cached) }}</strong></div>
-            <div><span>Cache read</span><strong class="mono">{{ number(detail.tokens.cache_read) }}</strong></div>
-            <div><span>Cache creation</span><strong class="mono">{{ number(detail.tokens.cache_creation) }}</strong></div>
             <div><span>Output</span><strong class="mono">{{ number(detail.tokens.output) }}</strong></div>
+            <div><span>缓存读取</span><strong class="mono">{{ number(detail.tokens.cache_read) }}</strong></div>
+            <div><span>缓存创建</span><strong class="mono">{{ number(detail.tokens.cache_creation) }}</strong></div>
             <div><span>Reasoning</span><strong class="mono">{{ number(detail.tokens.reasoning) }}</strong></div>
             <div><span>TTFT</span><strong class="mono">{{ duration(detail.ttft_ms) }}</strong></div>
             <div><span>延迟</span><strong class="mono">{{ duration(detail.latency_ms) }}</strong></div>
             <div><span>生成阶段</span><strong class="mono">{{ duration(detail.generation_ms) }}</strong></div>
             <div><span>真实 TPS</span><strong class="mono">{{ detail.tps === null ? '-' : Number(detail.tps).toFixed(2) }}</strong></div>
+            <div><span>总 Tokens</span><strong class="mono">{{ number(detail.tokens.total) }}</strong></div>
             <div><span>等效成本</span><strong class="mono">{{ detail.cost === null ? '未计价' : money(detail.cost) }}</strong></div>
           </div>
         </v-card-text>
