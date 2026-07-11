@@ -9,7 +9,17 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import select
 
 from .database import now_ms
-from .models import APIKey, AllowedChat, BillingCycle, CyclePoolCost, GroupMembership, KeyOwnershipPeriod, ResourcePool, TelegramUser
+from .models import (
+    APIKey,
+    AllowedChat,
+    BillingCycle,
+    CyclePoolCost,
+    GradientRule,
+    GroupMembership,
+    KeyOwnershipPeriod,
+    ResourcePool,
+    TelegramUser,
+)
 from .security import login_fingerprint, mask_api_key, mask_hash
 from .services import BillingService
 
@@ -82,6 +92,10 @@ def migrate_legacy_bot(service: BillingService, legacy_path: Path, dry_run: bool
                 counts["ownerships"] += 1
         version_id = service._active_pricing_id(session)
         pool = session.scalar(select(ResourcePool).where(ResourcePool.name == "default-cpa"))
+        default_gradient = session.scalar(select(GradientRule).where(GradientRule.name == "default-gradient"))
+        if default_gradient is None:
+            raise RuntimeError("default gradient rule is missing")
+        default_tiers = json.loads(default_gradient.tiers_json)
         for row in source.execute("select * from billing_cycles order by start_at"):
             if session.scalar(select(BillingCycle).where(BillingCycle.name == row["name"])):
                 continue
@@ -89,8 +103,29 @@ def migrate_legacy_bot(service: BillingService, legacy_path: Path, dry_run: bool
             start, end = datetime.fromisoformat(row["start_at"]), datetime.fromisoformat(row["end_at"])
             if start.tzinfo is None: start = start.replace(tzinfo=zone)
             if end.tzinfo is None: end = end.replace(tzinfo=zone)
+            tiers_json = str(row["tiers_json"])
+            try:
+                tiers = json.loads(tiers_json)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(f"legacy cycle {row['name']} has invalid tiers JSON") from exc
+            gradient = default_gradient
+            if tiers != default_tiers:
+                rule_name = f"legacy-{row['name']}"[:80]
+                gradient = session.scalar(select(GradientRule).where(GradientRule.name == rule_name))
+                if gradient is None:
+                    gradient = GradientRule(
+                        name=rule_name,
+                        description="Imported from legacy cpa-tg-bot billing cycle",
+                        tiers_json=tiers_json,
+                        active=True,
+                        created_at_ms=now_ms(),
+                        updated_at_ms=now_ms(),
+                    )
+                    session.add(gradient)
+                    session.flush()
             cycle = BillingCycle(name=str(row["name"]), start_at_ms=int(start.timestamp() * 1000), end_at_ms=int(end.timestamp() * 1000),
-                                 timezone=service.settings.timezone, status="open", pricing_version_id=version_id, tiers_json=str(row["tiers_json"]),
+                                 timezone=service.settings.timezone, status="open", pricing_version_id=version_id,
+                                 gradient_rule_id=gradient.id, tiers_json=tiers_json,
                                  data_quality_waiver=("本周期曾启用 codexcomp；CPAMP 未保存 metadata.proxy_billed_usage，部分多轮请求的真实上游用量可能被低估。"
                                                       if str(row["name"]) == "cycle0" else None), created_at_ms=int(row["created_at"]) * 1000)
             session.add(cycle)

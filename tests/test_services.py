@@ -4,14 +4,32 @@ import hashlib
 import json
 import sqlite3
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from datetime import datetime, timedelta
+from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 import pytest
 from sqlalchemy import func, select
 
 from cpa_billing.database import Database
-from cpa_billing.models import APIKey, Adjustment, BillingCycle, CyclePoolCost, KeyOwnershipPeriod, RatedEvent, RawUsageEvent, ResourcePool, Statement, TelegramUser
+from cpa_billing.models import (
+    APIKey,
+    Adjustment,
+    BillingCycle,
+    CyclePoolCost,
+    GradientRule,
+    KeyOwnershipPeriod,
+    MeteredKeyCharge,
+    PricingVersion,
+    RatedEvent,
+    RawUsageEvent,
+    ResourcePool,
+    Statement,
+    TelegramUser,
+)
 from cpa_billing.security import cpamp_key_hash
 from cpa_billing.services import BillingError, BillingService
 
@@ -19,14 +37,17 @@ from cpa_billing.services import BillingError, BillingService
 def insert_event(settings, key_hash: str, timestamp_ms: int, *, event_hash: str = "e1", input_tokens: int = 1000,
                  cached_tokens: int = 100, output_tokens: int = 100, tier: str = "default",
                  model: str = "gpt-test", failed: bool = False, fail_status_code: int | None = None,
-                 latency_ms: int = 100, ttft_ms: int = 10) -> None:
+                 latency_ms: int = 100, ttft_ms: int = 10, cache_tokens: int = 0,
+                 cache_read_tokens: int = 0, cache_creation_tokens: int = 0,
+                 account_snapshot: str = "account", auth_index: str = "auth") -> None:
     db = sqlite3.connect(settings.cpamp_database_path)
     db.execute("""insert into usage_events(event_hash,request_id,timestamp_ms,timestamp,provider,executor_type,model,
                requested_model,resolved_model,service_tier,api_key_hash,source_hash,source,account_snapshot,auth_index,
-               input_tokens,output_tokens,reasoning_tokens,cached_tokens,cache_read_tokens,cache_creation_tokens,total_tokens,
-               failed,fail_status_code,latency_ms,ttft_ms) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               input_tokens,output_tokens,reasoning_tokens,cached_tokens,cache_tokens,cache_read_tokens,cache_creation_tokens,total_tokens,
+               failed,fail_status_code,latency_ms,ttft_ms) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                (event_hash, f"request-{event_hash}", timestamp_ms, "2026-07-04T00:00:00Z", "codex", "CodexExecutor", model, model, model, tier,
-                key_hash, "source", "masked", "account", "auth", input_tokens, output_tokens, 40, cached_tokens, 0, 0,
+                key_hash, "source", "masked", account_snapshot, auth_index, input_tokens, output_tokens, 40,
+                cached_tokens, cache_tokens, cache_read_tokens, cache_creation_tokens,
                 input_tokens + output_tokens, int(failed), fail_status_code, latency_ms, ttft_ms))
     db.commit(); db.close()
 
@@ -49,6 +70,16 @@ def test_sync_is_incremental_and_idempotent(service, settings) -> None:
         assert session.scalar(select(func.count()).select_from(RawUsageEvent)) == 1
 
 
+def test_concurrent_rating_is_idempotent(service, settings) -> None:
+    insert_event(settings, "hash", 1000)
+    service.sync_cpamp()
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _: service.rate_events(), range(2)))
+    assert sum(results) == 1
+    with service.db.session() as session:
+        assert session.scalar(select(func.count()).select_from(RatedEvent)) == 1
+
+
 def test_rating_uses_cached_subset_and_reasoning_not_added(service, settings) -> None:
     create_owner(service, "key", 2, 0)
     insert_event(settings, cpamp_key_hash("key"), 1000)
@@ -61,7 +92,16 @@ def test_rating_uses_cached_subset_and_reasoning_not_added(service, settings) ->
 
 def test_priority_and_long_context_combine(service, settings) -> None:
     create_owner(service, "key", 2, 0)
-    insert_event(settings, cpamp_key_hash("key"), 1000, input_tokens=300000, cached_tokens=0, output_tokens=10, tier="fast")
+    insert_event(
+        settings,
+        cpamp_key_hash("key"),
+        1000,
+        input_tokens=300000,
+        cached_tokens=0,
+        output_tokens=10,
+        tier="fast",
+        model="gpt-5.6-luna",
+    )
     service.sync_cpamp(); service.rate_events()
     with service.db.session() as session:
         rated = session.scalar(select(RatedEvent))
@@ -275,6 +315,8 @@ def test_confirmation_token_is_claimed_before_external_key_operation(service, mo
 
 
 def test_keeper_accounts_are_sanitized_and_refresh_uses_public_account_ids(service, monkeypatch) -> None:
+    current = int(time.time() * 1000)
+    reset_at = datetime.fromtimestamp((current + 3_600_000) / 1000, ZoneInfo("Asia/Shanghai")).isoformat()
     raw = {
         "identities": [{
             "id": "7",
@@ -305,6 +347,9 @@ def test_keeper_accounts_are_sanitized_and_refresh_uses_public_account_ids(servi
                 "allowed": True,
                 "limitReached": False,
                 "window": {"seconds": 18000},
+                "resetAt": reset_at,
+                "window_usage_tokens": 999999999,
+                "window_usage_cost": 999999,
             }]},
         }]},
         "inspection": {"total": 1, "normal": 1, "results": [{
@@ -321,6 +366,16 @@ def test_keeper_accounts_are_sanitized_and_refresh_uses_public_account_ids(servi
             return {"tasks": [{"authIndex": "raw-auth-index"}], "accepted": 1, "skipped": 0, "limit": 1}
 
     monkeypatch.setattr(service, "keeper", FakeKeeper())
+    insert_event(
+        service.settings,
+        "account-key",
+        current,
+        event_hash="account-local",
+        auth_index="raw-auth-index",
+        account_snapshot="Shared Pro",
+    )
+    service.sync_cpamp()
+    service.rate_events()
     snapshot = service.accounts_snapshot()
     serialized = json.dumps(snapshot)
     assert "raw-auth-index" not in serialized
@@ -328,9 +383,41 @@ def test_keeper_accounts_are_sanitized_and_refresh_uses_public_account_ids(servi
     assert "/root/private" not in serialized
     assert snapshot["accounts"][0]["id"] == "7"
     assert snapshot["accounts"][0]["quota"][0]["used_percent"] == 42
+    assert snapshot["accounts"][0]["usage"]["requests"] == 1
+    assert snapshot["accounts"][0]["usage"]["total_tokens"] == 1100
+    assert snapshot["accounts"][0]["usage"]["source"] == "billing-panel"
+    assert snapshot["accounts"][0]["quota"][0]["window_usage_tokens"] == 1100
+    assert snapshot["accounts"][0]["quota"][0]["window_usage_cost"] == "0.0015"
 
     refresh = service.refresh_account_quotas(["7"])
     assert refresh["tasks"] == [{"account_id": "7", "status": "queued"}]
+
+
+def test_keeper_refresh_accepts_null_task_lists(service, monkeypatch) -> None:
+    raw = {
+        "identities": [{
+            "id": "7",
+            "identity": "raw-auth-index",
+            "displayName": "Shared Pro",
+            "disabled": False,
+        }],
+        "quota": {"items": []},
+        "inspection": {},
+    }
+
+    class FakeKeeper:
+        def accounts_snapshot(self):
+            return raw
+
+        def refresh(self, auth_indexes):
+            assert auth_indexes == ["raw-auth-index"]
+            return {"tasks": None, "rejected": None, "accepted": 0, "skipped": 1, "limit": 1}
+
+    monkeypatch.setattr(service, "keeper", FakeKeeper())
+    result = service.refresh_account_quotas(["7"])
+    assert result["tasks"] == []
+    assert result["rejected"] == []
+    assert result["skipped"] == 1
 
 
 def test_pricing_snapshot_exposes_effective_rules_without_internal_auth_patterns(service) -> None:
@@ -362,3 +449,215 @@ def test_realtime_status_removes_key_ids_auth_indexes_and_request_particles(serv
     assert "internal-model-id" not in serialized
     assert '"particles"' not in serialized
     assert '"timestamp": "secret"' not in serialized
+
+
+def test_request_history_exposes_and_filters_true_tps(service, settings) -> None:
+    create_owner(service, "key", 2, 0)
+    insert_event(
+        settings,
+        cpamp_key_hash("key"),
+        1000,
+        output_tokens=100,
+        latency_ms=2100,
+        ttft_ms=100,
+    )
+    service.sync_cpamp()
+    service.rate_events()
+
+    history = service.request_history(2, min_tps=49, max_tps=51, sort="tps_desc")
+    assert history["pagination"]["total"] == 1
+    assert history["items"][0]["generation_ms"] == 2000
+    assert history["items"][0]["tps"] == 50.0
+    assert history["summary"]["input_tokens"] == 1000
+    assert history["summary"]["output_tokens"] == 100
+
+
+def test_gradient_updates_only_open_cycles_and_cannot_be_deleted_while_bound(service) -> None:
+    rule_id = service.create_gradient_rule(
+        "team-gradient",
+        "test",
+        [{"left": 0, "right": None, "multiplier": 1}],
+        "create test rule",
+    )
+    service.create_cycle("open-cycle", "1970-01-01T08:00", "1970-01-02T08:00", 0, gradient_rule_id=rule_id)
+    service.create_cycle("closed-cycle", "1970-01-02T08:00", "1970-01-03T08:00", 0, gradient_rule_id=rule_id)
+    service.close_cycle("closed-cycle", 1, False)
+
+    service.update_gradient_rule(
+        rule_id,
+        "team-gradient",
+        "updated",
+        [
+            {"left": 0, "right": 10, "multiplier": 1},
+            {"left": 10, "right": None, "multiplier": 0.5},
+        ],
+        "update test rule",
+    )
+    with service.db.session() as session:
+        opened = session.scalar(select(BillingCycle).where(BillingCycle.name == "open-cycle"))
+        closed = session.scalar(select(BillingCycle).where(BillingCycle.name == "closed-cycle"))
+        assert json.loads(opened.tiers_json)[0]["right"] == "10"
+        assert json.loads(closed.tiers_json)[0]["right"] is None
+    with pytest.raises(BillingError, match="仍被未关闭账期使用"):
+        service.delete_gradient_rule(rule_id, "cannot delete yet")
+
+
+def test_unowned_metered_key_reduces_member_pool_cost(service, settings) -> None:
+    create_owner(service, "owned-key", 2, 0)
+    with service.db.session() as session:
+        session.add(APIKey(
+            cpamp_hash=cpamp_key_hash("metered-key"),
+            login_fingerprint=None,
+            masked_value="sk-cpa-****metered",
+            status="unowned",
+            current_owner_id=None,
+            present_in_cpa=True,
+            created_at_ms=0,
+        ))
+        session.flush()
+        metered_id = session.scalar(select(APIKey.id).where(APIKey.cpamp_hash == cpamp_key_hash("metered-key")))
+    service.update_unowned_key_profile(metered_id, "external-team", "7", "set RMB per USD multiplier")
+    insert_event(
+        settings,
+        cpamp_key_hash("owned-key"),
+        1000,
+        event_hash="owned-usage",
+        input_tokens=1_000_000,
+        cached_tokens=0,
+        output_tokens=0,
+    )
+    insert_event(
+        settings,
+        cpamp_key_hash("metered-key"),
+        1001,
+        event_hash="metered-usage",
+        input_tokens=1_000_000,
+        cached_tokens=0,
+        output_tokens=0,
+    )
+    service.sync_cpamp()
+    service.rate_events()
+    service.create_cycle("metered-cycle", "1970-01-01T08:00", "1970-01-02T08:00", 1000)
+
+    dashboard = service.dashboard("metered-cycle")
+    owned = next(row for row in dashboard["rows"] if row["telegram_user_id"] == 2)
+    unowned = next(row for row in dashboard["rows"] if row["unowned"])
+    assert owned["amount"] == "3.00"
+    assert unowned["amount"] == "7.00"
+    assert dashboard["totals"]["fixed_cost"] == "10.00"
+    assert dashboard["totals"]["metered_amount"] == "7.00"
+    assert dashboard["totals"]["member_amount"] == "3.00"
+    assert dashboard["totals"]["amount"] == "10.00"
+
+
+def test_cpa_key_sync_restores_owned_key_status(service, monkeypatch) -> None:
+    create_owner(service, "owned-key", 2, 0)
+    cpa_keys: list[str] = []
+    monkeypatch.setattr(service.cpa, "list_keys", lambda: list(cpa_keys))
+
+    service.sync_cpa_keys()
+    with service.db.session() as session:
+        key = session.scalar(select(APIKey).where(APIKey.cpamp_hash == cpamp_key_hash("owned-key")))
+        assert key.status == "retired"
+        assert key.present_in_cpa is False
+
+    cpa_keys.append("owned-key")
+    service.sync_cpa_keys()
+    with service.db.session() as session:
+        key = session.scalar(select(APIKey).where(APIKey.cpamp_hash == cpamp_key_hash("owned-key")))
+        assert key.status == "active"
+        assert key.present_in_cpa is True
+        assert key.login_fingerprint is not None
+
+
+def test_upstream_price_sync_rerates_open_cycles_only(service, settings, monkeypatch) -> None:
+    create_owner(service, "key", 2, 0)
+    insert_event(settings, cpamp_key_hash("key"), 1000)
+    service.sync_cpamp()
+    service.rate_events()
+    service.create_cycle("open-price", "1970-01-01T08:00", "1970-01-02T08:00", 1000)
+    service.create_cycle("closed-price", "1970-01-01T08:00", "1970-01-02T08:00", 1000)
+    service.close_cycle("closed-price", 1, False)
+    before_open = service.dashboard("open-price")["totals"]["actual"]
+    before_closed = service.dashboard("closed-price")["totals"]["actual"]
+
+    def sync_prices(models):
+        assert "gpt-test" in models
+        db = sqlite3.connect(settings.cpamp_database_path)
+        db.execute(
+            "update model_prices set prompt_per_1m=2, completion_per_1m=12, cache_per_1m=.2, "
+            "cache_read_per_1m=.2, cache_creation_per_1m=2.5 where model='gpt-test'"
+        )
+        db.commit()
+        db.close()
+        return {"source": "test", "sources": ["test"], "imported": 1, "skipped": 0, "unmatched": []}
+
+    monkeypatch.setattr(service.cpamp, "sync_model_prices", sync_prices)
+    result = service.sync_upstream_prices("synced-prices", "web-admin", "admin-token", "test refresh")
+    assert result["rated_events"] >= 1
+    assert Decimal(service.dashboard("open-price")["totals"]["actual"].replace(",", "")) > Decimal(before_open.replace(",", ""))
+    assert service.dashboard("closed-price")["totals"]["actual"] == before_closed
+    assert service.request_history(2)["items"][0]["cost"] == before_closed
+    with service.db.session() as session:
+        opened = session.scalar(select(BillingCycle).where(BillingCycle.name == "open-price"))
+        closed = session.scalar(select(BillingCycle).where(BillingCycle.name == "closed-price"))
+        assert session.get(PricingVersion, opened.pricing_version_id).name == "synced-prices"
+        assert session.get(PricingVersion, closed.pricing_version_id).name == "cpamp-initial"
+
+
+def test_site_status_usage_is_calculated_locally(service, settings, monkeypatch) -> None:
+    current = int(time.time() * 1000)
+    insert_event(settings, "site-key", current - 1000, event_hash="site-local")
+    service.sync_cpamp()
+    service.rate_events()
+
+    class FakeKeeper:
+        def status_snapshot(self, range_name, window, start, end):
+            return {
+                "status": {"running": True},
+                "version": {"version": "test"},
+                "update": {"updateAvailable": False},
+            }
+
+    monkeypatch.setattr(service, "keeper", FakeKeeper())
+    status = service.site_status("24h", "15m")
+    assert status["keeper"]["overview"]["summary"]["request_count"] == 1
+    assert status["keeper"]["overview"]["summary"]["token_count"] == 1100
+    assert status["keeper"]["overview"]["summary"]["source"] == "billing-panel"
+    assert status["keeper"]["realtime"]["source"] == "billing-panel"
+
+
+def test_rankings_keep_unowned_keys_separate_and_masked(service, settings) -> None:
+    current = int(time.time() * 1000)
+    with service.db.session() as session:
+        session.add_all([
+            APIKey(
+                cpamp_hash=cpamp_key_hash("unowned-one"),
+                login_fingerprint=None,
+                masked_value="sk-cpa-****one",
+                display_name="external-one",
+                status="unowned",
+                current_owner_id=None,
+                created_at_ms=current,
+            ),
+            APIKey(
+                cpamp_hash=cpamp_key_hash("unowned-two"),
+                login_fingerprint=None,
+                masked_value="sk-cpa-****two",
+                status="unowned",
+                current_owner_id=None,
+                created_at_ms=current,
+            ),
+        ])
+    insert_event(settings, cpamp_key_hash("unowned-one"), current - 1000, event_hash="unowned-one-event")
+    insert_event(settings, cpamp_key_hash("unowned-two"), current - 500, event_hash="unowned-two-event")
+    service.sync_cpamp()
+    service.rate_events()
+
+    web_rows = [row for row in service.ranking_snapshot("24h")["rows"] if row["unowned"]]
+    assert {row["name"] for row in web_rows} == {"external-one", "sk-cpa-****two"}
+    assert all(row["key_count"] == 1 for row in web_rows)
+    bot_rows = [row for row in service.rankings(current - 86_400_000) if row["telegram_user_id"] is None]
+    assert {row["name"] for row in bot_rows} == {"external-one", "sk-cpa-****two"}
+    _, chart = service.hourly_usage(24)
+    assert {row["name"] for row in chart} == {"external-one", "sk-cpa-****two"}

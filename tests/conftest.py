@@ -18,7 +18,7 @@ def create_cpamp(path: Path) -> None:
       id integer primary key autoincrement,event_hash text unique,request_id text,timestamp_ms integer,timestamp text,
       provider text,executor_type text,model text,requested_model text,resolved_model text,service_tier text,
       api_key_hash text,source_hash text,source text,account_snapshot text,auth_index text,
-      input_tokens integer,output_tokens integer,reasoning_tokens integer,cached_tokens integer,
+      input_tokens integer,output_tokens integer,reasoning_tokens integer,cached_tokens integer,cache_tokens integer,
       cache_read_tokens integer,cache_creation_tokens integer,total_tokens integer,failed integer,
       fail_status_code integer,latency_ms integer,ttft_ms integer);
     alter table usage_events add column response_metadata_json text;
@@ -33,6 +33,7 @@ def create_cpamp(path: Path) -> None:
            "cache_read_input_token_cost_priority": 0.0000002, "input_cost_per_token_above_272k_tokens": 0.000002,
            "output_cost_per_token_above_272k_tokens": 0.000009}
     db.execute("insert into model_prices values(?,?,?,?,?,?,?,?,?,?,?)", ("gpt-test", 1, 6, .1, .1, 1.25, "test", "gpt-test", json.dumps(raw), 1, 1))
+    db.execute("insert into model_prices values(?,?,?,?,?,?,?,?,?,?,?)", ("gpt-5.6-luna", 1, 6, .1, .1, 1.25, "test", "gpt-5.6-luna", json.dumps(raw), 1, 1))
     db.commit(); db.close()
 
 

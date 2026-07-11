@@ -31,7 +31,17 @@ def worker(service: BillingService, interval: float, once: bool) -> None:
             rated = service.rate_events()
             logging.info("worker imported=%s rated=%s", imported, rated)
         except Exception:
-            logging.exception("worker iteration failed")
+            logging.exception("usage sync iteration failed")
+        try:
+            keys = service.sync_cpa_keys()
+            logging.info(
+                "worker keys_current=%s keys_created=%s keys_retired=%s",
+                keys["current"],
+                keys["created"],
+                keys["retired"],
+            )
+        except Exception:
+            logging.exception("CPA key sync iteration failed")
         if once:
             return
         time.sleep(interval)
@@ -46,6 +56,10 @@ def main() -> None:
     preview = sub.add_parser("preview"); preview.add_argument("cycle")
     close = sub.add_parser("close-cycle"); close.add_argument("cycle"); close.add_argument("operator", type=int); close.add_argument("--confirm-waiver", action="store_true")
     sub.add_parser("reconcile")
+    price_sync = sub.add_parser("sync-prices")
+    price_sync.add_argument("--name")
+    price_sync.add_argument("--reason", required=True)
+    sub.add_parser("sync-keys")
     sub.add_parser("bot")
     serve = sub.add_parser("serve"); serve.add_argument("--host", default="0.0.0.0"); serve.add_argument("--port", type=int, default=18417)
     args = parser.parse_args()
@@ -65,6 +79,15 @@ def main() -> None:
         service.close_cycle(args.cycle, args.operator, args.confirm_waiver)
     elif args.command == "reconcile":
         print(json.dumps(service.reconciliation(record=True), ensure_ascii=False))
+    elif args.command == "sync-prices":
+        print(json.dumps(service.sync_upstream_prices(
+            args.name,
+            operator_type="cli-admin",
+            operator_id="deployment",
+            reason=args.reason,
+        ), ensure_ascii=False))
+    elif args.command == "sync-keys":
+        print(json.dumps(service.sync_cpa_keys(), ensure_ascii=False))
     elif args.command == "bot":
         asyncio.run(run_bot())
     elif args.command == "serve":

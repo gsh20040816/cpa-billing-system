@@ -110,11 +110,18 @@ class AccountRefreshPayload(BaseModel):
     account_ids: list[str] = Field(default_factory=list, max_length=100)
 
 
+class PoolCostPayload(BaseModel):
+    pool_id: int = Field(ge=1)
+    fixed_cost: str
+
+
 class CyclePayload(BaseModel):
     name: str
     start: str
     end: str
-    fixed_cost: str
+    fixed_cost: str = "0"
+    gradient_rule_id: int | None = Field(default=None, ge=1)
+    pool_costs: list[PoolCostPayload] = Field(default_factory=list)
     waiver: str | None = Field(default=None, max_length=1000)
 
 
@@ -147,6 +154,34 @@ class PoolPayload(BaseModel):
 class PricingImportPayload(BaseModel):
     name: str
     confirm_import: bool = False
+
+
+class PricingSyncPayload(BaseModel):
+    name: str | None = Field(default=None, max_length=80)
+    reason: str = Field(min_length=1, max_length=1000)
+
+
+class GradientRulePayload(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    description: str | None = Field(default=None, max_length=300)
+    tiers: list[dict[str, Any]] = Field(min_length=1, max_length=100)
+    reason: str = Field(min_length=1, max_length=1000)
+
+
+class ReasonPayload(BaseModel):
+    reason: str = Field(min_length=1, max_length=1000)
+
+
+class CycleConfigurationPayload(BaseModel):
+    gradient_rule_id: int = Field(ge=1)
+    pool_costs: list[PoolCostPayload] = Field(default_factory=list)
+    reason: str = Field(min_length=1, max_length=1000)
+
+
+class KeyBillingProfilePayload(BaseModel):
+    name: str | None = Field(default=None, max_length=120)
+    multiplier: str | None = Field(default=None, max_length=40)
+    reason: str = Field(min_length=1, max_length=1000)
 
 
 def _client_address(request: Request) -> str:
@@ -433,6 +468,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         max_latency: int | None = Query(None, ge=0),
         min_ttft: int | None = Query(None, ge=0),
         max_ttft: int | None = Query(None, ge=0),
+        min_tps: float | None = Query(None, ge=0),
+        max_tps: float | None = Query(None, ge=0),
         long_context: bool | None = Query(None),
         q: str | None = Query(None, max_length=200),
         sort: str = Query("time_desc"),
@@ -458,6 +495,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             max_latency=max_latency,
             min_ttft=min_ttft,
             max_ttft=max_ttft,
+            min_tps=min_tps,
+            max_tps=max_tps,
             long_context=long_context,
             query_text=q,
             sort=sort,
@@ -525,14 +564,35 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.post("/api/admin/cycles")
     def api_create_cycle(payload: CyclePayload, request: Request, auth: Any = Depends(admin_current)) -> dict[str, bool]:
         verify_csrf(request, auth)
+        pool_costs = [{
+            "pool_id": item.pool_id,
+            "fixed_cost_cents": _money_to_cents(item.fixed_cost),
+        } for item in payload.pool_costs]
         service.create_cycle(
             payload.name,
             payload.start,
             payload.end,
             _money_to_cents(payload.fixed_cost),
             (payload.waiver or "").strip() or None,
+            gradient_rule_id=payload.gradient_rule_id,
+            pool_costs=pool_costs or None,
             operator_type="web-admin",
             operator_id="admin-token",
+        )
+        return {"ok": True}
+
+    @app.put("/api/admin/cycles/{cycle_name}/configuration")
+    def api_configure_cycle(cycle_name: str, payload: CycleConfigurationPayload, request: Request,
+                            auth: Any = Depends(admin_current)) -> dict[str, bool]:
+        verify_csrf(request, auth)
+        service.configure_cycle(
+            cycle_name,
+            payload.gradient_rule_id,
+            [{
+                "pool_id": item.pool_id,
+                "fixed_cost_cents": _money_to_cents(item.fixed_cost),
+            } for item in payload.pool_costs],
+            payload.reason,
         )
         return {"ok": True}
 
@@ -607,6 +667,65 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             allow_existing=False,
         )
         return {"ok": True}
+
+    @app.post("/api/admin/pricing-versions/sync")
+    def api_sync_pricing(payload: PricingSyncPayload, request: Request,
+                         auth: Any = Depends(admin_current)) -> dict[str, Any]:
+        verify_csrf(request, auth)
+        return service.sync_upstream_prices(
+            payload.name,
+            operator_type="web-admin",
+            operator_id="admin-token",
+            reason=payload.reason,
+        )
+
+    @app.post("/api/admin/gradient-rules")
+    def api_create_gradient(payload: GradientRulePayload, request: Request,
+                            auth: Any = Depends(admin_current)) -> dict[str, Any]:
+        verify_csrf(request, auth)
+        rule_id = service.create_gradient_rule(
+            payload.name,
+            payload.description,
+            payload.tiers,
+            payload.reason,
+        )
+        return {"ok": True, "id": rule_id}
+
+    @app.put("/api/admin/gradient-rules/{rule_id}")
+    def api_update_gradient(rule_id: int, payload: GradientRulePayload, request: Request,
+                            auth: Any = Depends(admin_current)) -> dict[str, bool]:
+        verify_csrf(request, auth)
+        service.update_gradient_rule(
+            rule_id,
+            payload.name,
+            payload.description,
+            payload.tiers,
+            payload.reason,
+        )
+        return {"ok": True}
+
+    @app.delete("/api/admin/gradient-rules/{rule_id}")
+    def api_delete_gradient(rule_id: int, payload: ReasonPayload, request: Request,
+                            auth: Any = Depends(admin_current)) -> dict[str, bool]:
+        verify_csrf(request, auth)
+        service.delete_gradient_rule(rule_id, payload.reason)
+        return {"ok": True}
+
+    @app.patch("/api/admin/keys/{key_id}/billing-profile")
+    def api_update_key_billing_profile(key_id: int, payload: KeyBillingProfilePayload, request: Request,
+                                       auth: Any = Depends(admin_current)) -> dict[str, Any]:
+        verify_csrf(request, auth)
+        return service.update_unowned_key_profile(
+            key_id,
+            payload.name,
+            payload.multiplier,
+            payload.reason,
+        )
+
+    @app.post("/api/admin/cpa-keys/sync")
+    def api_sync_cpa_keys(request: Request, auth: Any = Depends(admin_current)) -> dict[str, int]:
+        verify_csrf(request, auth)
+        return service.sync_cpa_keys()
 
     @app.get("/login", include_in_schema=False)
     def login_page(request: Request) -> Response:

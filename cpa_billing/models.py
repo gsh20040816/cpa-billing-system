@@ -56,6 +56,7 @@ class RawUsageEvent(Base):
     output_tokens: Mapped[int] = mapped_column(BigInteger, default=0)
     reasoning_tokens: Mapped[int] = mapped_column(BigInteger, default=0)
     cached_tokens: Mapped[int] = mapped_column(BigInteger, default=0)
+    cache_tokens: Mapped[int] = mapped_column(BigInteger, default=0)
     cache_read_tokens: Mapped[int] = mapped_column(BigInteger, default=0)
     cache_creation_tokens: Mapped[int] = mapped_column(BigInteger, default=0)
     total_tokens: Mapped[int] = mapped_column(BigInteger, default=0)
@@ -119,6 +120,9 @@ class APIKey(Base):
     display_name: Mapped[str | None] = mapped_column(String(120))
     status: Mapped[str] = mapped_column(String(20), default="active")
     current_owner_id: Mapped[int | None] = mapped_column(ForeignKey("telegram_users.telegram_user_id"))
+    billing_multiplier_ppm: Mapped[int | None] = mapped_column(BigInteger)
+    present_in_cpa: Mapped[bool] = mapped_column(Boolean, default=False)
+    last_seen_in_cpa_at_ms: Mapped[int | None] = mapped_column(BigInteger)
     created_at_ms: Mapped[int] = mapped_column(BigInteger)
     revoked_at_ms: Mapped[int | None] = mapped_column(BigInteger)
 
@@ -168,6 +172,10 @@ class ModelPriceRule(Base):
     output_nano_per_token: Mapped[int] = mapped_column(BigInteger)
     cache_read_nano_per_token: Mapped[int] = mapped_column(BigInteger)
     cache_creation_nano_per_token: Mapped[int] = mapped_column(BigInteger)
+    input_configured: Mapped[bool] = mapped_column(Boolean, default=True)
+    output_configured: Mapped[bool] = mapped_column(Boolean, default=True)
+    cache_read_configured: Mapped[bool] = mapped_column(Boolean, default=False)
+    cache_creation_configured: Mapped[bool] = mapped_column(Boolean, default=False)
     priority_input_nano_per_token: Mapped[int | None] = mapped_column(BigInteger)
     priority_output_nano_per_token: Mapped[int | None] = mapped_column(BigInteger)
     priority_cache_read_nano_per_token: Mapped[int | None] = mapped_column(BigInteger)
@@ -218,6 +226,17 @@ class RatedEvent(Base):
     rated_at_ms: Mapped[int] = mapped_column(BigInteger)
 
 
+class GradientRule(Base):
+    __tablename__ = "gradient_rules"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(80), unique=True)
+    description: Mapped[str | None] = mapped_column(String(300))
+    tiers_json: Mapped[str] = mapped_column(Text)
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at_ms: Mapped[int] = mapped_column(BigInteger)
+    updated_at_ms: Mapped[int] = mapped_column(BigInteger)
+
+
 class BillingCycle(Base):
     __tablename__ = "billing_cycles"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -227,6 +246,7 @@ class BillingCycle(Base):
     timezone: Mapped[str] = mapped_column(String(80))
     status: Mapped[str] = mapped_column(String(20), default="open")
     pricing_version_id: Mapped[int] = mapped_column(ForeignKey("pricing_versions.id"))
+    gradient_rule_id: Mapped[int] = mapped_column(ForeignKey("gradient_rules.id"))
     tiers_json: Mapped[str] = mapped_column(Text)
     data_quality_waiver: Mapped[str | None] = mapped_column(Text)
     created_at_ms: Mapped[int] = mapped_column(BigInteger)
@@ -264,6 +284,20 @@ class StatementLine(Base):
     billed_weight_nano_usd: Mapped[int] = mapped_column(BigInteger)
     amount_cents: Mapped[int] = mapped_column(BigInteger)
     api_key_count: Mapped[int] = mapped_column(Integer)
+
+
+class MeteredKeyCharge(Base):
+    __tablename__ = "metered_key_charges"
+    __table_args__ = (UniqueConstraint("cycle_id", "pool_id", "api_key_id"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    cycle_id: Mapped[int] = mapped_column(ForeignKey("billing_cycles.id"))
+    pool_id: Mapped[int] = mapped_column(ForeignKey("resource_pools.id"))
+    api_key_id: Mapped[int] = mapped_column(ForeignKey("api_keys.id"))
+    actual_weight_nano_usd: Mapped[int] = mapped_column(BigInteger)
+    multiplier_ppm: Mapped[int] = mapped_column(BigInteger)
+    amount_cents: Mapped[int] = mapped_column(BigInteger)
+    generated_at_ms: Mapped[int] = mapped_column(BigInteger)
+    final: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
 class Adjustment(Base):

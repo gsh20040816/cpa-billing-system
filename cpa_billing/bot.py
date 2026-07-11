@@ -208,10 +208,31 @@ class BillingBot:
             return f"用户 <code>{target}</code> cached_legal=<code>{self.service.user_is_eligible_cached(target)}</code>"
         if command == "/billconfig":
             parts = args.split()
-            if len(parts) != 5:
-                return "用法：<code>/billconfig NAME START END FIXED TIERS</code>；Web 管理页将提供完整向导。"
-            name, start, end, fixed, _ = parts
-            await asyncio.to_thread(self.service.create_cycle, name, start, end, int(Decimal(fixed) * 100), None)
+            if not parts:
+                snapshot = await asyncio.to_thread(self.service.admin_snapshot)
+                rules = "\n".join(
+                    f"<code>{rule['id']}</code> {esc(rule['name'])}"
+                    for rule in snapshot.get("gradients", []) if rule.get("active")
+                ) or "暂无可用规则"
+                return (
+                    "<b>创建计费周期</b>\n\n"
+                    "用法：<code>/billconfig NAME START END FIXED [RULE_ID]</code>\n"
+                    "示例：<code>/billconfig 2026-08 2026-08-01T00:00 2026-09-01T00:00 1090 1</code>\n\n"
+                    "可用梯度规则：\n" + rules
+                )
+            if len(parts) not in {4, 5}:
+                return "参数数量不正确。发送 <code>/billconfig</code> 查看示例和可用规则。"
+            name, start, end, fixed = parts[:4]
+            rule_id = int(parts[4]) if len(parts) == 5 else None
+            await asyncio.to_thread(
+                self.service.create_cycle,
+                name,
+                start,
+                end,
+                int(Decimal(fixed) * 100),
+                None,
+                rule_id,
+            )
             return f"计费周期 <code>{esc(name)}</code> 已创建。"
         if command == "/billcycles":
             cycles = await asyncio.to_thread(self.service.list_cycles)
@@ -242,7 +263,7 @@ class BillingBot:
 
     def help(self, is_admin: bool) -> str:
         lines = ["CPA 自助 API Key Bot", "", "用户命令：", "/register - 首次注册或新增 API Key", "/mykey - 查看已绑定的掩码 Key",
-                 "/confirm TOKEN - 确认 Web Key 操作", "/usage /models /ranking /chart /billing /sub2billing /accounts", "/id /help", "", f"Web：<code>{esc(self.settings.public_base_url)}</code>"]
+                 "/usage /models /ranking /chart /billing /sub2billing /accounts", "/id /help", "", f"Web：<code>{esc(self.settings.public_base_url)}</code>"]
         if is_admin:
             lines += ["", "管理员命令：", "/billconfig /billcycle /billcycles", "/stats /users /allowuser /revokeuser /checkuser", "/namekey /allowchat /delchat /listchats"]
         return "\n".join(lines)
@@ -321,7 +342,7 @@ class BillingBot:
         commands = [{"command": cmd, "description": desc} for cmd, desc in [
             ("usage", "查看 CPA 全局用量"), ("models", "查看模型用量"), ("ranking", "查看全局排行"), ("chart", "查看最近排行"),
             ("billing", "查看当前计费周期"), ("sub2billing", "查看 Sub2API 当前周期"), ("accounts", "查看账号用量"),
-            ("register", "注册或新增 CPA API Key"), ("mykey", "查看已绑定 Key"), ("confirm", "确认 Web Key 操作"), ("id", "显示 Telegram id"), ("help", "查看帮助")]]
+            ("register", "注册或新增 CPA API Key"), ("mykey", "查看已绑定 Key"), ("id", "显示 Telegram id"), ("help", "查看帮助")]]
         await self.tg.call("setMyCommands", {"commands": commands})
         offset = None
         while True:

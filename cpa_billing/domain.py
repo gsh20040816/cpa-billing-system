@@ -31,7 +31,7 @@ def tiered_weight(actual_nano: int, tiers: Iterable[Tier]) -> int:
 def parse_tiers(items: list[dict[str, object]]) -> list[Tier]:
     tiers: list[Tier] = []
     expected = Decimal(0)
-    for item in items:
+    for index, item in enumerate(items):
         left = Decimal(str(item["left"]))
         right_raw = item.get("right")
         multiplier = Decimal(str(item["multiplier"]))
@@ -48,6 +48,8 @@ def parse_tiers(items: list[dict[str, object]]) -> list[Tier]:
             )
         )
         if right is None:
+            if index != len(items) - 1:
+                raise ValueError("only the last tier may be open ended")
             break
         expected = right
     if not tiers or tiers[-1].right_nano is not None:
