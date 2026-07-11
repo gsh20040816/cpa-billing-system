@@ -1721,11 +1721,13 @@ class BillingService:
                 } for key in keys],
             }
 
-    def request_filter_options(self, user_id: int) -> dict[str, Any]:
-        event_ownership = (
+    def request_filter_options(self, user_id: int | None, *, all_users: bool = False) -> dict[str, Any]:
+        if (user_id is None) != all_users:
+            raise BillingError("请求查询范围无效")
+        event_scope = (
             RawUsageEvent.__table__
-            .join(APIKey.__table__, APIKey.cpamp_hash == RawUsageEvent.api_key_hash)
-            .join(KeyOwnershipPeriod.__table__, and_(
+            .outerjoin(APIKey.__table__, APIKey.cpamp_hash == RawUsageEvent.api_key_hash)
+            .outerjoin(KeyOwnershipPeriod.__table__, and_(
                 KeyOwnershipPeriod.api_key_id == APIKey.id,
                 KeyOwnershipPeriod.valid_from_ms <= RawUsageEvent.occurred_at_ms,
                 or_(
@@ -1734,9 +1736,9 @@ class BillingService:
                 ),
             ))
         )
-        ownership_filter = KeyOwnershipPeriod.telegram_user_id == user_id
+        scope_filters = [] if all_users else [KeyOwnershipPeriod.telegram_user_id == user_id]
         with self.db.session() as session:
-            if session.get(TelegramUser, user_id) is None:
+            if not all_users and session.get(TelegramUser, user_id) is None:
                 raise BillingError("用户不存在")
             models = sorted({
                 str(value)
@@ -1745,33 +1747,33 @@ class BillingService:
                         RawUsageEvent.model,
                         RawUsageEvent.requested_model,
                         RawUsageEvent.resolved_model,
-                    ).select_from(event_ownership).where(ownership_filter)
+                    ).select_from(event_scope).where(*scope_filters)
                 )
                 for value in row
                 if value
             })
             tiers = sorted({str(value or "default") for value in session.scalars(
-                select(RawUsageEvent.service_tier).select_from(event_ownership)
-                .where(ownership_filter).distinct().order_by(RawUsageEvent.service_tier)
+                select(RawUsageEvent.service_tier).select_from(event_scope)
+                .where(*scope_filters).distinct().order_by(RawUsageEvent.service_tier)
             )})
             providers = [str(value) for value in session.scalars(
-                select(RawUsageEvent.provider).select_from(event_ownership)
-                .where(ownership_filter, RawUsageEvent.provider.is_not(None))
+                select(RawUsageEvent.provider).select_from(event_scope)
+                .where(*scope_filters).where(RawUsageEvent.provider.is_not(None))
                 .distinct().order_by(RawUsageEvent.provider)
             )]
             failure_codes = [int(value) for value in session.scalars(
-                select(RawUsageEvent.fail_status_code).select_from(event_ownership)
-                .where(ownership_filter, RawUsageEvent.fail_status_code.is_not(None))
+                select(RawUsageEvent.fail_status_code).select_from(event_scope)
+                .where(*scope_filters).where(RawUsageEvent.fail_status_code.is_not(None))
                 .distinct().order_by(RawUsageEvent.fail_status_code)
             )]
             bounds = session.execute(
                 select(func.min(RawUsageEvent.occurred_at_ms), func.max(RawUsageEvent.occurred_at_ms))
-                .select_from(event_ownership).where(ownership_filter)
+                .select_from(event_scope).where(*scope_filters)
             ).one()
             key_rows = session.execute(
                 select(APIKey.id, APIKey.masked_value, APIKey.display_name, APIKey.status)
-                .join(KeyOwnershipPeriod, KeyOwnershipPeriod.api_key_id == APIKey.id)
-                .where(KeyOwnershipPeriod.telegram_user_id == user_id)
+                .select_from(event_scope)
+                .where(*scope_filters).where(APIKey.id.is_not(None))
                 .distinct().order_by(APIKey.id.desc())
             ).all()
             return {
@@ -1785,8 +1787,9 @@ class BillingService:
 
     def request_history(
         self,
-        user_id: int,
+        user_id: int | None,
         *,
+        all_users: bool = False,
         start: str | None = None,
         end: str | None = None,
         models: list[str] | None = None,
@@ -1811,6 +1814,8 @@ class BillingService:
         page: int = 1,
         page_size: int = 50,
     ) -> dict[str, Any]:
+        if (user_id is None) != all_users:
+            raise BillingError("请求查询范围无效")
         if page < 1 or page_size < 1 or page_size > 100:
             raise BillingError("分页参数无效")
         for minimum, maximum, label in (
@@ -1865,8 +1870,8 @@ class BillingService:
             )
             event_history = (
                 RawUsageEvent.__table__
-                .join(APIKey.__table__, APIKey.cpamp_hash == RawUsageEvent.api_key_hash)
-                .join(KeyOwnershipPeriod.__table__, and_(
+                .outerjoin(APIKey.__table__, APIKey.cpamp_hash == RawUsageEvent.api_key_hash)
+                .outerjoin(KeyOwnershipPeriod.__table__, and_(
                     KeyOwnershipPeriod.api_key_id == APIKey.id,
                     KeyOwnershipPeriod.valid_from_ms <= RawUsageEvent.occurred_at_ms,
                     or_(
@@ -1874,12 +1879,13 @@ class BillingService:
                         KeyOwnershipPeriod.valid_to_ms > RawUsageEvent.occurred_at_ms,
                     ),
                 ))
+                .outerjoin(TelegramUser.__table__, TelegramUser.telegram_user_id == KeyOwnershipPeriod.telegram_user_id)
                 .outerjoin(RatedEvent.__table__, and_(
                     RatedEvent.raw_event_id == RawUsageEvent.id,
                     RatedEvent.pricing_version_id == effective_version_id,
                 ))
             )
-            filters: list[Any] = [KeyOwnershipPeriod.telegram_user_id == user_id]
+            filters: list[Any] = [] if all_users else [KeyOwnershipPeriod.telegram_user_id == user_id]
             if since_ms is not None:
                 filters.append(RawUsageEvent.occurred_at_ms >= since_ms)
             if until_ms is not None:
@@ -1970,7 +1976,7 @@ class BillingService:
             ).one()
             total = int(aggregate[0] or 0)
             rows = session.execute(
-                select(RawUsageEvent, RatedEvent, APIKey)
+                select(RawUsageEvent, RatedEvent, APIKey, TelegramUser)
                 .select_from(event_history)
                 .where(*filters)
                 .order_by(sort_options[sort], RawUsageEvent.id.desc())
@@ -1978,7 +1984,7 @@ class BillingService:
                 .limit(page_size)
             ).all()
             items = []
-            for event, rated, key in rows:
+            for event, rated, key, owner in rows:
                 generation_ms = None
                 tps = None
                 if event.latency_ms is not None and event.ttft_ms is not None:
@@ -1987,7 +1993,12 @@ class BillingService:
                         generation_ms = candidate_generation_ms
                         if event.output_tokens > 0:
                             tps = round(int(event.output_tokens) * 1000 / candidate_generation_ms, 2)
-                items.append({
+                key_payload = {
+                    "id": key.id if key else None,
+                    "masked": key.masked_value if key else mask_hash(event.api_key_hash or ""),
+                    "name": key.display_name if key else None,
+                }
+                item = {
                     "id": event.id,
                     "request_id": event.request_id,
                     "occurred_at_ms": event.occurred_at_ms,
@@ -1997,7 +2008,7 @@ class BillingService:
                     "requested_model": event.requested_model,
                     "resolved_model": event.resolved_model,
                     "service_tier": rated.service_tier if rated else (event.service_tier or "default"),
-                    "key": {"id": key.id, "masked": key.masked_value, "name": key.display_name},
+                    "key": key_payload,
                     "tokens": {
                         "input": event.input_tokens,
                         "cache_read": self._effective_cache_read_tokens(event),
@@ -2016,7 +2027,13 @@ class BillingService:
                     "cost_nano_usd": rated.rated_weight_nano_usd if rated else None,
                     "cost": format_usd_nano(rated.rated_weight_nano_usd) if rated else None,
                     "pricing_status": "priced" if rated else "unpriced",
-                })
+                }
+                if all_users:
+                    item["owner"] = ({
+                        "telegram_user_id": owner.telegram_user_id,
+                        "name": self._user_name(owner, owner.telegram_user_id),
+                    } if owner else None)
+                items.append(item)
             return {
                 "items": items,
                 "pagination": {

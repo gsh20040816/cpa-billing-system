@@ -9,6 +9,11 @@ import { createDebouncedTask } from '../lib/debounce'
 import { dateTime, duration, money, number } from '../lib/format'
 import { activeFilterCount, toQuery } from '../lib/query'
 
+const props = defineProps({
+  admin: { type: Boolean, default: false },
+})
+const endpointBase = props.admin ? '/api/admin/usage' : '/api/me/usage'
+const apiOptions = props.admin ? { admin: true } : {}
 const loading = ref(true)
 const optionsLoading = ref(true)
 const error = ref('')
@@ -49,6 +54,7 @@ const longContextItems = [
 const headers = [
   { title: '时间', key: 'occurred_at', minWidth: 168 },
   { title: 'Key', key: 'key', minWidth: 145 },
+  ...(props.admin ? [{ title: '历史归属', key: 'owner', minWidth: 145 }] : []),
   { title: '模型', key: 'model', minWidth: 150 },
   { title: 'Tier', key: 'service_tier', width: 92 },
   { title: 'Input', key: 'input_tokens', align: 'end' },
@@ -96,7 +102,7 @@ const filterSignature = computed(() => {
 async function loadOptions() {
   optionsLoading.value = true
   try {
-    options.value = await api('/api/me/usage/filter-options')
+    options.value = await api(`${endpointBase}/filter-options`, apiOptions)
   } finally {
     optionsLoading.value = false
   }
@@ -107,7 +113,7 @@ async function load() {
   loading.value = true
   error.value = ''
   try {
-    const result = await api(`/api/me/usage/events${toQuery(requestParams())}`)
+    const result = await api(`${endpointBase}/events${toQuery(requestParams())}`, apiOptions)
     if (sequence === requestSequence) data.value = result
   } catch (exc) {
     if (sequence === requestSequence) error.value = exc.message
@@ -144,6 +150,10 @@ function keyLabel(item) {
   return item.name ? `${item.name} · ${item.masked}` : item.masked
 }
 
+function ownerLabel(owner) {
+  return owner?.name || (owner?.telegram_user_id ? `TG ${owner.telegram_user_id}` : '未绑定')
+}
+
 onMounted(async () => {
   await Promise.all([loadOptions(), load()])
 })
@@ -154,7 +164,10 @@ onBeforeUnmount(autoReload.cancel)
 
 <template>
   <div class="content-shell">
-    <PageHeader title="历史请求" subtitle="本人所有 API Key 的完整请求元数据">
+    <PageHeader
+      :title="props.admin ? '全部请求' : '历史请求'"
+      :subtitle="props.admin ? '全站所有 API Key 的完整请求元数据，包含未绑定 Key' : '本人所有 API Key 的完整请求元数据'"
+    >
       <template #actions>
         <v-btn variant="outlined" @click="filtersOpen = !filtersOpen">
           <SlidersHorizontal :size="17" class="mr-2" />筛选
@@ -216,7 +229,7 @@ onBeforeUnmount(autoReload.cancel)
 
     <section class="section-band">
       <div class="section-band__head">
-        <div><h2>请求明细</h2><p>不包含提示词或响应正文</p></div>
+        <div><h2>{{ props.admin ? '全站请求明细' : '请求明细' }}</h2><p>不包含提示词或响应正文</p></div>
         <span v-if="data" class="data-muted text-body-2">共 {{ number(data.pagination.total) }} 条</span>
       </div>
       <div class="section-band__body section-band__body--flush">
@@ -224,6 +237,9 @@ onBeforeUnmount(autoReload.cancel)
           <v-data-table :headers="headers" :items="data?.items || []" :items-per-page="-1" :loading="loading" hide-default-footer hover @click:row="(_, row) => detail = row.item">
             <template #item.occurred_at="{ item }"><span class="nowrap">{{ dateTime(item.occurred_at) }}</span></template>
             <template #item.key="{ item }"><span class="mono">{{ item.key.name || item.key.masked }}</span></template>
+            <template #item.owner="{ item }">
+              <v-chip :color="item.owner ? 'secondary' : 'warning'" variant="tonal">{{ ownerLabel(item.owner) }}</v-chip>
+            </template>
             <template #item.model="{ item }">
               <div>{{ item.resolved_model || item.model }}</div>
               <div v-if="item.requested_model && item.requested_model !== item.resolved_model" class="data-muted text-caption">请求 {{ item.requested_model }}</div>
@@ -255,6 +271,7 @@ onBeforeUnmount(autoReload.cancel)
           <div class="detail-grid">
             <div><span>时间</span><strong>{{ dateTime(detail.occurred_at) }}</strong></div>
             <div><span>API Key</span><strong class="mono">{{ detail.key.name || detail.key.masked }}</strong></div>
+            <div v-if="props.admin"><span>历史归属</span><strong>{{ ownerLabel(detail.owner) }}</strong></div>
             <div><span>模型</span><strong>{{ detail.resolved_model || detail.model }}</strong></div>
             <div><span>Tier</span><strong>{{ detail.service_tier }}</strong></div>
             <div><span>Input</span><strong class="mono">{{ number(detail.tokens.input) }}</strong></div>

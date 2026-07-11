@@ -37,6 +37,7 @@ const routes = [
     meta: { admin: true },
     children: [
       { path: '', component: AdminView, meta: { admin: true, title: '系统管理' } },
+      { path: 'requests', component: RequestsView, props: { admin: true }, meta: { admin: true, title: '全部请求' } },
     ],
   },
   { path: '/:pathMatch(.*)*', redirect: '/' },

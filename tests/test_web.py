@@ -95,6 +95,8 @@ def test_admin_uses_independent_token_and_csrf(settings) -> None:
     app = create_app(settings)
     client = TestClient(app, base_url="https://billing.example")
 
+    assert client.get("/api/admin/usage/filter-options").status_code == 401
+    assert client.get("/api/admin/usage/events").status_code == 401
     invalid = client.post("/auth/admin/login", json={"management_token": "wrong"})
     assert invalid.status_code == 401
     assert invalid.json()["detail"] == "管理 token 无效。"
@@ -104,6 +106,8 @@ def test_admin_uses_independent_token_and_csrf(settings) -> None:
     csrf = response.json()["csrf_token"]
     assert client.get("/api/admin/session").json()["is_admin"] is True
     assert client.get("/api/session").status_code == 401
+    assert client.get("/api/admin/usage/filter-options").status_code == 200
+    assert client.get("/api/admin/usage/events").status_code == 200
 
     missing_csrf = client.post("/api/admin/cycles/cycle0/preview", json={})
     assert missing_csrf.status_code == 403

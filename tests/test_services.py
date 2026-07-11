@@ -229,6 +229,31 @@ def test_request_history_uses_historical_ownership_and_keeps_unpriced_events(ser
     assert bot_ranking["requests"] == 2
 
 
+def test_admin_request_history_includes_all_users_and_unowned_events(service, settings) -> None:
+    create_owner(service, "key-two", 2, 0)
+    create_owner(service, "key-three", 3, 0)
+    insert_event(settings, cpamp_key_hash("key-two"), 1000, event_hash="admin-owned-two")
+    insert_event(settings, cpamp_key_hash("key-three"), 2000, event_hash="admin-owned-three")
+    insert_event(settings, cpamp_key_hash("missing-key"), 3000, event_hash="admin-unowned")
+    service.sync_cpamp()
+    assert service.rate_events() == 3
+
+    own = service.request_history(2)
+    assert own["pagination"]["total"] == 1
+    assert len(service.request_filter_options(2)["keys"]) == 1
+
+    history = service.request_history(None, all_users=True, sort="time_asc")
+    assert history["pagination"]["total"] == 3
+    assert [item["owner"]["telegram_user_id"] if item["owner"] else None for item in history["items"]] == [2, 3, None]
+    assert history["items"][0]["owner"]["name"] == "@u2"
+    assert history["items"][2]["key"]["id"] is None
+    assert history["items"][2]["key"]["masked"].startswith("key:")
+
+    options = service.request_filter_options(None, all_users=True)
+    assert len(options["keys"]) == 2
+    assert options["models"] == ["gpt-test"]
+
+
 def test_web_key_actions_execute_directly_and_invalidate_target_sessions(service, settings, monkeypatch) -> None:
     raw_keys = ["current-key", "target-key"]
 

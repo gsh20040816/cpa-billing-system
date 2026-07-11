@@ -504,6 +504,65 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             page_size=page_size,
         )
 
+    @app.get("/api/admin/usage/filter-options")
+    def api_admin_request_options(_: Any = Depends(admin_current)) -> dict[str, Any]:
+        return service.request_filter_options(None, all_users=True)
+
+    @app.get("/api/admin/usage/events")
+    def api_admin_request_history(
+        start: str | None = Query(None),
+        end: str | None = Query(None),
+        model: list[str] = Query(default=[]),
+        tier: str | None = Query(None),
+        provider: str | None = Query(None),
+        request_status: str | None = Query(None, alias="status"),
+        key_id: int | None = Query(None, ge=1),
+        failure_code: int | None = Query(None),
+        min_tokens: int | None = Query(None, ge=0),
+        max_tokens: int | None = Query(None, ge=0),
+        min_cost: str | None = Query(None),
+        max_cost: str | None = Query(None),
+        min_latency: int | None = Query(None, ge=0),
+        max_latency: int | None = Query(None, ge=0),
+        min_ttft: int | None = Query(None, ge=0),
+        max_ttft: int | None = Query(None, ge=0),
+        min_tps: float | None = Query(None, ge=0),
+        max_tps: float | None = Query(None, ge=0),
+        long_context: bool | None = Query(None),
+        q: str | None = Query(None, max_length=200),
+        sort: str = Query("time_desc"),
+        page: int = Query(1, ge=1),
+        page_size: int = Query(50, ge=1, le=100),
+        _: Any = Depends(admin_current),
+    ) -> dict[str, Any]:
+        return service.request_history(
+            None,
+            all_users=True,
+            start=start,
+            end=end,
+            models=model,
+            tier=tier,
+            provider=provider,
+            status=request_status,
+            key_id=key_id,
+            failure_code=failure_code,
+            min_tokens=min_tokens,
+            max_tokens=max_tokens,
+            min_cost=min_cost,
+            max_cost=max_cost,
+            min_latency=min_latency,
+            max_latency=max_latency,
+            min_ttft=min_ttft,
+            max_ttft=max_ttft,
+            min_tps=min_tps,
+            max_tps=max_tps,
+            long_context=long_context,
+            query_text=q,
+            sort=sort,
+            page=page,
+            page_size=page_size,
+        )
+
     @app.get("/api/rankings")
     def api_rankings(
         range_name: str = Query("24h", alias="range"),
