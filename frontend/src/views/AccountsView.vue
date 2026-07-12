@@ -161,6 +161,9 @@ onBeforeUnmount(() => timers.forEach((id) => window.clearTimeout(id)))
                   <v-progress-linear :model-value="quota.used_percent || 0" :color="quotaTone(quota.used_percent)" height="8" rounded="sm" />
                 </div>
                 <div class="quota-row__meta">
+                  <div v-if="quota.usage_filter?.mode === 'only_model'">模型范围：仅 {{ quota.usage_filter.models.join('、') }}</div>
+                  <div v-else-if="quota.usage_filter?.mode === 'all_except_models'">模型范围：普通用量（排除 {{ quota.usage_filter.models.join('、') }}）</div>
+                  <div v-else>模型范围：全部模型</div>
                   <div>统计自 {{ dateTime(quota.window_started_at) }}</div>
                   <div>重置 {{ dateTime(quota.reset_at) }}</div>
                   <div>{{ number(quota.window_usage_requests) }} 请求 · {{ number(quota.window_usage_tokens) }} tokens</div>

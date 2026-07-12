@@ -19,7 +19,7 @@ from typing import Any, Iterator
 from zoneinfo import ZoneInfo
 
 import httpx
-from sqlalchemy import Integer, and_, case, cast, delete, func, or_, select, update
+from sqlalchemy import Integer, and_, case, cast, delete, func, not_, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
 from .config import Settings
@@ -2545,26 +2545,34 @@ class BillingService:
         start_ms: int | None = None,
         end_ms: int | None = None,
         model_metric: str | None = None,
+        excluded_model_metrics: tuple[str, ...] = (),
     ) -> dict[str, Any]:
         filters: list[Any] = [RawUsageEvent.auth_index == auth_index]
         if start_ms is not None:
             filters.append(RawUsageEvent.occurred_at_ms >= start_ms)
         if end_ms is not None:
             filters.append(RawUsageEvent.occurred_at_ms < end_ms)
-        if model_metric:
-            metric = _model_slug(model_metric)
-            model_columns = (
-                RawUsageEvent.model,
-                RawUsageEvent.requested_model,
-                RawUsageEvent.resolved_model,
-            )
+
+        model_columns = (
+            RawUsageEvent.model,
+            RawUsageEvent.requested_model,
+            RawUsageEvent.resolved_model,
+        )
+
+        def metric_filter(metric_value: str) -> Any:
+            metric = _model_slug(metric_value)
             model_filters = []
             for column in model_columns:
                 model_filters.extend((
                     func.lower(func.coalesce(column, "")) == metric,
                     func.lower(func.coalesce(column, "")).like(f"%/{metric}"),
                 ))
-            filters.append(or_(*model_filters))
+            return or_(*model_filters)
+
+        if model_metric:
+            filters.append(metric_filter(model_metric))
+        if excluded_model_metrics:
+            filters.append(not_(or_(*(metric_filter(metric) for metric in excluded_model_metrics))))
         compatible_cached = func.max(
             func.max(RawUsageEvent.cached_tokens, RawUsageEvent.cache_tokens)
             - func.max(RawUsageEvent.cache_read_tokens, 0)
@@ -2632,6 +2640,11 @@ class BillingService:
                 if not auth_index:
                     continue
                 account["usage"] = self._account_usage_aggregate(session, version_id, auth_index)
+                additional_metrics = tuple(sorted({
+                    _model_slug(str(quota.get("metric")))
+                    for quota in account["quota"]
+                    if quota.get("scope") == "additional" and quota.get("metric")
+                }))
                 for quota in account["quota"]:
                     window_seconds = int(quota.get("window_seconds") or 0)
                     reset_at_ms = self._external_timestamp_ms(quota.get("reset_at"))
@@ -2647,7 +2660,9 @@ class BillingService:
                         str(quota.get("key") or quota.get("label") or "unknown"),
                         candidate_start_ms,
                     )
-                    model_metric = quota.get("metric") if quota.get("scope") == "additional" else None
+                    is_additional = quota.get("scope") == "additional"
+                    model_metric = _model_slug(str(quota["metric"])) if is_additional and quota.get("metric") else None
+                    excluded_model_metrics = () if is_additional else additional_metrics
                     usage = self._account_usage_aggregate(
                         session,
                         version_id,
@@ -2655,7 +2670,14 @@ class BillingService:
                         start_ms=window_start_ms,
                         end_ms=window_end_ms + 1,
                         model_metric=model_metric,
+                        excluded_model_metrics=excluded_model_metrics,
                     )
+                    if model_metric:
+                        quota["usage_filter"] = {"mode": "only_model", "models": [model_metric]}
+                    elif additional_metrics:
+                        quota["usage_filter"] = {"mode": "all_except_models", "models": list(additional_metrics)}
+                    else:
+                        quota["usage_filter"] = {"mode": "all_models", "models": []}
                     quota["window_started_at"] = self._iso_timestamp(window_start_ms)
                     quota["window_ended_at"] = self._iso_timestamp(window_end_ms)
                     quota["window_usage_requests"] = usage["requests"]

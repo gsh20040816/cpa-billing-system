@@ -609,10 +609,10 @@ def test_keeper_accounts_are_sanitized_and_refresh_uses_public_account_ids(servi
                     "window_usage_cost": 999999,
                 },
                 {
-                    "key": "additional_rate_limits.gpt-test.primary_window",
-                    "label": "gpt-test 5h",
+                    "key": "additional_rate_limits.gpt-5.3-codex-spark.primary_window",
+                    "label": "GPT-5.3-Codex-Spark 5h",
                     "scope": "additional",
-                    "metric": "gpt-test",
+                    "metric": "gpt-5.3-codex-spark",
                     "usedPercent": 7,
                     "window": {"seconds": 18000},
                     "resetAt": reset_at,
@@ -658,6 +658,15 @@ def test_keeper_accounts_are_sanitized_and_refresh_uses_public_account_ids(servi
         auth_index="raw-auth-index",
         account_snapshot="Shared Pro",
     )
+    insert_event(
+        service.settings,
+        "account-key",
+        current - 250,
+        event_hash="account-spark-model",
+        model="gpt-5.3-codex-spark",
+        auth_index="raw-auth-index",
+        account_snapshot="Shared Pro",
+    )
     service.sync_cpamp()
     service.rate_events()
     snapshot = service.accounts_snapshot()
@@ -667,12 +676,16 @@ def test_keeper_accounts_are_sanitized_and_refresh_uses_public_account_ids(servi
     assert "/root/private" not in serialized
     assert snapshot["accounts"][0]["id"] == "7"
     assert snapshot["accounts"][0]["quota"][0]["used_percent"] == 42
-    assert snapshot["accounts"][0]["usage"]["requests"] == 3
-    assert snapshot["accounts"][0]["usage"]["total_tokens"] == 3300
+    assert snapshot["accounts"][0]["usage"]["requests"] == 4
+    assert snapshot["accounts"][0]["usage"]["total_tokens"] == 4400
     assert snapshot["accounts"][0]["usage"]["source"] == "billing-panel"
     primary = snapshot["accounts"][0]["quota"][0]
     assert primary["window_usage_requests"] == 2
     assert primary["window_usage_tokens"] == 2200
+    assert primary["usage_filter"] == {
+        "mode": "all_except_models",
+        "models": ["gpt-5.3-codex-spark"],
+    }
     assert primary["window_started_at"] == datetime.fromtimestamp(
         (current - 4 * 3_600_000) / 1000,
         ZoneInfo("Asia/Shanghai"),
@@ -681,6 +694,10 @@ def test_keeper_accounts_are_sanitized_and_refresh_uses_public_account_ids(servi
     assert additional["window_usage_requests"] == 1
     assert additional["window_usage_tokens"] == 1100
     assert additional["window_usage_cost"] == "0.0015"
+    assert additional["usage_filter"] == {
+        "mode": "only_model",
+        "models": ["gpt-5.3-codex-spark"],
+    }
 
     raw["quota"]["items"][0]["quota"]["quota"][0]["resetAt"] = datetime.fromtimestamp(
         (current + 3_600_000 + 4 * 60_000) / 1000,

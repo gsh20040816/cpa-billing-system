@@ -34,6 +34,7 @@ def create_cpamp(path: Path) -> None:
            "output_cost_per_token_above_272k_tokens": 0.000009}
     db.execute("insert into model_prices values(?,?,?,?,?,?,?,?,?,?,?)", ("gpt-test", 1, 6, .1, .1, 1.25, "test", "gpt-test", json.dumps(raw), 1, 1))
     db.execute("insert into model_prices values(?,?,?,?,?,?,?,?,?,?,?)", ("gpt-5.6-luna", 1, 6, .1, .1, 1.25, "test", "gpt-5.6-luna", json.dumps(raw), 1, 1))
+    db.execute("insert into model_prices values(?,?,?,?,?,?,?,?,?,?,?)", ("gpt-5.3-codex-spark", 1, 6, .1, .1, 1.25, "test", "gpt-5.3-codex-spark", json.dumps(raw), 1, 1))
     db.commit(); db.close()
 
 
