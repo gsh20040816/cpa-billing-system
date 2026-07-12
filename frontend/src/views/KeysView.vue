@@ -7,6 +7,7 @@ import PageHeader from '../components/PageHeader.vue'
 import { dateTime } from '../lib/format'
 
 const userSession = inject('userSession')
+const managementSession = computed(() => userSession?.value?.management_session)
 const loading = ref(true)
 const error = ref('')
 const data = ref(null)
@@ -16,7 +17,7 @@ const renameDialog = reactive({ open: false, key: null, name: '' })
 const revealDialog = reactive({ open: false, apiKey: '', action: '' })
 const snackbar = reactive({ show: false, text: '', color: 'success' })
 
-const headers = [
+const baseHeaders = [
   { title: 'ID', key: 'id', width: 70 },
   { title: 'API Key', key: 'masked', minWidth: 190 },
   { title: '名称', key: 'name', minWidth: 170 },
@@ -25,6 +26,7 @@ const headers = [
   { title: '吊销时间', key: 'revoked_at', minWidth: 170 },
   { title: '操作', key: 'actions', align: 'end', sortable: false, width: 150 },
 ]
+const headers = computed(() => managementSession.value ? baseHeaders.filter((item) => item.key !== 'actions') : baseHeaders)
 
 const dialogTitle = computed(() => {
   if (actionDialog.action === 'add') return '新增 API Key'
@@ -42,7 +44,12 @@ async function load() {
   loading.value = true
   error.value = ''
   try {
-    data.value = await api('/api/me/keys')
+    if (managementSession.value) {
+      const snapshot = await api('/api/admin/snapshot', { admin: true })
+      data.value = { keys: snapshot.admin?.keys || [] }
+    } else {
+      data.value = await api('/api/me/keys')
+    }
   } catch (exc) {
     error.value = exc.message
   } finally {
@@ -51,6 +58,7 @@ async function load() {
 }
 
 function openAction(action, target = null) {
+  if (managementSession.value) return
   actionDialog.action = action
   actionDialog.target = target
   actionDialog.currentKey = ''
@@ -95,6 +103,7 @@ async function executeAction() {
 }
 
 function openRename(key) {
+  if (managementSession.value) return
   renameDialog.key = key
   renameDialog.name = key.name || ''
   renameDialog.open = true
@@ -128,9 +137,9 @@ onMounted(load)
 
 <template>
   <div class="content-shell">
-    <PageHeader title="我的 API Key" subtitle="新增、命名、重置与吊销">
-      <template #actions>
-        <v-btn color="primary" @click="openAction('add')"><Plus :size="17" class="mr-2" />新增 Key</v-btn>
+      <PageHeader :title="managementSession ? '全部 API Key' : '我的 API Key'" :subtitle="managementSession ? '全站 Key 只读视图，完整 Key 永不显示' : '新增、命名、重置与吊销'">
+        <template #actions>
+        <v-btn v-if="!managementSession" color="primary" @click="openAction('add')"><Plus :size="17" class="mr-2" />新增 Key</v-btn>
         <v-tooltip text="刷新 Key 列表"><template #activator="{ props }"><v-btn v-bind="props" icon variant="outlined" :loading="loading" @click="load"><RefreshCw :size="18" /></v-btn></template></v-tooltip>
       </template>
     </PageHeader>
@@ -147,7 +156,7 @@ onMounted(load)
             <template #item.status="{ item }"><v-chip :color="item.status === 'active' ? 'success' : 'default'" variant="tonal">{{ item.status }}</v-chip></template>
             <template #item.created_at="{ item }">{{ dateTime(item.created_at) }}</template>
             <template #item.revoked_at="{ item }">{{ dateTime(item.revoked_at) }}</template>
-            <template #item.actions="{ item }">
+            <template v-if="!managementSession" #item.actions="{ item }">
               <div class="d-flex justify-end ga-1">
                 <v-tooltip text="修改名称"><template #activator="{ props }"><v-btn v-bind="props" icon size="small" variant="text" @click="openRename(item)"><Pencil :size="16" /></v-btn></template></v-tooltip>
                 <template v-if="item.status === 'active'">

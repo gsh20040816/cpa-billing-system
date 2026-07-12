@@ -30,10 +30,7 @@ const managementNav = [
   { title: '全部请求', to: '/admin/requests', icon: Activity },
 ]
 
-const userNav = computed(() => {
-  if (session.value?.management_session) return nav.filter((item) => item.to !== '/keys')
-  return nav
-})
+const userNav = computed(() => nav)
 const bottomNav = computed(() => [
   ...userNav.value.filter((item) => ['/', '/requests', '/status', '/keys'].includes(item.to)),
   ...(session.value?.is_admin ? [managementNav[0]] : []),
