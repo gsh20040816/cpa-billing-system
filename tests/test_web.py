@@ -71,27 +71,28 @@ def test_web_has_no_registration_and_hides_other_users_keys(settings, monkeypatc
     assert len(client.get("/api/me/keys").json()["keys"]) == 1
     assert "sk-cpa-user-three-secret" not in str(other)
     assert client.get("/api/me/usage/events").status_code == 200
+    admin_page = client.get("/admin", follow_redirects=False)
+    assert admin_page.status_code == 303
+    assert admin_page.headers["location"] == "/"
 
     logout = client.post("/auth/logout", headers={"X-CSRF-Token": login["csrf_token"]})
     assert logout.status_code == 204
     assert client.get("/api/session").status_code == 401
 
 
-def test_api_key_admin_flag_does_not_grant_web_admin(settings, monkeypatch) -> None:
+def test_api_key_admin_flag_grants_web_admin(settings, monkeypatch) -> None:
     app = create_app(settings)
     add_user(app, settings, 1, "sk-cpa-telegram-admin-secret", is_admin=True)
     monkeypatch.setattr(app.state.service.cpa, "list_keys", lambda: ["sk-cpa-telegram-admin-secret"])
     client = TestClient(app, base_url="https://billing.example")
 
     login_user(client, "sk-cpa-telegram-admin-secret")
-    assert client.get("/api/session").json()["is_admin"] is False
-    admin_page = client.get("/admin", follow_redirects=False)
-    assert admin_page.status_code == 303
-    assert admin_page.headers["location"] == "/admin/login"
-    assert client.get("/api/admin/session").status_code == 401
+    assert client.get("/api/session").json()["is_admin"] is True
+    assert client.get("/admin", follow_redirects=False).status_code == 200
+    assert client.get("/api/admin/session").status_code == 200
 
 
-def test_admin_uses_independent_token_and_csrf(settings) -> None:
+def test_admin_token_uses_the_unified_session_and_csrf(settings) -> None:
     app = create_app(settings)
     client = TestClient(app, base_url="https://billing.example")
 
@@ -105,16 +106,57 @@ def test_admin_uses_independent_token_and_csrf(settings) -> None:
     assert response.status_code == 200
     csrf = response.json()["csrf_token"]
     assert client.get("/api/admin/session").json()["is_admin"] is True
-    assert client.get("/api/session").status_code == 401
+    unified = client.get("/api/session")
+    assert unified.status_code == 200
+    assert unified.json()["is_admin"] is True
+    assert unified.json()["telegram_user_id"] is None
+    assert unified.json()["management_session"] is True
+    assert client.get("/api/dashboard").status_code == 200
+    assert client.get("/api/me/usage/filter-options").status_code == 200
     assert client.get("/api/admin/usage/filter-options").status_code == 200
     assert client.get("/api/admin/usage/events").status_code == 200
 
     missing_csrf = client.post("/api/admin/cycles/cycle0/preview", json={})
     assert missing_csrf.status_code == 403
     assert "CSRF" in missing_csrf.json()["detail"]
-    logout = client.post("/auth/admin/logout", headers={"X-CSRF-Token": csrf})
+    logout = client.post("/auth/logout", headers={"X-CSRF-Token": csrf})
     assert logout.status_code == 204
+    assert client.get("/api/session").status_code == 401
     assert client.get("/api/admin/session").status_code == 401
+
+
+def test_admin_can_grant_and_revoke_web_access_for_telegram_user(settings, monkeypatch) -> None:
+    app = create_app(settings)
+    add_user(app, settings, 2, "sk-cpa-user-two-secret")
+    monkeypatch.setattr(app.state.service.cpa, "list_keys", lambda: ["sk-cpa-user-two-secret"])
+    admin_client = TestClient(app, base_url="https://billing.example")
+    login = admin_client.post("/auth/admin/login", json={"management_token": settings.admin_token})
+    csrf = login.json()["csrf_token"]
+    headers = {"X-CSRF-Token": csrf}
+
+    granted = admin_client.patch(
+        "/api/admin/users/2/admin",
+        headers=headers,
+        json={"is_admin": True, "reason": "授予 Web 管理权限"},
+    )
+    assert granted.status_code == 200
+    assert granted.json()["is_admin"] is True
+
+    user_client = TestClient(app, base_url="https://billing.example")
+    user_login = login_user(user_client, "sk-cpa-user-two-secret")
+    assert user_client.get("/api/session").json()["is_admin"] is True
+    assert user_client.get("/admin", follow_redirects=False).status_code == 200
+    assert user_client.get("/api/admin/session").status_code == 200
+
+    revoked = admin_client.patch(
+        "/api/admin/users/2/admin",
+        headers=headers,
+        json={"is_admin": False, "reason": "取消测试权限"},
+    )
+    assert revoked.status_code == 200
+    assert user_client.get("/api/session").json()["is_admin"] is False
+    assert user_client.get("/api/admin/session").status_code == 403
+    user_client.post("/auth/logout", headers={"X-CSRF-Token": user_login["csrf_token"]})
 
 
 def test_site_mutations_require_user_csrf_and_expose_no_quota_reset(settings, monkeypatch) -> None:

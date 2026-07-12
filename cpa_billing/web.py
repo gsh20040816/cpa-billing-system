@@ -5,6 +5,7 @@ import logging
 import os
 import time
 from collections import defaultdict, deque
+from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
@@ -95,6 +96,11 @@ class UserLoginPayload(BaseModel):
 
 class AdminLoginPayload(BaseModel):
     management_token: str = Field(min_length=1, max_length=512)
+
+
+class UserAdminPayload(BaseModel):
+    is_admin: bool
+    reason: str = Field(min_length=1, max_length=1000)
 
 
 class KeyActionPayload(BaseModel):
@@ -234,6 +240,14 @@ def _manual_usage_to_nano(value: str) -> int:
     return amount_nano_usd
 
 
+@dataclass(frozen=True)
+class WebAuth:
+    session: Any
+    user: Any | None
+    is_admin: bool
+    via_management_token: bool
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or Settings.from_env()
     database = Database(settings.database_path)
@@ -248,25 +262,38 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     if assets_dir.is_dir():
         app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
 
-    def current(request: Request) -> tuple[Any, Any]:
-        auth = service.get_session(request.cookies.get(USER_COOKIE))
+    def resolve_web_auth(request: Request) -> WebAuth | None:
+        user_auth = service.get_session(request.cookies.get(USER_COOKIE))
+        if user_auth is not None:
+            session, user = user_auth
+            return WebAuth(
+                session=session,
+                user=user,
+                is_admin=bool(user.is_admin or user.telegram_user_id in settings.admin_user_ids),
+                via_management_token=False,
+            )
+        admin_session = service.get_admin_session(request.cookies.get(ADMIN_COOKIE))
+        if admin_session is not None:
+            return WebAuth(session=admin_session, user=None, is_admin=True, via_management_token=True)
+        return None
+
+    def current(request: Request) -> WebAuth:
+        auth = resolve_web_auth(request)
         if auth is None:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="用户会话已失效")
         return auth
 
-    def page_current(request: Request) -> tuple[Any, Any] | None:
-        return service.get_session(request.cookies.get(USER_COOKIE))
+    def page_current(request: Request) -> WebAuth | None:
+        return resolve_web_auth(request)
 
-    def admin_current(request: Request) -> Any:
-        auth = service.get_admin_session(request.cookies.get(ADMIN_COOKIE))
-        if auth is None:
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="管理会话已失效")
+    def admin_current(request: Request) -> WebAuth:
+        auth = current(request)
+        if not auth.is_admin:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="需要管理员权限")
         return auth
 
-    def page_admin_current(request: Request) -> Any | None:
-        return service.get_admin_session(request.cookies.get(ADMIN_COOKIE))
-
-    def verify_csrf(request: Request, session: Any) -> None:
+    def verify_csrf(request: Request, auth: WebAuth | Any) -> None:
+        session = auth.session if isinstance(auth, WebAuth) else auth
         token = request.headers.get("x-csrf-token", "")
         if not token or not constant_equal(token, session.csrf_token):
             raise HTTPException(status_code=403, detail="CSRF 校验失败，请刷新页面后重试。")
@@ -288,6 +315,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             secure=True,
             httponly=True,
             samesite="lax",
+            path="/",
+            max_age=settings.session_ttl_seconds,
+        )
+
+    def set_admin_cookie(response: Response, token: str) -> None:
+        response.set_cookie(
+            ADMIN_COOKIE,
+            token,
+            secure=True,
+            httponly=True,
+            samesite="strict",
             path="/",
             max_age=settings.session_ttl_seconds,
         )
@@ -363,17 +401,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         token, csrf = service.create_session(user.telegram_user_id, key.id)
         response = JSONResponse({"ok": True, "telegram_user_id": user.telegram_user_id, "csrf_token": csrf})
         set_user_cookie(response, token)
+        response.delete_cookie(ADMIN_COOKIE, path="/")
         response.delete_cookie("billing_session", path="/")
         return response
 
     @app.post("/auth/logout")
-    def logout(request: Request, auth: tuple[Any, Any] = Depends(current)) -> Response:
-        verify_csrf(request, auth[0])
-        token = request.cookies.get(USER_COOKIE)
-        if token:
-            service.revoke_session(token)
+    def logout(request: Request, auth: WebAuth = Depends(current)) -> Response:
+        verify_csrf(request, auth)
+        user_token = request.cookies.get(USER_COOKIE)
+        if user_token:
+            service.revoke_session(user_token)
+        admin_token = request.cookies.get(ADMIN_COOKIE)
+        if admin_token:
+            service.revoke_admin_session(admin_token)
         response = Response(status_code=204)
         response.delete_cookie(USER_COOKIE, path="/")
+        response.delete_cookie(ADMIN_COOKIE, path="/")
         response.delete_cookie("billing_session", path="/")
         return response
 
@@ -388,41 +431,36 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         limiter.success(limiter_key)
         token, csrf = service.create_admin_session()
         response = JSONResponse({"ok": True, "is_admin": True, "csrf_token": csrf})
-        response.set_cookie(
-            ADMIN_COOKIE,
-            token,
-            secure=True,
-            httponly=True,
-            samesite="strict",
-            path="/",
-            max_age=settings.session_ttl_seconds,
-        )
+        set_admin_cookie(response, token)
+        response.delete_cookie(USER_COOKIE, path="/")
         return response
 
     @app.post("/auth/admin/logout")
-    def admin_logout(request: Request, auth: Any = Depends(admin_current)) -> Response:
+    def admin_logout(request: Request, auth: WebAuth = Depends(admin_current)) -> Response:
         verify_csrf(request, auth)
         token = request.cookies.get(ADMIN_COOKIE)
         if token:
             service.revoke_admin_session(token)
         response = Response(status_code=204)
         response.delete_cookie(ADMIN_COOKIE, path="/")
+        response.delete_cookie(USER_COOKIE, path="/")
         return response
 
     @app.get("/api/session")
-    def api_session(auth: tuple[Any, Any] = Depends(current)) -> dict[str, Any]:
-        session, user = auth
+    def api_session(auth: WebAuth = Depends(current)) -> dict[str, Any]:
+        user = auth.user
         return {
-            "telegram_user_id": user.telegram_user_id,
-            "name": service._user_name(user, user.telegram_user_id),
-            "is_admin": False,
-            "login_key_id": session.api_key_id,
-            "csrf_token": session.csrf_token,
+            "telegram_user_id": None if user is None else user.telegram_user_id,
+            "name": "管理员" if user is None else service._user_name(user, user.telegram_user_id),
+            "is_admin": auth.is_admin,
+            "login_key_id": None if user is None else auth.session.api_key_id,
+            "management_session": auth.via_management_token,
+            "csrf_token": auth.session.csrf_token,
         }
 
     @app.get("/api/admin/session")
-    def api_admin_session(auth: Any = Depends(admin_current)) -> dict[str, Any]:
-        return {"is_admin": True, "csrf_token": auth.csrf_token}
+    def api_admin_session(auth: WebAuth = Depends(admin_current)) -> dict[str, Any]:
+        return {"is_admin": True, "csrf_token": auth.session.csrf_token}
 
     @app.get("/api/dashboard")
     def api_dashboard(cycle: str | None = Query(None), _: tuple[Any, Any] = Depends(current)) -> dict[str, Any]:
@@ -439,31 +477,37 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return service.user_summary(user_id, cycle)
 
     @app.get("/api/me/keys")
-    def api_keys(auth: tuple[Any, Any] = Depends(current)) -> dict[str, Any]:
-        return service.user_keys(auth[1].telegram_user_id)
+    def api_keys(auth: WebAuth = Depends(current)) -> dict[str, Any]:
+        if auth.user is None:
+            raise HTTPException(status_code=403, detail="管理 Token 没有个人 API Key")
+        return service.user_keys(auth.user.telegram_user_id)
 
     @app.patch("/api/me/keys/{key_id}")
     def api_rename_key(key_id: int, payload: KeyNamePayload, request: Request,
-                       auth: tuple[Any, Any] = Depends(current)) -> dict[str, Any]:
-        verify_csrf(request, auth[0])
-        return service.rename_key(auth[1].telegram_user_id, key_id, payload.name)
+                       auth: WebAuth = Depends(current)) -> dict[str, Any]:
+        if auth.user is None:
+            raise HTTPException(status_code=403, detail="管理 Token 不能操作个人 API Key")
+        verify_csrf(request, auth)
+        return service.rename_key(auth.user.telegram_user_id, key_id, payload.name)
 
     @app.post("/api/me/keys/actions")
     async def api_key_action(payload: KeyActionPayload, request: Request,
-                             auth: tuple[Any, Any] = Depends(current)) -> JSONResponse:
-        verify_csrf(request, auth[0])
+                             auth: WebAuth = Depends(current)) -> JSONResponse:
+        if auth.user is None:
+            raise HTTPException(status_code=403, detail="管理 Token 不能操作个人 API Key")
+        verify_csrf(request, auth)
         result = await asyncio.to_thread(
             service.execute_web_key_action,
-            auth[1].telegram_user_id,
+            auth.user.telegram_user_id,
             payload.current_api_key,
             payload.action,
             payload.target_key_id,
         )
-        target_is_login_key = payload.target_key_id == auth[0].api_key_id
+        target_is_login_key = payload.target_key_id == auth.session.api_key_id
         session_ended = payload.action == "revoke" and target_is_login_key
         response_payload = {**result, "session_ended": session_ended}
         if payload.action == "reset" and target_is_login_key and result["new_key_id"]:
-            token, csrf = service.create_session(auth[1].telegram_user_id, result["new_key_id"])
+            token, csrf = service.create_session(auth.user.telegram_user_id, result["new_key_id"])
             response_payload["csrf_token"] = csrf
             response = JSONResponse(response_payload)
             set_user_cookie(response, token)
@@ -474,8 +518,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return response
 
     @app.get("/api/me/usage/filter-options")
-    def api_request_options(auth: tuple[Any, Any] = Depends(current)) -> dict[str, Any]:
-        return service.request_filter_options(auth[1].telegram_user_id)
+    def api_request_options(auth: WebAuth = Depends(current)) -> dict[str, Any]:
+        if auth.user is None:
+            return service.request_filter_options(None, all_users=True)
+        return service.request_filter_options(auth.user.telegram_user_id)
 
     @app.get("/api/me/usage/events")
     def api_request_history(
@@ -502,10 +548,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         sort: str = Query("time_desc"),
         page: int = Query(1, ge=1),
         page_size: int = Query(50, ge=1, le=100),
-        auth: tuple[Any, Any] = Depends(current),
+        auth: WebAuth = Depends(current),
     ) -> dict[str, Any]:
+        all_users = auth.user is None
         return service.request_history(
-            auth[1].telegram_user_id,
+            None if all_users else auth.user.telegram_user_id,
+            all_users=all_users,
             start=start,
             end=end,
             models=model,
@@ -625,9 +673,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/api/site/accounts/refresh")
     async def api_refresh_accounts(payload: AccountRefreshPayload, request: Request,
-                                   auth: tuple[Any, Any] = Depends(current)) -> dict[str, Any]:
-        verify_csrf(request, auth[0])
-        quota_refresh_limiter.check_and_mark(str(auth[1].telegram_user_id))
+                                   auth: WebAuth = Depends(current)) -> dict[str, Any]:
+        verify_csrf(request, auth)
+        quota_refresh_limiter.check_and_mark(str(auth.user.telegram_user_id if auth.user else "admin-token"))
         return await asyncio.to_thread(service.refresh_account_quotas, payload.account_ids)
 
     @app.get("/api/site/accounts/{account_id}/refresh")
@@ -646,6 +694,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "accounts": accounts,
             "admin": service.admin_snapshot(),
         }
+
+    @app.patch("/api/admin/users/{user_id}/admin")
+    def api_set_user_admin(
+        user_id: int,
+        payload: UserAdminPayload,
+        request: Request,
+        auth: WebAuth = Depends(admin_current),
+    ) -> dict[str, Any]:
+        verify_csrf(request, auth)
+        return service.set_user_admin(
+            user_id,
+            payload.is_admin,
+            payload.reason,
+            operator_id=None if auth.user is None else auth.user.telegram_user_id,
+            operator_type="web-admin-token" if auth.via_management_token else "web-admin-user",
+        )
 
     @app.post("/api/admin/cycles")
     def api_create_cycle(payload: CyclePayload, request: Request, auth: Any = Depends(admin_current)) -> dict[str, bool]:
@@ -859,8 +923,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/admin/login", include_in_schema=False)
     def admin_login_page(request: Request) -> Response:
-        if page_admin_current(request):
-            return RedirectResponse("/admin", status_code=303)
+        if page_current(request):
+            return RedirectResponse("/", status_code=303)
         return spa_response()
 
     @app.get("/register", include_in_schema=False)
@@ -872,8 +936,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if full_path.startswith("api/") or full_path.startswith("auth/"):
             raise HTTPException(status_code=404, detail="Not Found")
         if full_path == "admin" or full_path.startswith("admin/"):
-            if page_admin_current(request) is None:
-                return RedirectResponse("/admin/login", status_code=303)
+            auth = page_current(request)
+            if auth is None:
+                return RedirectResponse("/login", status_code=303)
+            if not auth.is_admin:
+                return RedirectResponse("/", status_code=303)
             return spa_response()
         if page_current(request) is None:
             return RedirectResponse("/login", status_code=303)

@@ -26,7 +26,9 @@ export async function api(path, options = {}) {
   const finalHeaders = { Accept: 'application/json', ...headers }
   if (body !== undefined) finalHeaders['Content-Type'] = 'application/json'
   if (!['GET', 'HEAD', 'OPTIONS'].includes(method)) {
-    const csrf = state[admin ? 'adminCsrf' : 'userCsrf']
+    const csrf = admin
+      ? (state.adminCsrf || state.userCsrf)
+      : (state.userCsrf || state.adminCsrf)
     if (csrf) finalHeaders['X-CSRF-Token'] = csrf
   }
   const response = await fetch(path, {

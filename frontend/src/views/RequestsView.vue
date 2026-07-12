@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import { computed, inject, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { Filter, RefreshCw, RotateCcw, Search, SlidersHorizontal } from '@lucide/vue'
 import { api } from '../api'
 import LoadingState from '../components/LoadingState.vue'
@@ -12,8 +12,10 @@ import { activeFilterCount, toQuery } from '../lib/query'
 const props = defineProps({
   admin: { type: Boolean, default: false },
 })
-const endpointBase = props.admin ? '/api/admin/usage' : '/api/me/usage'
-const apiOptions = props.admin ? { admin: true } : {}
+const userSession = inject('userSession', ref(null))
+const globalScope = computed(() => props.admin || userSession.value?.management_session)
+const endpointBase = computed(() => globalScope.value ? '/api/admin/usage' : '/api/me/usage')
+const apiOptions = computed(() => globalScope.value ? { admin: true } : {})
 const loading = ref(true)
 const optionsLoading = ref(true)
 const error = ref('')
@@ -104,7 +106,7 @@ const filterSignature = computed(() => {
 async function loadOptions() {
   optionsLoading.value = true
   try {
-    options.value = await api(`${endpointBase}/filter-options`, apiOptions)
+        options.value = await api(`${endpointBase.value}/filter-options`, apiOptions.value)
   } finally {
     optionsLoading.value = false
   }
@@ -115,7 +117,7 @@ async function load() {
   loading.value = true
   error.value = ''
   try {
-    const result = await api(`${endpointBase}/events${toQuery(requestParams())}`, apiOptions)
+    const result = await api(`${endpointBase.value}/events${toQuery(requestParams())}`, apiOptions.value)
     if (sequence === requestSequence) data.value = result
   } catch (exc) {
     if (sequence === requestSequence) error.value = exc.message
@@ -167,8 +169,8 @@ onBeforeUnmount(autoReload.cancel)
 <template>
   <div class="content-shell">
     <PageHeader
-      :title="props.admin ? '全部请求' : '历史请求'"
-      :subtitle="props.admin ? '全站所有 API Key 的完整请求元数据，包含未绑定 Key' : '本人所有 API Key 的完整请求元数据'"
+      :title="globalScope ? '全部请求' : '历史请求'"
+      :subtitle="globalScope ? '全站所有 API Key 的完整请求元数据，包含未绑定 Key' : '本人所有 API Key 的完整请求元数据'"
     >
       <template #actions>
         <v-btn variant="outlined" @click="filtersOpen = !filtersOpen">

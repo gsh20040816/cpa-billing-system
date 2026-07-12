@@ -1,9 +1,7 @@
 import { createRouter, createWebHistory } from 'vue-router'
 
 const UserLayout = () => import('./layouts/UserLayout.vue')
-const AdminLayout = () => import('./layouts/AdminLayout.vue')
 const LoginView = () => import('./views/LoginView.vue')
-const AdminLoginView = () => import('./views/AdminLoginView.vue')
 const DashboardView = () => import('./views/DashboardView.vue')
 const RequestsView = () => import('./views/RequestsView.vue')
 const SiteStatusView = () => import('./views/SiteStatusView.vue')
@@ -16,7 +14,7 @@ const AdminView = () => import('./views/AdminView.vue')
 
 const routes = [
   { path: '/login', component: LoginView, meta: { public: true, title: '用户登录' } },
-  { path: '/admin/login', component: AdminLoginView, meta: { public: true, admin: true, title: '管理登录' } },
+  { path: '/admin/login', redirect: '/login', meta: { public: true, title: '用户登录' } },
   {
     path: '/',
     component: UserLayout,
@@ -29,15 +27,8 @@ const routes = [
       { path: 'pricing', component: PricingView, meta: { title: '费用规则' } },
       { path: 'keys', component: KeysView, meta: { title: '我的 API Key' } },
       { path: 'users/:id', component: UserView, meta: { title: '用户用量' } },
-    ],
-  },
-  {
-    path: '/admin',
-    component: AdminLayout,
-    meta: { admin: true },
-    children: [
-      { path: '', component: AdminView, meta: { admin: true, title: '系统管理' } },
-      { path: 'requests', component: RequestsView, props: { admin: true }, meta: { admin: true, title: '全部请求' } },
+      { path: 'admin', component: AdminView, meta: { admin: true, title: '系统管理' } },
+      { path: 'admin/requests', component: RequestsView, props: { admin: true }, meta: { admin: true, title: '全部请求' } },
     ],
   },
   { path: '/:pathMatch(.*)*', redirect: '/' },

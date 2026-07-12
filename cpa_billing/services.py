@@ -1028,6 +1028,43 @@ class BillingService:
     def authenticate_admin_token(self, raw_token: str) -> bool:
         return constant_equal(raw_token.strip(), self.settings.admin_token)
 
+    def set_user_admin(
+        self,
+        user_id: int,
+        is_admin: bool,
+        reason: str,
+        operator_id: int | None = None,
+        operator_type: str = "web-admin",
+    ) -> dict[str, Any]:
+        normalized_reason = reason.strip()
+        if not normalized_reason:
+            raise BillingError("管理员权限变更原因不能为空")
+        if user_id in self.settings.admin_user_ids and not is_admin:
+            raise BillingError("配置文件中的管理员不能在面板撤销，请修改 ADMIN_CHAT_IDS")
+        with self.db.session() as session:
+            user = session.get(TelegramUser, user_id)
+            if user is None:
+                raise BillingError("Telegram 用户不存在")
+            before = bool(user.is_admin)
+            if before != is_admin:
+                user.is_admin = is_admin
+                session.add(AuditLog(
+                    operator_type=operator_type,
+                    operator_id=str(operator_id if operator_id is not None else "admin-token"),
+                    operation="user.admin.grant" if is_admin else "user.admin.revoke",
+                    target=str(user_id),
+                    before_json=json.dumps({"is_admin": before}),
+                    after_json=json.dumps({"is_admin": is_admin}),
+                    reason=normalized_reason,
+                    created_at_ms=now_ms(),
+                ))
+            effective = bool(user.is_admin or user_id in self.settings.admin_user_ids)
+            return {
+                "id": user_id,
+                "is_admin": effective,
+                "configured_admin": user_id in self.settings.admin_user_ids,
+            }
+
     def _admin_credential_fingerprint(self) -> str:
         return hash_token(self.settings.admin_token, self.settings.session_secret)
 
@@ -3458,6 +3495,8 @@ class BillingService:
                          )],
                 "users": [{"id": user.telegram_user_id, "name": self._user_name(user, user.telegram_user_id),
                            "registered": bool(user.registered_at_ms), "manual_allowed": user.manual_allowed,
+                           "is_admin": bool(user.is_admin or user.telegram_user_id in self.settings.admin_user_ids),
+                           "configured_admin": user.telegram_user_id in self.settings.admin_user_ids,
                            "active_keys": sum(1 for key in keys if key.current_owner_id == user.telegram_user_id and key.status == "active")}
                           for user in users.values()],
                 "keys": [{"id": key.id, "masked": key.masked_value, "name": key.display_name,

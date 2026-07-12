@@ -2,18 +2,15 @@
 
 import { flushPromises, mount } from '@vue/test-utils'
 import { createMemoryHistory, createRouter } from 'vue-router'
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import vuetify from '../plugins/vuetify'
 import UserLayout from './UserLayout.vue'
+import { loadUserSession } from '../api'
 
 vi.mock('../api', () => ({
   api: vi.fn(),
   clearCsrf: vi.fn(),
-  loadUserSession: vi.fn().mockResolvedValue({
-    telegram_user_id: 100,
-    name: '@tester',
-    is_admin: false,
-  }),
+  loadUserSession: vi.fn(),
 }))
 
 class ResizeObserverStub {
@@ -25,12 +22,25 @@ class ResizeObserverStub {
 globalThis.ResizeObserver = ResizeObserverStub
 
 describe('UserLayout', () => {
+  beforeEach(() => {
+    loadUserSession.mockResolvedValue({
+      telegram_user_id: 100,
+      name: '@tester',
+      is_admin: false,
+      management_session: false,
+    })
+  })
+
+  afterEach(() => {
+    vi.clearAllMocks()
+  })
+
   it('opens the permanent navigation drawer on desktop', async () => {
     Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1280 })
     const View = { template: '<div />' }
     const router = createRouter({
       history: createMemoryHistory(),
-      routes: ['/', '/requests', '/status', '/accounts', '/rankings', '/pricing', '/keys', '/admin/login']
+      routes: ['/', '/requests', '/status', '/accounts', '/rankings', '/pricing', '/keys', '/admin', '/admin/requests']
         .map((path) => ({ path, component: View })),
     })
     await router.push('/')
@@ -56,7 +66,7 @@ describe('UserLayout', () => {
     const View = { template: '<div />' }
     const router = createRouter({
       history: createMemoryHistory(),
-      routes: ['/', '/requests', '/status', '/accounts', '/rankings', '/pricing', '/keys', '/admin/login']
+      routes: ['/', '/requests', '/status', '/accounts', '/rankings', '/pricing', '/keys', '/admin', '/admin/requests']
         .map((path) => ({ path, component: View })),
     })
     await router.push('/status')
@@ -74,5 +84,36 @@ describe('UserLayout', () => {
       .find((item) => item.props('to') === '/')
     expect(dashboard.props('exact')).toBe(true)
     expect(dashboard.classes()).not.toContain('v-list-item--active')
+  })
+
+  it('adds the management navigation for a Telegram web administrator', async () => {
+    loadUserSession.mockResolvedValue({
+      telegram_user_id: 100,
+      name: '@tester',
+      is_admin: true,
+      management_session: false,
+    })
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1280 })
+    const View = { template: '<div />' }
+    const router = createRouter({
+      history: createMemoryHistory(),
+      routes: ['/', '/requests', '/status', '/accounts', '/rankings', '/pricing', '/keys', '/admin', '/admin/requests']
+        .map((path) => ({ path, component: View })),
+    })
+    await router.push('/')
+    await router.isReady()
+
+    const wrapper = mount(UserLayout, {
+      global: {
+        plugins: [router, vuetify],
+        stubs: { SystemPulse: true, RouterView: true },
+      },
+    })
+    await flushPromises()
+
+    const management = wrapper.findAllComponents({ name: 'VListItem' })
+    expect(management.some((item) => item.props('to') === '/admin')).toBe(true)
+    expect(management.some((item) => item.props('to') === '/admin/requests')).toBe(true)
+    wrapper.unmount()
   })
 })

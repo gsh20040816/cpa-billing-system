@@ -44,8 +44,8 @@ const snapshot = {
       },
     ],
     users: [
-      { id: 2, name: '@u2', registered: true, manual_allowed: false, active_keys: 1 },
-      { id: 3, name: '@u3', registered: true, manual_allowed: false, active_keys: 1 },
+      { id: 2, name: '@u2', registered: true, manual_allowed: false, active_keys: 1, is_admin: false, configured_admin: false },
+      { id: 3, name: '@u3', registered: true, manual_allowed: false, active_keys: 1, is_admin: false, configured_admin: false },
     ],
     pools: [
       { id: 1, name: 'default-cpa', active: true, rules: [] },
@@ -189,6 +189,40 @@ describe('AdminView manual usage', () => {
         reason: 'updated usage',
       },
       method: 'PUT',
+    })
+    wrapper.unmount()
+  })
+
+  it('grants Web administration to a Telegram user', async () => {
+    const wrapper = mount(AdminView, {
+      attachTo: document.body,
+      global: { plugins: [vuetify] },
+    })
+    await flushPromises()
+
+    const identityTab = wrapper.findAllComponents({ name: 'VTab' })
+      .find((item) => item.text().includes('用户与 Keys'))
+    await identityTab.trigger('click')
+    await flushPromises()
+
+    const grantButton = wrapper.findAllComponents({ name: 'VBtn' })
+      .find((item) => item.text().includes('授予管理'))
+    expect(grantButton).toBeTruthy()
+    await grantButton.trigger('click')
+    await flushPromises()
+
+    const dialog = wrapper.findAllComponents({ name: 'VDialog' })
+      .find((item) => item.props('modelValue') === true)
+    const reason = dialog.findComponent({ name: 'VTextarea' })
+    await reason.setValue('授权管理测试')
+    await dialog.findAllComponents({ name: 'VBtn' })
+      .find((item) => item.text().includes('确认变更')).trigger('click')
+    await flushPromises()
+
+    expect(api).toHaveBeenCalledWith('/api/admin/users/2/admin', {
+      admin: true,
+      body: { is_admin: true, reason: '授权管理测试' },
+      method: 'PATCH',
     })
     wrapper.unmount()
   })

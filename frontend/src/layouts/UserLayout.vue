@@ -4,7 +4,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { useDisplay } from 'vuetify'
 import {
   Activity, BarChart3, BookOpenText, ChevronDown, CircleDollarSign,
-  Gauge, KeyRound, LayoutDashboard, LogOut, Menu, ServerCog, UsersRound,
+  Gauge, KeyRound, LayoutDashboard, LogOut, Menu, ServerCog, Settings2,
 } from '@lucide/vue'
 import { api, clearCsrf, loadUserSession } from '../api'
 import SystemPulse from '../components/SystemPulse.vue'
@@ -25,8 +25,19 @@ const nav = [
   { title: '费用规则', to: '/pricing', icon: CircleDollarSign },
   { title: '我的 API Key', to: '/keys', icon: KeyRound },
 ]
+const managementNav = [
+  { title: '系统管理', to: '/admin', icon: Settings2 },
+  { title: '全部请求', to: '/admin/requests', icon: Activity },
+]
 
-const bottomNav = nav.filter((item) => ['/', '/requests', '/status', '/keys'].includes(item.to))
+const userNav = computed(() => {
+  if (session.value?.management_session) return nav.filter((item) => item.to !== '/keys')
+  return nav
+})
+const bottomNav = computed(() => [
+  ...userNav.value.filter((item) => ['/', '/requests', '/status', '/keys'].includes(item.to)),
+  ...(session.value?.is_admin ? [managementNav[0]] : []),
+])
 const pageTitle = computed(() => route.meta.title || 'CPA Billing')
 
 provide('userSession', session)
@@ -50,6 +61,7 @@ async function logout() {
     await api('/auth/logout', { method: 'POST' })
   } finally {
     clearCsrf()
+    clearCsrf(true)
     window.location.assign('/login')
   }
 }
@@ -69,17 +81,21 @@ onMounted(loadSession)
       </div>
       <v-divider />
       <v-list nav density="compact" class="pa-2">
-        <v-list-item v-for="item in nav" :key="item.to" :to="item.to" :exact="item.to === '/'" color="primary" rounded="sm">
+        <v-list-item v-for="item in userNav" :key="item.to" :to="item.to" :exact="item.to === '/'" color="primary" rounded="sm">
           <template #prepend><component :is="item.icon" :size="19" /></template>
           <v-list-item-title>{{ item.title }}</v-list-item-title>
         </v-list-item>
+        <template v-if="session?.is_admin">
+          <v-list-subheader>管理</v-list-subheader>
+          <v-list-item v-for="item in managementNav" :key="item.to" :to="item.to" :exact="item.to === '/admin'" color="primary" rounded="sm">
+            <template #prepend><component :is="item.icon" :size="19" /></template>
+            <v-list-item-title>{{ item.title }}</v-list-item-title>
+          </v-list-item>
+        </template>
       </v-list>
       <template #append>
         <v-divider />
         <v-list density="compact" class="pa-2">
-          <v-list-item to="/admin/login" title="管理入口">
-            <template #prepend><UsersRound :size="18" /></template>
-          </v-list-item>
           <v-list-item href="https://cpa.shgao.top" target="_blank" title="CPA API">
             <template #prepend><BookOpenText :size="18" /></template>
           </v-list-item>
@@ -98,7 +114,10 @@ onMounted(loadSession)
           </v-btn>
         </template>
         <v-list density="compact" min-width="190">
-          <v-list-item :subtitle="String(session?.telegram_user_id || '')" title="Telegram 用户" />
+          <v-list-item
+            :title="session?.management_session ? '管理 Token 会话' : 'Telegram 用户'"
+            :subtitle="session?.telegram_user_id ? String(session.telegram_user_id) : '全站管理权限'"
+          />
           <v-divider />
           <v-list-item title="退出登录" @click="logout">
             <template #prepend><LogOut :size="17" /></template>

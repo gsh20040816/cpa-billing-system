@@ -68,7 +68,10 @@ async function executeAction() {
       },
     })
     actionDialog.open = false
-    if (result.csrf_token) setCsrf(result.csrf_token)
+    if (result.csrf_token) {
+      setCsrf(result.csrf_token)
+      setCsrf(result.csrf_token, true)
+    }
     if (result.new_api_key) {
       revealDialog.apiKey = result.new_api_key
       revealDialog.action = result.action

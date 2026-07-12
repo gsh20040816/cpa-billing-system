@@ -1,7 +1,7 @@
 <script setup>
 import { computed, onMounted, reactive, ref } from 'vue'
 import {
-  Activity, ArrowDown, ArrowUp, CloudDownload, Edit3, KeyRound, Plus, RefreshCw,
+  Activity, ArrowDown, ArrowUp, CloudDownload, Edit3, KeyRound, Plus, RefreshCw, ShieldCheck,
   Save, Scale, Shuffle, Trash2, XCircle,
 } from '@lucide/vue'
 import { api } from '../api'
@@ -34,6 +34,7 @@ const pricingDialog = reactive({ open: false, name: '', reason: '' })
 const gradientDialog = reactive({ open: false, id: null, name: '', description: '', reason: '', tiers: [] })
 const deleteGradientDialog = reactive({ open: false, rule: null, reason: '' })
 const keyProfileDialog = reactive({ open: false, key: null, name: '', multiplier: '', reason: '' })
+const userAdminDialog = reactive({ open: false, user: null, is_admin: false, reason: '' })
 
 const reconciliation = computed(() => data.value?.reconciliation || {})
 const admin = computed(() => data.value?.admin || {})
@@ -251,6 +252,25 @@ async function syncCpaKeys() {
   await mutate('/api/admin/cpa-keys/sync', {}, 'CPA 当前 API Key 已同步')
 }
 
+function openUserAdmin(user) {
+  Object.assign(userAdminDialog, {
+    open: true,
+    user,
+    is_admin: !user.is_admin,
+    reason: '',
+  })
+}
+
+async function saveUserAdmin() {
+  const result = await mutate(
+    `/api/admin/users/${userAdminDialog.user.id}/admin`,
+    { is_admin: userAdminDialog.is_admin, reason: userAdminDialog.reason },
+    userAdminDialog.is_admin ? '已授予 Web 管理权限' : '已撤销 Web 管理权限',
+    'PATCH',
+  )
+  if (result) userAdminDialog.open = false
+}
+
 function emptyTier() {
   return { left: '0', right: '', multiplier: '1' }
 }
@@ -354,7 +374,7 @@ onMounted(load)
 
 <template>
   <div class="content-shell content-shell--admin">
-    <PageHeader eyebrow="Independent admin session" title="系统管理" subtitle="计价、规则、归属与结算使用独立管理 token">
+    <PageHeader eyebrow="Web administration" title="系统管理" subtitle="计价、规则、归属与结算使用统一 Web 管理权限">
       <template #actions>
         <v-tooltip text="刷新管理数据">
           <template #activator="{ props }">
@@ -437,9 +457,20 @@ onMounted(load)
 
         <v-window-item value="identity">
           <section class="section-band">
-            <div class="section-band__head"><div><h2>Telegram 用户</h2><p>注册和手动授权状态</p></div></div>
+            <div class="section-band__head"><div><h2>Telegram 用户</h2><p>注册、授权和 Web 管理权限；配置文件中的管理员不能在此撤销</p></div></div>
             <div class="section-band__body section-band__body--flush">
-              <v-data-table :headers="[{title:'ID',key:'id'},{title:'用户',key:'name'},{title:'已注册',key:'registered'},{title:'手动授权',key:'manual_allowed'},{title:'有效 Keys',key:'active_keys'}]" :items="admin.users || []" :items-per-page="25" />
+              <v-data-table
+                :headers="[
+                  {title:'ID',key:'id'},{title:'用户',key:'name'},{title:'已注册',key:'registered'},
+                  {title:'手动授权',key:'manual_allowed'},{title:'有效 Keys',key:'active_keys'},
+                  {title:'Web 管理员',key:'is_admin'},{title:'操作',key:'actions',sortable:false},
+                ]"
+                :items="admin.users || []"
+                :items-per-page="25"
+              >
+                <template #item.is_admin="{ item }"><v-chip :color="item.is_admin ? 'secondary' : 'default'" variant="tonal">{{ item.is_admin ? '是' : '否' }}</v-chip></template>
+                <template #item.actions="{ item }"><v-btn v-if="!item.configured_admin" size="small" variant="text" @click="openUserAdmin(item)"><ShieldCheck :size="15" class="mr-1" />{{ item.is_admin ? '撤销管理' : '授予管理' }}</v-btn><span v-else class="data-muted">配置管理员</span></template>
+              </v-data-table>
             </div>
           </section>
           <section class="section-band">
@@ -593,6 +624,17 @@ onMounted(load)
     <v-dialog v-model="transferDialog.open" max-width="560"><v-card><v-card-title>变更 Key 归属</v-card-title><v-card-text><v-text-field v-model="transferDialog.key_id" label="Key ID" type="number" min="1" /><v-text-field v-model="transferDialog.telegram_user_id" label="新 Telegram 用户 ID" type="number" /><v-textarea v-model="transferDialog.reason" label="原因" rows="2" /><v-checkbox v-model="transferDialog.confirm_transfer" label="确认默认仅影响未来用量" /></v-card-text><v-card-actions><v-spacer /><v-btn variant="text" @click="transferDialog.open = false">取消</v-btn><v-btn color="error" :loading="mutating" @click="transferOwnership">执行</v-btn></v-card-actions></v-card></v-dialog>
 
     <v-dialog v-model="poolDialog.open" max-width="560"><v-card><v-card-title>创建资源池</v-card-title><v-card-text><v-text-field v-model="poolDialog.name" label="名称" /><v-text-field v-model="poolDialog.auth_pattern" label="Auth index 正则" /><v-text-field v-model="poolDialog.model_pattern" label="模型正则" /><v-text-field v-model="poolDialog.priority" label="优先级" type="number" /></v-card-text><v-card-actions><v-spacer /><v-btn variant="text" @click="poolDialog.open = false">取消</v-btn><v-btn color="primary" :loading="mutating" @click="createPool">创建</v-btn></v-card-actions></v-card></v-dialog>
+
+    <v-dialog v-model="userAdminDialog.open" max-width="560">
+      <v-card>
+        <v-card-title>{{ userAdminDialog.is_admin ? '授予 Web 管理权限' : '撤销 Web 管理权限' }}</v-card-title>
+        <v-card-text>
+          <v-alert type="info" variant="tonal" class="mb-4">目标用户：{{ userAdminDialog.user?.name }}（{{ userAdminDialog.user?.id }}）</v-alert>
+          <v-textarea v-model="userAdminDialog.reason" label="变更原因" rows="3" autofocus />
+        </v-card-text>
+        <v-card-actions><v-spacer /><v-btn variant="text" @click="userAdminDialog.open = false">取消</v-btn><v-btn color="primary" :disabled="!userAdminDialog.reason.trim()" :loading="mutating" @click="saveUserAdmin">确认变更</v-btn></v-card-actions>
+      </v-card>
+    </v-dialog>
 
     <v-snackbar v-model="snackbar.show" :color="snackbar.color" timeout="4500">{{ snackbar.text }}</v-snackbar>
   </div>
