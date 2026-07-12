@@ -433,6 +433,106 @@ class BillingService:
             event.reasoning_effort = effort_by_source_id.get(event.source_event_id, "")
         return len(pending)
 
+    @staticmethod
+    def _raw_event_from_cpamp_row(source_id: int, row: sqlite3.Row) -> RawUsageEvent:
+        return RawUsageEvent(
+            source_id=source_id,
+            source_event_id=int(row["id"]),
+            event_hash=str(row["event_hash"]),
+            request_id=row["request_id"],
+            occurred_at_ms=int(row["timestamp_ms"]),
+            timestamp=str(row["timestamp"]),
+            provider=row["provider"],
+            executor_type=row["executor_type"],
+            model=str(row["model"]),
+            requested_model=row["requested_model"],
+            resolved_model=row["resolved_model"],
+            reasoning_effort=str(row["reasoning_effort"] or "").strip(),
+            service_tier=row["service_tier"],
+            api_key_hash=row["api_key_hash"],
+            source_hash=row["source_hash"],
+            source_label=row["source"],
+            account_snapshot=row["account_snapshot"],
+            auth_index=row["auth_index"],
+            input_tokens=int(row["input_tokens"] or 0),
+            output_tokens=int(row["output_tokens"] or 0),
+            reasoning_tokens=int(row["reasoning_tokens"] or 0),
+            cached_tokens=int(row["cached_tokens"] or 0),
+            cache_tokens=int(row["cache_tokens"] or 0),
+            cache_read_tokens=int(row["cache_read_tokens"] or 0),
+            cache_creation_tokens=int(row["cache_creation_tokens"] or 0),
+            total_tokens=int(row["total_tokens"] or 0),
+            failed=bool(row["failed"]),
+            fail_status_code=row["fail_status_code"],
+            latency_ms=row["latency_ms"],
+            ttft_ms=row["ttft_ms"],
+            response_metadata_json=row["response_metadata_json"],
+            quota_used_percent=None if row["header_quota_used_percent"] is None else int(Decimal(str(row["header_quota_used_percent"])) * 1_000_000),
+            quota_recover_at_ms=row["header_quota_recover_at_ms"],
+            quota_plan_type=row["header_quota_plan_type"],
+            imported_at_ms=now_ms(),
+        )
+
+    def _retry_cpamp_dead_letters(
+        self,
+        source_db: sqlite3.Connection,
+        session: Any,
+        source_id: int,
+        batch_size: int,
+        reasoning_effort_column: str,
+    ) -> int:
+        dead_letters = session.scalars(
+            select(DeadLetter)
+            .where(DeadLetter.source_id == source_id, DeadLetter.resolved_at_ms.is_(None), DeadLetter.source_event_id.is_not(None))
+            .order_by(DeadLetter.id)
+            .limit(batch_size)
+        ).all()
+        source_ids = [int(item.source_event_id) for item in dead_letters if item.source_event_id is not None]
+        if not source_ids:
+            return 0
+        placeholders = ",".join("?" for _ in source_ids)
+        rows = source_db.execute(
+            f"""
+            select id,event_hash,request_id,timestamp_ms,timestamp,provider,executor_type,model,
+                   requested_model,resolved_model,service_tier,api_key_hash,source_hash,source,
+                   account_snapshot,auth_index,input_tokens,output_tokens,reasoning_tokens,
+                   cached_tokens,cache_tokens,cache_read_tokens,cache_creation_tokens,total_tokens,failed,
+                   fail_status_code,latency_ms,ttft_ms,response_metadata_json,header_quota_used_percent,
+                   header_quota_recover_at_ms,header_quota_plan_type,{reasoning_effort_column}
+            from usage_events where id in ({placeholders})
+            """,
+            source_ids,
+        ).fetchall()
+        rows_by_id = {int(row["id"]): row for row in rows}
+        retried = 0
+        for dead_letter in dead_letters:
+            source_event_id = int(dead_letter.source_event_id)
+            row = rows_by_id.get(source_event_id)
+            if row is None:
+                dead_letter.error = "source event is no longer present in CPAMP"
+                continue
+            try:
+                with session.begin_nested():
+                    session.add(self._raw_event_from_cpamp_row(source_id, row))
+                    session.flush()
+                dead_letter.resolved_at_ms = now_ms()
+                retried += 1
+            except IntegrityError as exc:
+                existing = session.scalar(select(RawUsageEvent).where(
+                    RawUsageEvent.source_id == source_id,
+                    or_(RawUsageEvent.source_event_id == source_event_id, RawUsageEvent.event_hash == str(row["event_hash"])),
+                ))
+                if existing is not None:
+                    dead_letter.resolved_at_ms = now_ms()
+                    retried += 1
+                else:
+                    dead_letter.error = str(exc)
+            except Exception as exc:
+                dead_letter.error = str(exc)
+        if retried:
+            LOGGER.info("worker retried dead_letters=%s", retried)
+        return retried
+
     def sync_cpamp(self, batch_size: int = 1000) -> int:
         with self._db_write_lock():
             return self._sync_cpamp_locked(batch_size)
@@ -456,6 +556,9 @@ class BillingService:
                     checkpoint.last_error = "CPAMP schema fingerprint changed; review required"
                     raise BillingError(checkpoint.last_error)
                 source.schema_fingerprint = fingerprint
+                imported += self._retry_cpamp_dead_letters(
+                    source_db, session, source.id, batch_size, reasoning_effort_column,
+                )
                 rows = source_db.execute(
                     f"""
                     select id,event_hash,request_id,timestamp_ms,timestamp,provider,executor_type,model,
@@ -470,28 +573,7 @@ class BillingService:
                 ).fetchall()
                 for row in rows:
                     try:
-                        event = RawUsageEvent(
-                            source_id=source.id,
-                            source_event_id=int(row["id"]),
-                            event_hash=str(row["event_hash"]),
-                            request_id=row["request_id"],
-                            occurred_at_ms=int(row["timestamp_ms"]),
-                            timestamp=str(row["timestamp"]),
-                            provider=row["provider"], executor_type=row["executor_type"], model=str(row["model"]),
-                            requested_model=row["requested_model"], resolved_model=row["resolved_model"],
-                            reasoning_effort=str(row["reasoning_effort"] or "").strip(),
-                            service_tier=row["service_tier"], api_key_hash=row["api_key_hash"], source_hash=row["source_hash"],
-                            source_label=row["source"], account_snapshot=row["account_snapshot"], auth_index=row["auth_index"],
-                            input_tokens=int(row["input_tokens"] or 0), output_tokens=int(row["output_tokens"] or 0),
-                            reasoning_tokens=int(row["reasoning_tokens"] or 0), cached_tokens=int(row["cached_tokens"] or 0),
-                            cache_tokens=int(row["cache_tokens"] or 0),
-                            cache_read_tokens=int(row["cache_read_tokens"] or 0),
-                            cache_creation_tokens=int(row["cache_creation_tokens"] or 0), total_tokens=int(row["total_tokens"] or 0),
-                            failed=bool(row["failed"]), fail_status_code=row["fail_status_code"],
-                            latency_ms=row["latency_ms"], ttft_ms=row["ttft_ms"], response_metadata_json=row["response_metadata_json"],
-                            quota_used_percent=None if row["header_quota_used_percent"] is None else int(Decimal(str(row["header_quota_used_percent"])) * 1_000_000),
-                            quota_recover_at_ms=row["header_quota_recover_at_ms"], quota_plan_type=row["header_quota_plan_type"], imported_at_ms=now_ms(),
-                        )
+                        event = self._raw_event_from_cpamp_row(source.id, row)
                         with session.begin_nested():
                             session.add(event)
                             session.flush()

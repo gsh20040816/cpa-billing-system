@@ -22,6 +22,7 @@ from cpa_billing.models import (
     AuditLog,
     BillingCycle,
     CyclePoolCost,
+    DeadLetter,
     GradientRule,
     KeyOwnershipPeriod,
     ManualUsageAdjustment,
@@ -73,6 +74,29 @@ def test_sync_is_incremental_and_idempotent(service, settings) -> None:
     assert service.sync_cpamp() == 0
     with service.db.session() as session:
         assert session.scalar(select(func.count()).select_from(RawUsageEvent)) == 1
+
+
+def test_sync_retries_unresolved_dead_letters(service, settings) -> None:
+    insert_event(settings, "first", 1000, event_hash="first")
+    assert service.sync_cpamp() == 1
+    insert_event(settings, "second", 2000, event_hash="second")
+    with service.db.session() as session:
+        checkpoint = session.scalar(select(SyncCheckpoint))
+        session.add(DeadLetter(
+            source_id=checkpoint.source_id,
+            source_event_id=2,
+            error="transient database lock",
+            payload_json="{}",
+            created_at_ms=1,
+        ))
+        checkpoint.last_event_id = 2
+        checkpoint.last_event_at_ms = 2000
+
+    assert service.sync_cpamp() == 1
+    with service.db.session() as session:
+        assert session.scalar(select(func.count()).select_from(RawUsageEvent)) == 2
+        dead_letter = session.scalar(select(DeadLetter))
+        assert dead_letter.resolved_at_ms is not None
 
 
 def test_concurrent_rating_is_idempotent(service, settings) -> None:
