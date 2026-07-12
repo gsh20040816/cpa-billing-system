@@ -47,9 +47,9 @@ const event = {
 }
 
 const VDataTableStub = {
-  props: ['items'],
+  props: ['items', 'headers'],
   emits: ['click:row'],
-  template: '<div><div v-for="item in items" :key="item.id" class="request-list-row"><slot name="item.reasoning_effort" :item="item" /><slot name="item.cache_read" :item="item" /></div><button class="request-row" @click="$emit(\'click:row\', $event, { item: items[0] })">打开请求</button></div>',
+  template: '<div><div class="header-list">{{ headers.map((header) => header.title).join(\' · \') }}</div><div v-for="item in items" :key="item.id" class="request-list-row"><slot name="item.reasoning_effort" :item="item" /><slot name="item.cache_read" :item="item" /></div><button class="request-row" @click="$emit(\'click:row\', $event, { item: items[0] })">打开请求</button></div>',
 }
 
 const VDialogStub = {
@@ -122,6 +122,30 @@ describe('RequestsView', () => {
     await flushPromises()
     expect(document.body.textContent).toContain('历史归属')
     expect(document.body.textContent).toContain('@u2')
+    wrapper.unmount()
+  })
+
+  it('reloads data and table columns when switching between user and all requests', async () => {
+    const wrapper = mount(RequestsView, {
+      attachTo: document.body,
+      global: {
+        plugins: [vuetify],
+        stubs: { VDataTable: VDataTableStub, VDialog: VDialogStub },
+      },
+    })
+    await flushPromises()
+
+    expect(wrapper.find('.header-list').text()).not.toContain('历史归属')
+    const initialEventCalls = api.mock.calls.filter(([url]) => url.startsWith('/api/me/usage/events')).length
+
+    await wrapper.setProps({ admin: true })
+    await flushPromises()
+
+    expect(api.mock.calls.filter(([url]) => url.startsWith('/api/admin/usage/filter-options')).length).toBeGreaterThan(0)
+    expect(api.mock.calls.filter(([url]) => url.startsWith('/api/admin/usage/events')).length).toBeGreaterThan(0)
+    expect(api.mock.calls.filter(([url]) => url.startsWith('/api/me/usage/events')).length).toBe(initialEventCalls)
+    expect(wrapper.find('.header-list').text()).toContain('历史归属')
+    expect(wrapper.text()).toContain('全站请求明细')
     wrapper.unmount()
   })
 })

@@ -1,5 +1,5 @@
 <script setup>
-import { computed, inject, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import { computed, inject, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { Filter, RefreshCw, RotateCcw, Search, SlidersHorizontal } from '@lucide/vue'
 import { api } from '../api'
 import LoadingState from '../components/LoadingState.vue'
@@ -24,6 +24,8 @@ const data = ref(null)
 const filtersOpen = ref(true)
 const detail = ref(null)
 let requestSequence = 0
+let optionsSequence = 0
+let suppressFilterReload = false
 
 const defaults = {
   start: '', end: '', model: [], tier: '', provider: '', status: 'all', key_id: '', failure_code: '',
@@ -53,10 +55,10 @@ const longContextItems = [
   { title: '长上下文', value: true },
   { title: '普通上下文', value: false },
 ]
-const headers = [
+const headers = computed(() => [
   { title: '时间', key: 'occurred_at', minWidth: 168 },
   { title: 'Key', key: 'key', minWidth: 145 },
-  ...(props.admin ? [{ title: '历史归属', key: 'owner', minWidth: 145 }] : []),
+  ...(globalScope.value ? [{ title: '历史归属', key: 'owner', minWidth: 145 }] : []),
   { title: '模型', key: 'model', minWidth: 150 },
   { title: 'Tier', key: 'service_tier', width: 92 },
   { title: '推理强度', key: 'reasoning_effort', width: 108 },
@@ -68,7 +70,7 @@ const headers = [
   { title: '延迟', key: 'latency_ms', align: 'end' },
   { title: '成本', key: 'cost', align: 'end' },
   { title: '状态', key: 'status', width: 94 },
-]
+])
 
 const filterCount = computed(() => activeFilterCount(filters, ['page', 'page_size', 'sort']))
 const detailOpen = computed({
@@ -104,11 +106,13 @@ const filterSignature = computed(() => {
 })
 
 async function loadOptions() {
+  const sequence = ++optionsSequence
   optionsLoading.value = true
   try {
-        options.value = await api(`${endpointBase.value}/filter-options`, apiOptions.value)
+    const result = await api(`${endpointBase.value}/filter-options`, apiOptions.value)
+    if (sequence === optionsSequence) options.value = result
   } finally {
-    optionsLoading.value = false
+    if (sequence === optionsSequence) optionsLoading.value = false
   }
 }
 
@@ -158,11 +162,27 @@ function ownerLabel(owner) {
   return owner?.name || (owner?.telegram_user_id ? `TG ${owner.telegram_user_id}` : '未绑定')
 }
 
+async function reloadForScope() {
+  autoReload.cancel()
+  suppressFilterReload = true
+  Object.assign(filters, defaults)
+  await nextTick()
+  suppressFilterReload = false
+  detail.value = null
+  data.value = null
+  await Promise.all([loadOptions(), load()])
+}
+
 onMounted(async () => {
   await Promise.all([loadOptions(), load()])
 })
-watch(filterSignature, () => autoReload.schedule())
-watch(() => filters.page, () => load())
+watch(filterSignature, () => {
+  if (!suppressFilterReload) autoReload.schedule()
+})
+watch(globalScope, reloadForScope)
+watch(() => filters.page, () => {
+  if (!suppressFilterReload) load()
+})
 onBeforeUnmount(autoReload.cancel)
 </script>
 
@@ -233,7 +253,7 @@ onBeforeUnmount(autoReload.cancel)
 
     <section class="section-band">
       <div class="section-band__head">
-        <div><h2>{{ props.admin ? '全站请求明细' : '请求明细' }}</h2><p>不包含提示词或响应正文</p></div>
+        <div><h2>{{ globalScope ? '全站请求明细' : '请求明细' }}</h2><p>不包含提示词或响应正文</p></div>
         <span v-if="data" class="data-muted text-body-2">共 {{ number(data.pagination.total) }} 条</span>
       </div>
       <div class="section-band__body section-band__body--flush">
@@ -277,7 +297,7 @@ onBeforeUnmount(autoReload.cancel)
           <div class="detail-grid">
             <div><span>时间</span><strong>{{ dateTime(detail.occurred_at) }}</strong></div>
             <div><span>API Key</span><strong class="mono">{{ detail.key.name || detail.key.masked }}</strong></div>
-            <div v-if="props.admin"><span>历史归属</span><strong>{{ ownerLabel(detail.owner) }}</strong></div>
+            <div v-if="globalScope"><span>历史归属</span><strong>{{ ownerLabel(detail.owner) }}</strong></div>
             <div><span>模型</span><strong>{{ detail.resolved_model || detail.model }}</strong></div>
             <div><span>Tier</span><strong>{{ detail.service_tier }}</strong></div>
             <div><span>推理强度</span><strong class="mono">{{ detail.reasoning_effort || '-' }}</strong></div>
