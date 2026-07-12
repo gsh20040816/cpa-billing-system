@@ -59,6 +59,9 @@ def main() -> None:
     price_sync = sub.add_parser("sync-prices")
     price_sync.add_argument("--name")
     price_sync.add_argument("--reason", required=True)
+    reprice = sub.add_parser("rerate-active")
+    reprice.add_argument("--name")
+    reprice.add_argument("--reason", required=True)
     sub.add_parser("sync-keys")
     sub.add_parser("bot")
     serve = sub.add_parser("serve"); serve.add_argument("--host", default="0.0.0.0"); serve.add_argument("--port", type=int, default=18417)
@@ -85,6 +88,11 @@ def main() -> None:
             operator_type="cli-admin",
             operator_id="deployment",
             reason=args.reason,
+        ), ensure_ascii=False))
+    elif args.command == "rerate-active":
+        print(json.dumps(service.republish_active_pricing(
+            reason=args.reason,
+            version_name=args.name,
         ), ensure_ascii=False))
     elif args.command == "sync-keys":
         print(json.dumps(service.sync_cpa_keys(), ensure_ascii=False))

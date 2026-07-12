@@ -140,6 +140,58 @@ def test_priority_and_long_context_combine(service, settings) -> None:
         assert detail["rates"][0] == 4000
 
 
+def test_long_context_uses_the_active_price_rule_and_can_be_republished(service, settings) -> None:
+    create_owner(service, "key", 2, 0)
+    insert_event(
+        settings,
+        cpamp_key_hash("key"),
+        1000,
+        input_tokens=300000,
+        cached_tokens=0,
+        output_tokens=10,
+        tier="fast",
+        model="gpt-5.6-luna",
+    )
+    service.sync_cpamp()
+    assert service.rate_events() == 1
+    with service.db.session() as session:
+        first = session.scalar(select(RatedEvent))
+        assert first.long_context_applied is True
+
+    updated = service.update_pricing_rule(
+        "gpt-5.6-luna",
+        {
+            "input_nano_per_token": 1_000,
+            "output_nano_per_token": 6_000,
+            "cache_read_nano_per_token": 100,
+            "cache_creation_nano_per_token": 1_250,
+            "long_threshold_tokens": None,
+            "long_input_multiplier_ppm": 2_000_000,
+            "long_output_multiplier_ppm": 1_500_000,
+        },
+        "without-long-context",
+        "remove long context multiplier",
+        "test",
+        "test",
+    )
+    assert updated["rating_status"] == "queued"
+    assert service.rate_events() == 1
+    with service.db.session() as session:
+        active = session.scalar(select(PricingVersion).where(PricingVersion.status == "active"))
+        rated = session.scalar(select(RatedEvent).where(RatedEvent.pricing_version_id == active.id))
+        detail = json.loads(rated.calculation_json)
+        assert rated.long_context_applied is False
+        assert detail["rates"] == [2000, 200, 2500, 12000]
+
+    republished = service.republish_active_pricing("rebuild current pricing")
+    assert republished["rating_status"] == "queued"
+    assert service.rate_events() == 1
+    with service.db.session() as session:
+        active = session.scalar(select(PricingVersion).where(PricingVersion.status == "active"))
+        rated = session.scalar(select(RatedEvent).where(RatedEvent.pricing_version_id == active.id))
+        assert rated.long_context_applied is False
+
+
 def test_cycle_allocation_groups_by_user_and_preserves_cost(service, settings) -> None:
     create_owner(service, "key1", 2, 0); create_owner(service, "key2", 3, 0)
     insert_event(settings, cpamp_key_hash("key1"), 1000, event_hash="a", input_tokens=1_000_000, cached_tokens=0, output_tokens=0)

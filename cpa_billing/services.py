@@ -911,6 +911,98 @@ class BillingService:
             "rating_status": "queued",
         }
 
+    def republish_active_pricing(
+        self,
+        reason: str,
+        version_name: str | None = None,
+        operator_type: str = "cli-admin",
+        operator_id: str = "deployment",
+    ) -> dict[str, Any]:
+        reason = reason.strip()
+        if not reason:
+            raise BillingError("重新发布价格版本必须填写原因")
+        requested_name = (version_name or "").strip()
+        if requested_name and not re.fullmatch(r"[A-Za-z0-9._-]{1,80}", requested_name):
+            raise BillingError("价格版本名称只能包含字母、数字、点、下划线或短横线")
+
+        with self._db_write_lock(), self.db.session() as session:
+            active = session.scalar(
+                select(PricingVersion)
+                .where(PricingVersion.status == "active")
+                .order_by(PricingVersion.id.desc())
+            )
+            if active is None:
+                raise BillingError("没有 active 价格版本")
+            source_rules = list(session.scalars(
+                select(ModelPriceRule)
+                .where(ModelPriceRule.pricing_version_id == active.id)
+                .order_by(ModelPriceRule.model)
+            ))
+            if not source_rules:
+                raise BillingError("active 价格版本没有模型规则")
+
+            base_name = requested_name or f"reprice-{datetime.now(ZoneInfo(self.settings.timezone)):%Y%m%d-%H%M%S}"
+            candidate_name = base_name
+            suffix = 2
+            while session.scalar(select(PricingVersion).where(PricingVersion.name == candidate_name)) is not None:
+                if requested_name:
+                    raise BillingError("价格版本名称已存在")
+                candidate_name = f"{base_name}-{suffix}"
+                suffix += 1
+
+            created = now_ms()
+            for item in session.scalars(select(PricingVersion).where(PricingVersion.status == "active")):
+                item.status = "retired"
+            version = PricingVersion(
+                name=candidate_name,
+                status="active",
+                source="active pricing republish",
+                created_at_ms=created,
+                activated_at_ms=created,
+            )
+            session.add(version)
+            session.flush()
+            rule_fields = (
+                "input_nano_per_token", "output_nano_per_token",
+                "cache_read_nano_per_token", "cache_creation_nano_per_token",
+                "input_configured", "output_configured", "cache_read_configured", "cache_creation_configured",
+                "priority_input_nano_per_token", "priority_output_nano_per_token",
+                "priority_cache_read_nano_per_token", "priority_cache_creation_nano_per_token",
+                "flex_input_nano_per_token", "flex_output_nano_per_token",
+                "long_threshold_tokens", "long_input_multiplier_ppm", "long_output_multiplier_ppm", "raw_json",
+            )
+            for source_rule in source_rules:
+                session.add(ModelPriceRule(
+                    pricing_version_id=version.id,
+                    model=source_rule.model,
+                    **{field: getattr(source_rule, field) for field in rule_fields},
+                ))
+
+            cycles = list(session.scalars(select(BillingCycle).where(BillingCycle.status != "closed")))
+            cycle_ids = [cycle.id for cycle in cycles]
+            for cycle in cycles:
+                cycle.pricing_version_id = version.id
+            self._invalidate_cycle_previews(session, cycle_ids)
+            session.add(AuditLog(
+                operator_type=operator_type,
+                operator_id=operator_id,
+                operation="pricing.republish",
+                target=candidate_name,
+                before_json=json.dumps({"version_id": active.id, "name": active.name}),
+                after_json=json.dumps({"version_id": version.id, "name": candidate_name, "cycles": [cycle.name for cycle in cycles]}),
+                reason=reason,
+                created_at_ms=created,
+            ))
+            return {
+                "version_id": version.id,
+                "name": candidate_name,
+                "source": "active pricing republish",
+                "previous_version_id": active.id,
+                "cycles": [cycle.name for cycle in cycles],
+                "rated_events": 0,
+                "rating_status": "queued",
+            }
+
     def _active_pricing_id(self, session: Any) -> int:
         version = session.scalar(select(PricingVersion).where(PricingVersion.status == "active").order_by(PricingVersion.id.desc()))
         if version is None:
@@ -964,15 +1056,19 @@ class BillingService:
             cache_read_rate = rule.priority_cache_read_nano_per_token or cache_read_rate
             cache_creation_rate = rule.priority_cache_creation_nano_per_token or cache_creation_rate
 
+        long_threshold = rule.long_threshold_tokens
         long_context = bool(
             _model_family(behavior_model, "gpt-5.6")
-            and event.input_tokens > 272_000
+            and long_threshold is not None
+            and event.input_tokens > long_threshold
         )
         if long_context:
-            input_rate = _scaled_rate(input_rate, 2_000_000)
-            cache_read_rate = _scaled_rate(cache_read_rate, 2_000_000)
-            cache_creation_rate = _scaled_rate(cache_creation_rate, 2_000_000)
-            output_rate = _scaled_rate(output_rate, 1_500_000)
+            input_multiplier = rule.long_input_multiplier_ppm if rule.long_input_multiplier_ppm is not None else 1_000_000
+            output_multiplier = rule.long_output_multiplier_ppm if rule.long_output_multiplier_ppm is not None else 1_000_000
+            input_rate = _scaled_rate(input_rate, input_multiplier)
+            cache_read_rate = _scaled_rate(cache_read_rate, input_multiplier)
+            cache_creation_rate = _scaled_rate(cache_creation_rate, input_multiplier)
+            output_rate = _scaled_rate(output_rate, output_multiplier)
 
         compatible_cached = self._compatible_cached_tokens(event)
         cache_read = max(int(event.cache_read_tokens or 0), 0)
