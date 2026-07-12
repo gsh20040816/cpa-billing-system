@@ -31,6 +31,7 @@ const event = {
   model: 'gpt-5.6-sol',
   requested_model: 'gpt-5.6-sol',
   resolved_model: 'gpt-5.6-sol',
+  reasoning_effort: 'high',
   service_tier: 'default',
   key: { id: 1, masked: 'sk-cpa-m..._vM4', name: null },
   owner: { telegram_user_id: 2, name: '@u2' },
@@ -48,7 +49,7 @@ const event = {
 const VDataTableStub = {
   props: ['items'],
   emits: ['click:row'],
-  template: '<button class="request-row" @click="$emit(\'click:row\', $event, { item: items[0] })">打开请求</button>',
+  template: '<div><div v-for="item in items" :key="item.id" class="request-list-row"><slot name="item.reasoning_effort" :item="item" /><slot name="item.cache_read" :item="item" /></div><button class="request-row" @click="$emit(\'click:row\', $event, { item: items[0] })">打开请求</button></div>',
 }
 
 const VDialogStub = {
@@ -74,7 +75,7 @@ describe('RequestsView', () => {
     vi.clearAllMocks()
   })
 
-  it('shows one effective cache read field in request details', async () => {
+  it('shows reasoning effort and one effective cache read field in the list and details', async () => {
     const wrapper = mount(RequestsView, {
       attachTo: document.body,
       global: {
@@ -84,6 +85,8 @@ describe('RequestsView', () => {
     })
     await flushPromises()
 
+    expect(wrapper.find('.request-list-row').text()).toContain('high')
+    expect(wrapper.find('.request-list-row').text()).toContain('65,024')
     const row = wrapper.find('.request-row')
     expect(row.exists()).toBe(true)
     await row.trigger('click')
@@ -93,6 +96,8 @@ describe('RequestsView', () => {
     expect(pageText).toContain('缓存读取')
     expect(pageText).toContain('65,024')
     expect(pageText).toContain('缓存创建')
+    expect(pageText).toContain('推理强度')
+    expect(pageText).toContain('high')
     expect(pageText).not.toContain('Cached')
     expect(pageText).not.toContain('Cache read')
     wrapper.unmount()

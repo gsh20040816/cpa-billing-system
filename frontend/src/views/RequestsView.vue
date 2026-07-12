@@ -57,7 +57,9 @@ const headers = [
   ...(props.admin ? [{ title: '历史归属', key: 'owner', minWidth: 145 }] : []),
   { title: '模型', key: 'model', minWidth: 150 },
   { title: 'Tier', key: 'service_tier', width: 92 },
+  { title: '推理强度', key: 'reasoning_effort', width: 108 },
   { title: 'Input', key: 'input_tokens', align: 'end' },
+  { title: '缓存读取', key: 'cache_read', align: 'end' },
   { title: 'Output', key: 'output_tokens', align: 'end' },
   { title: '真实 TPS', key: 'tps', align: 'end' },
   { title: 'TTFT', key: 'ttft_ms', align: 'end' },
@@ -245,7 +247,9 @@ onBeforeUnmount(autoReload.cancel)
               <div v-if="item.requested_model && item.requested_model !== item.resolved_model" class="data-muted text-caption">请求 {{ item.requested_model }}</div>
             </template>
             <template #item.service_tier="{ item }"><v-chip variant="tonal" color="secondary">{{ item.service_tier }}</v-chip></template>
+            <template #item.reasoning_effort="{ item }"><v-chip v-if="item.reasoning_effort" variant="tonal" color="secondary">{{ item.reasoning_effort }}</v-chip><span v-else class="data-muted">-</span></template>
             <template #item.input_tokens="{ item }"><span class="mono">{{ number(item.tokens.input) }}</span></template>
+            <template #item.cache_read="{ item }"><span class="mono">{{ number(item.tokens.cache_read) }}</span></template>
             <template #item.output_tokens="{ item }"><span class="mono">{{ number(item.tokens.output) }}</span></template>
             <template #item.tps="{ item }"><span class="mono">{{ item.tps === null ? '-' : Number(item.tps).toFixed(2) }}</span></template>
             <template #item.ttft_ms="{ item }"><span class="mono">{{ duration(item.ttft_ms) }}</span></template>
@@ -274,6 +278,7 @@ onBeforeUnmount(autoReload.cancel)
             <div v-if="props.admin"><span>历史归属</span><strong>{{ ownerLabel(detail.owner) }}</strong></div>
             <div><span>模型</span><strong>{{ detail.resolved_model || detail.model }}</strong></div>
             <div><span>Tier</span><strong>{{ detail.service_tier }}</strong></div>
+            <div><span>推理强度</span><strong class="mono">{{ detail.reasoning_effort || '-' }}</strong></div>
             <div><span>Input</span><strong class="mono">{{ number(detail.tokens.input) }}</strong></div>
             <div><span>Output</span><strong class="mono">{{ number(detail.tokens.output) }}</strong></div>
             <div><span>缓存读取</span><strong class="mono">{{ number(detail.tokens.cache_read) }}</strong></div>

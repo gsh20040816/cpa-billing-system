@@ -46,6 +46,7 @@ class RawUsageEvent(Base):
     model: Mapped[str] = mapped_column(String(160))
     requested_model: Mapped[str | None] = mapped_column(String(160))
     resolved_model: Mapped[str | None] = mapped_column(String(160))
+    reasoning_effort: Mapped[str | None] = mapped_column(String(40))
     service_tier: Mapped[str | None] = mapped_column(String(40))
     api_key_hash: Mapped[str | None] = mapped_column(String(64))
     source_hash: Mapped[str | None] = mapped_column(String(64))

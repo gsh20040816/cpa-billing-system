@@ -371,10 +371,48 @@ class BillingService:
             raise BillingError("CPAMP schema missing columns: " + ", ".join(sorted(missing)))
         return hashlib.sha256(str(row[0]).encode()).hexdigest()
 
+    def _backfill_cpamp_reasoning_effort(
+        self,
+        source_db: sqlite3.Connection,
+        session: Any,
+        source_id: int,
+        batch_size: int,
+        has_reasoning_effort: bool,
+    ) -> int:
+        if not has_reasoning_effort:
+            return 0
+        pending = session.scalars(
+            select(RawUsageEvent)
+            .where(
+                RawUsageEvent.source_id == source_id,
+                RawUsageEvent.reasoning_effort.is_(None),
+            )
+            .order_by(RawUsageEvent.source_event_id)
+            .limit(min(batch_size, 5000))
+        ).all()
+        if not pending:
+            return 0
+        source_rows = source_db.execute(
+            "select id, reasoning_effort from usage_events where id between ? and ?",
+            (pending[0].source_event_id, pending[-1].source_event_id),
+        ).fetchall()
+        effort_by_source_id = {
+            int(row["id"]): str(row["reasoning_effort"] or "").strip()
+            for row in source_rows
+        }
+        for event in pending:
+            # Empty string means the source was checked and had no effort value.
+            event.reasoning_effort = effort_by_source_id.get(event.source_event_id, "")
+        return len(pending)
+
     def sync_cpamp(self, batch_size: int = 1000) -> int:
         imported = 0
         with self._cpamp() as source_db:
             fingerprint = self._schema_fingerprint(source_db)
+            usage_columns = {str(item[1]) for item in source_db.execute("pragma table_info(usage_events)")}
+            reasoning_effort_column = (
+                "reasoning_effort" if "reasoning_effort" in usage_columns else "NULL AS reasoning_effort"
+            )
             with self.db.session() as session:
                 source = session.scalar(select(CPAMPSource).where(CPAMPSource.name == self.settings.cpamp_source_name))
                 if source is None:
@@ -387,13 +425,13 @@ class BillingService:
                     raise BillingError(checkpoint.last_error)
                 source.schema_fingerprint = fingerprint
                 rows = source_db.execute(
-                    """
+                    f"""
                     select id,event_hash,request_id,timestamp_ms,timestamp,provider,executor_type,model,
                            requested_model,resolved_model,service_tier,api_key_hash,source_hash,source,
                            account_snapshot,auth_index,input_tokens,output_tokens,reasoning_tokens,
                            cached_tokens,cache_tokens,cache_read_tokens,cache_creation_tokens,total_tokens,failed,
                            fail_status_code,latency_ms,ttft_ms,response_metadata_json,header_quota_used_percent,
-                           header_quota_recover_at_ms,header_quota_plan_type
+                           header_quota_recover_at_ms,header_quota_plan_type,{reasoning_effort_column}
                     from usage_events where id > ? order by id limit ?
                     """,
                     (checkpoint.last_event_id, batch_size),
@@ -409,6 +447,7 @@ class BillingService:
                             timestamp=str(row["timestamp"]),
                             provider=row["provider"], executor_type=row["executor_type"], model=str(row["model"]),
                             requested_model=row["requested_model"], resolved_model=row["resolved_model"],
+                            reasoning_effort=str(row["reasoning_effort"] or "").strip(),
                             service_tier=row["service_tier"], api_key_hash=row["api_key_hash"], source_hash=row["source_hash"],
                             source_label=row["source"], account_snapshot=row["account_snapshot"], auth_index=row["auth_index"],
                             input_tokens=int(row["input_tokens"] or 0), output_tokens=int(row["output_tokens"] or 0),
@@ -435,6 +474,11 @@ class BillingService:
                 checkpoint.backlog = max(0, maximum - checkpoint.last_event_id)
                 checkpoint.last_success_at_ms = now_ms()
                 checkpoint.last_error = None
+                backfilled = self._backfill_cpamp_reasoning_effort(
+                    source_db, session, source.id, max(batch_size, 5000), "reasoning_effort" in usage_columns,
+                )
+                if backfilled:
+                    LOGGER.info("worker backfilled reasoning_effort=%s", backfilled)
         return imported
 
     def import_cpamp_prices(self, name: str, operator_type: str | None = None, operator_id: str | None = None,
@@ -2049,6 +2093,7 @@ class BillingService:
                     "model": event.model,
                     "requested_model": event.requested_model,
                     "resolved_model": event.resolved_model,
+                    "reasoning_effort": event.reasoning_effort or None,
                     "service_tier": rated.service_tier if rated else (event.service_tier or "default"),
                     "key": key_payload,
                     "tokens": {

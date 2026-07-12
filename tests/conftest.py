@@ -16,7 +16,7 @@ def create_cpamp(path: Path) -> None:
     db.executescript("""
     create table usage_events(
       id integer primary key autoincrement,event_hash text unique,request_id text,timestamp_ms integer,timestamp text,
-      provider text,executor_type text,model text,requested_model text,resolved_model text,service_tier text,
+      provider text,executor_type text,model text,requested_model text,resolved_model text,reasoning_effort text,service_tier text,
       api_key_hash text,source_hash text,source text,account_snapshot text,auth_index text,
       input_tokens integer,output_tokens integer,reasoning_tokens integer,cached_tokens integer,cache_tokens integer,
       cache_read_tokens integer,cache_creation_tokens integer,total_tokens integer,failed integer,

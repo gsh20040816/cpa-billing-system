@@ -44,13 +44,13 @@ def insert_event(settings, key_hash: str, timestamp_ms: int, *, event_hash: str 
                  model: str = "gpt-test", failed: bool = False, fail_status_code: int | None = None,
                  latency_ms: int = 100, ttft_ms: int = 10, cache_tokens: int = 0,
                  cache_read_tokens: int = 0, cache_creation_tokens: int = 0,
-                 account_snapshot: str = "account", auth_index: str = "auth") -> None:
+                 reasoning_effort: str | None = None, account_snapshot: str = "account", auth_index: str = "auth") -> None:
     db = sqlite3.connect(settings.cpamp_database_path)
     db.execute("""insert into usage_events(event_hash,request_id,timestamp_ms,timestamp,provider,executor_type,model,
-               requested_model,resolved_model,service_tier,api_key_hash,source_hash,source,account_snapshot,auth_index,
+               requested_model,resolved_model,reasoning_effort,service_tier,api_key_hash,source_hash,source,account_snapshot,auth_index,
                input_tokens,output_tokens,reasoning_tokens,cached_tokens,cache_tokens,cache_read_tokens,cache_creation_tokens,total_tokens,
-               failed,fail_status_code,latency_ms,ttft_ms) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-               (event_hash, f"request-{event_hash}", timestamp_ms, "2026-07-04T00:00:00Z", "codex", "CodexExecutor", model, model, model, tier,
+               failed,fail_status_code,latency_ms,ttft_ms) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               (event_hash, f"request-{event_hash}", timestamp_ms, "2026-07-04T00:00:00Z", "codex", "CodexExecutor", model, model, model, reasoning_effort, tier,
                 key_hash, "source", "masked", account_snapshot, auth_index, input_tokens, output_tokens, 40,
                 cached_tokens, cache_tokens, cache_read_tokens, cache_creation_tokens,
                 input_tokens + output_tokens, int(failed), fail_status_code, latency_ms, ttft_ms))
@@ -809,6 +809,19 @@ def test_request_history_exposes_one_effective_cache_read_value(service, setting
     assert items[1]["tokens"]["cache_read"] == 100
     assert items[1]["tokens"]["cache_creation"] == 50
     assert all("cached" not in item["tokens"] for item in items)
+
+
+def test_request_history_exposes_reasoning_effort_and_backfills_existing_events(service, settings) -> None:
+    create_owner(service, "key", 2, 0)
+    insert_event(settings, cpamp_key_hash("key"), 1000, reasoning_effort="high")
+    service.sync_cpamp()
+    with service.db.session() as session:
+        event = session.scalar(select(RawUsageEvent))
+        event.reasoning_effort = None
+    service.sync_cpamp()
+
+    item = service.request_history(2)["items"][0]
+    assert item["reasoning_effort"] == "high"
 
 
 def test_gradient_updates_only_open_cycles_and_cannot_be_deleted_while_bound(service) -> None:
