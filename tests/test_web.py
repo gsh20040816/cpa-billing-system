@@ -284,6 +284,34 @@ def test_admin_billing_rule_and_key_profile_endpoints(settings, monkeypatch) -> 
     assert pricing.status_code == 200
     assert pricing.json()["rated_events"] == 10
 
+    manual = client.put(
+        "/api/admin/pricing-rules",
+        headers=headers,
+        json={
+            "model": "gpt-test",
+            "input_usd_per_million": "2",
+            "output_usd_per_million": "12",
+            "cache_read_usd_per_million": "0.2",
+            "cache_creation_usd_per_million": "2.5",
+            "priority_input_usd_per_million": None,
+            "priority_output_usd_per_million": None,
+            "priority_cache_read_usd_per_million": None,
+            "priority_cache_creation_usd_per_million": None,
+            "flex_input_usd_per_million": None,
+            "flex_output_usd_per_million": None,
+            "long_context_threshold_tokens": None,
+            "long_context_input_multiplier": "1",
+            "long_context_output_multiplier": "1",
+            "version_name": "manual-web",
+            "reason": "手动修正测试价格",
+        },
+    )
+    assert manual.status_code == 200
+    assert manual.json()["name"] == "manual-web"
+    admin_snapshot = client.get("/api/admin/snapshot").json()["admin"]
+    assert admin_snapshot["pricing_rules"]["active_version"]["name"] == "manual-web"
+    assert next(item for item in admin_snapshot["pricing_rules"]["models"] if item["model"] == "gpt-test")["default"]["input"]["usd_per_million"] == "2"
+
 
 def test_admin_can_add_exact_manual_usage_with_independent_auth_and_csrf(settings) -> None:
     app = create_app(settings)

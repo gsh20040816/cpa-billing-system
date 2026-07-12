@@ -54,7 +54,20 @@ const snapshot = {
     gradients: [],
     keys: [],
     ownership: [],
-    pricing: [],
+    pricing: [{ id: 1, name: 'cpamp-initial', status: 'active', source: 'CPAMP', activated_at: '2026-07-11T12:00:00+08:00' }],
+    pricing_rules: {
+      active_version: { id: 1, name: 'cpamp-initial', source: 'CPAMP', activated_at: '2026-07-11T12:00:00+08:00' },
+      models: [{
+        model: 'gpt-test',
+        default: {
+          input: { usd_per_million: '1' }, output: { usd_per_million: '6' },
+          cache_read: { usd_per_million: '0.1' }, cache_creation: { usd_per_million: '1.25' },
+        },
+        priority: { input: null, output: null, cache_read: null, cache_creation: null },
+        flex: { input: null, output: null },
+        long_context: { threshold_tokens: null, input_multiplier_ppm: 1000000, output_multiplier_ppm: 1000000 },
+      }],
+    },
     adjustments: [],
     manual_usage_adjustments: [{
       id: 7,
@@ -224,6 +237,49 @@ describe('AdminView manual usage', () => {
       body: { is_admin: true, reason: '授权管理测试' },
       method: 'PATCH',
     })
+    wrapper.unmount()
+  })
+
+  it('edits a model pricing rule from the billing rules panel', async () => {
+    const wrapper = mount(AdminView, {
+      attachTo: document.body,
+      global: { plugins: [vuetify] },
+    })
+    await flushPromises()
+
+    const rulesTab = wrapper.findAllComponents({ name: 'VTab' })
+      .find((item) => item.text().includes('计费规则'))
+    await rulesTab.trigger('click')
+    await flushPromises()
+
+    const editButton = wrapper.findAllComponents({ name: 'VBtn' })
+      .find((item) => item.text().trim() === '调整')
+    expect(editButton).toBeTruthy()
+    await editButton.trigger('click')
+    await flushPromises()
+
+    const dialog = wrapper.findAllComponents({ name: 'VDialog' })
+      .find((item) => item.props('modelValue') === true)
+    expect(dialog).toBeTruthy()
+    const input = dialog.findAllComponents({ name: 'VTextField' })
+      .find((item) => item.props('label') === 'Default Input')
+    const reason = dialog.findAllComponents({ name: 'VTextarea' })
+      .find((item) => item.props('label') === '变更原因')
+    await input.setValue('2')
+    await reason.setValue('手动调价测试')
+    await dialog.findAllComponents({ name: 'VBtn' })
+      .find((item) => item.text().includes('保存并重算')).trigger('click')
+    await flushPromises()
+
+    expect(api).toHaveBeenCalledWith('/api/admin/pricing-rules', expect.objectContaining({
+      admin: true,
+      method: 'PUT',
+      body: expect.objectContaining({
+        model: 'gpt-test',
+        input_usd_per_million: '2',
+        reason: '手动调价测试',
+      }),
+    }))
     wrapper.unmount()
   })
 })

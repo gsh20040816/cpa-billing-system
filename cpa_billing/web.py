@@ -176,6 +176,25 @@ class PricingSyncPayload(BaseModel):
     reason: str = Field(min_length=1, max_length=1000)
 
 
+class PricingRulePayload(BaseModel):
+    model: str = Field(min_length=1, max_length=160)
+    input_usd_per_million: str = Field(min_length=1, max_length=40)
+    output_usd_per_million: str = Field(min_length=1, max_length=40)
+    cache_read_usd_per_million: str = Field(min_length=1, max_length=40)
+    cache_creation_usd_per_million: str = Field(min_length=1, max_length=40)
+    priority_input_usd_per_million: str | None = Field(default=None, max_length=40)
+    priority_output_usd_per_million: str | None = Field(default=None, max_length=40)
+    priority_cache_read_usd_per_million: str | None = Field(default=None, max_length=40)
+    priority_cache_creation_usd_per_million: str | None = Field(default=None, max_length=40)
+    flex_input_usd_per_million: str | None = Field(default=None, max_length=40)
+    flex_output_usd_per_million: str | None = Field(default=None, max_length=40)
+    long_context_threshold_tokens: int | None = Field(default=None, ge=0)
+    long_context_input_multiplier: str = Field(default="1", max_length=40)
+    long_context_output_multiplier: str = Field(default="1", max_length=40)
+    version_name: str | None = Field(default=None, max_length=80)
+    reason: str = Field(min_length=1, max_length=1000)
+
+
 class GradientRulePayload(BaseModel):
     name: str = Field(min_length=1, max_length=80)
     description: str | None = Field(default=None, max_length=300)
@@ -238,6 +257,38 @@ def _manual_usage_to_nano(value: str) -> int:
     if abs(amount_nano_usd) > 9_223_372_036_854_775_807:
         raise BillingError("原始等效用量超出可记录范围")
     return amount_nano_usd
+
+
+def _usd_per_million_to_nano(value: str | None, label: str, optional: bool = False) -> int | None:
+    if value is None or not str(value).strip():
+        if optional:
+            return None
+        raise BillingError(f"{label}不能为空")
+    try:
+        amount = Decimal(str(value).strip())
+        quantized = amount.quantize(Decimal("0.001"), rounding=ROUND_HALF_UP)
+    except (InvalidOperation, ValueError) as exc:
+        raise BillingError(f"{label}格式无效") from exc
+    if not amount.is_finite() or amount < 0:
+        raise BillingError(f"{label}必须是非负有限数值")
+    if amount != quantized:
+        raise BillingError(f"{label}最多保留三位小数")
+    return int(quantized * Decimal(1000))
+
+
+def _multiplier_to_ppm(value: str | None, label: str) -> int:
+    if value is None or not str(value).strip():
+        raise BillingError(f"{label}不能为空")
+    try:
+        amount = Decimal(str(value).strip())
+        quantized = amount.quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
+    except (InvalidOperation, ValueError) as exc:
+        raise BillingError(f"{label}格式无效") from exc
+    if not amount.is_finite() or amount < 0:
+        raise BillingError(f"{label}必须是非负有限数值")
+    if amount != quantized:
+        raise BillingError(f"{label}最多保留六位小数")
+    return int(quantized * Decimal(1_000_000))
 
 
 @dataclass(frozen=True)
@@ -865,6 +916,34 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             operator_type="web-admin",
             operator_id="admin-token",
             reason=payload.reason,
+        )
+
+    @app.put("/api/admin/pricing-rules")
+    def api_update_pricing_rule(payload: PricingRulePayload, request: Request,
+                                auth: WebAuth = Depends(admin_current)) -> dict[str, Any]:
+        verify_csrf(request, auth)
+        values = {
+            "input_nano_per_token": _usd_per_million_to_nano(payload.input_usd_per_million, "Input 价格"),
+            "output_nano_per_token": _usd_per_million_to_nano(payload.output_usd_per_million, "Output 价格"),
+            "cache_read_nano_per_token": _usd_per_million_to_nano(payload.cache_read_usd_per_million, "Cache read 价格"),
+            "cache_creation_nano_per_token": _usd_per_million_to_nano(payload.cache_creation_usd_per_million, "Cache creation 价格"),
+            "priority_input_nano_per_token": _usd_per_million_to_nano(payload.priority_input_usd_per_million, "Priority Input 价格", True),
+            "priority_output_nano_per_token": _usd_per_million_to_nano(payload.priority_output_usd_per_million, "Priority Output 价格", True),
+            "priority_cache_read_nano_per_token": _usd_per_million_to_nano(payload.priority_cache_read_usd_per_million, "Priority Cache read 价格", True),
+            "priority_cache_creation_nano_per_token": _usd_per_million_to_nano(payload.priority_cache_creation_usd_per_million, "Priority Cache creation 价格", True),
+            "flex_input_nano_per_token": _usd_per_million_to_nano(payload.flex_input_usd_per_million, "Flex Input 价格", True),
+            "flex_output_nano_per_token": _usd_per_million_to_nano(payload.flex_output_usd_per_million, "Flex Output 价格", True),
+            "long_threshold_tokens": payload.long_context_threshold_tokens,
+            "long_input_multiplier_ppm": _multiplier_to_ppm(payload.long_context_input_multiplier, "长上下文 Input 倍率"),
+            "long_output_multiplier_ppm": _multiplier_to_ppm(payload.long_context_output_multiplier, "长上下文 Output 倍率"),
+        }
+        return service.update_pricing_rule(
+            payload.model,
+            values,
+            payload.version_name,
+            payload.reason,
+            operator_type="web-admin-token" if auth.via_management_token else "web-admin-user",
+            operator_id="admin-token" if auth.via_management_token else str(auth.user.telegram_user_id),
         )
 
     @app.post("/api/admin/gradient-rules")

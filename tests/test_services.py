@@ -974,6 +974,51 @@ def test_upstream_price_sync_rerates_open_cycles_only(service, settings, monkeyp
         assert session.get(PricingVersion, closed.pricing_version_id).name == "cpamp-initial"
 
 
+def test_manual_price_update_creates_version_and_rerates_open_cycles_only(service, settings) -> None:
+    create_owner(service, "key", 2, 0)
+    insert_event(settings, cpamp_key_hash("key"), 1000)
+    service.sync_cpamp()
+    service.rate_events()
+    service.create_cycle("open-manual-price", "1970-01-01T08:00", "1970-01-02T08:00", 1000)
+    service.create_cycle("closed-manual-price", "1970-01-01T08:00", "1970-01-02T08:00", 1000)
+    service.close_cycle("closed-manual-price", 1, False)
+    before_open = service.dashboard("open-manual-price")["totals"]["actual"]
+    before_closed = service.dashboard("closed-manual-price")["totals"]["actual"]
+
+    result = service.update_pricing_rule(
+        "gpt-test",
+        {
+            "input_nano_per_token": 2_000,
+            "output_nano_per_token": 12_000,
+            "cache_read_nano_per_token": 200,
+            "cache_creation_nano_per_token": 2_500,
+            "priority_input_nano_per_token": None,
+            "priority_output_nano_per_token": None,
+            "priority_cache_read_nano_per_token": None,
+            "priority_cache_creation_nano_per_token": None,
+            "flex_input_nano_per_token": None,
+            "flex_output_nano_per_token": None,
+            "long_threshold_tokens": None,
+            "long_input_multiplier_ppm": 1_000_000,
+            "long_output_multiplier_ppm": 1_000_000,
+        },
+        "manual-prices",
+        "修正测试价格",
+        "web-admin",
+        "admin-token",
+    )
+
+    assert result["name"] == "manual-prices"
+    assert result["rated_events"] >= 1
+    assert Decimal(service.dashboard("open-manual-price")["totals"]["actual"].replace(",", "")) > Decimal(before_open.replace(",", ""))
+    assert service.dashboard("closed-manual-price")["totals"]["actual"] == before_closed
+    with service.db.session() as session:
+        opened = session.scalar(select(BillingCycle).where(BillingCycle.name == "open-manual-price"))
+        closed = session.scalar(select(BillingCycle).where(BillingCycle.name == "closed-manual-price"))
+        assert session.get(PricingVersion, opened.pricing_version_id).name == "manual-prices"
+        assert session.get(PricingVersion, closed.pricing_version_id).name == "cpamp-initial"
+
+
 def test_site_status_usage_is_calculated_locally(service, settings, monkeypatch) -> None:
     current = int(time.time() * 1000)
     insert_event(settings, "site-key", current - 1000, event_hash="site-local")

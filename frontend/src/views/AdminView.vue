@@ -2,7 +2,7 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import {
   Activity, ArrowDown, ArrowUp, CloudDownload, Edit3, KeyRound, Plus, RefreshCw, ShieldCheck,
-  Save, Scale, Shuffle, Trash2, XCircle,
+  Save, Scale, Search, Shuffle, Trash2, XCircle,
 } from '@lucide/vue'
 import { api } from '../api'
 import LoadingState from '../components/LoadingState.vue'
@@ -35,6 +35,27 @@ const gradientDialog = reactive({ open: false, id: null, name: '', description: 
 const deleteGradientDialog = reactive({ open: false, rule: null, reason: '' })
 const keyProfileDialog = reactive({ open: false, key: null, name: '', multiplier: '', reason: '' })
 const userAdminDialog = reactive({ open: false, user: null, is_admin: false, reason: '' })
+const pricingSearch = ref('')
+const pricingRuleDialog = reactive({
+  open: false,
+  editing_model: '',
+  model: '',
+  input_usd_per_million: '',
+  output_usd_per_million: '',
+  cache_read_usd_per_million: '',
+  cache_creation_usd_per_million: '',
+  priority_input_usd_per_million: '',
+  priority_output_usd_per_million: '',
+  priority_cache_read_usd_per_million: '',
+  priority_cache_creation_usd_per_million: '',
+  flex_input_usd_per_million: '',
+  flex_output_usd_per_million: '',
+  long_context_threshold_tokens: '',
+  long_context_input_multiplier: '1',
+  long_context_output_multiplier: '1',
+  version_name: '',
+  reason: '',
+})
 
 const reconciliation = computed(() => data.value?.reconciliation || {})
 const admin = computed(() => data.value?.admin || {})
@@ -42,6 +63,10 @@ const activeGradients = computed(() => (admin.value.gradients || []).filter((ite
 const activePools = computed(() => (admin.value.pools || []).filter((item) => item.active))
 const openCycles = computed(() => (admin.value.cycles || []).filter((item) => item.status !== 'closed'))
 const registeredUsers = computed(() => (admin.value.users || []).filter((item) => item.registered))
+const pricingModels = computed(() => {
+  const needle = pricingSearch.value.trim().toLowerCase()
+  return (admin.value.pricing_rules?.models || []).filter((item) => !needle || item.model.toLowerCase().includes(needle))
+})
 const manualUsagePools = computed(() => {
   const cycle = openCycles.value.find((item) => item.name === manualUsageDialog.cycle)
   return cycle?.pool_costs || []
@@ -246,6 +271,76 @@ async function syncPricing() {
     reason: pricingDialog.reason,
   }, '上游价格已同步，未关闭账期已重新计价')
   if (result) pricingDialog.open = false
+}
+
+function pricingValue(rule, tier, field) {
+  return rule?.[tier]?.[field]?.usd_per_million || '-'
+}
+
+function pricingLine(rule, tier) {
+  return `I ${pricingValue(rule, tier, 'input')} · R ${pricingValue(rule, tier, 'cache_read')} · C+ ${pricingValue(rule, tier, 'cache_creation')} · O ${pricingValue(rule, tier, 'output')}`
+}
+
+function pricingContext(rule) {
+  const context = rule?.long_context || {}
+  if (!context.threshold_tokens) return '-'
+  return `${number(context.threshold_tokens)} · ${(Number(context.input_multiplier_ppm || 1_000_000) / 1_000_000).toFixed(2)}x / ${(Number(context.output_multiplier_ppm || 1_000_000) / 1_000_000).toFixed(2)}x`
+}
+
+function ruleField(rule, tier, field) {
+  return rule?.[tier]?.[field]?.usd_per_million || ''
+}
+
+function multiplierField(rule, field) {
+  const value = rule?.long_context?.[field]
+  return value === undefined || value === null ? '1' : String(Number(value) / 1_000_000)
+}
+
+function openPricingRule(rule = null) {
+  Object.assign(pricingRuleDialog, {
+    open: true,
+    editing_model: rule?.model || '',
+    model: rule?.model || '',
+    input_usd_per_million: ruleField(rule, 'default', 'input'),
+    output_usd_per_million: ruleField(rule, 'default', 'output'),
+    cache_read_usd_per_million: ruleField(rule, 'default', 'cache_read'),
+    cache_creation_usd_per_million: ruleField(rule, 'default', 'cache_creation'),
+    priority_input_usd_per_million: ruleField(rule, 'priority', 'input'),
+    priority_output_usd_per_million: ruleField(rule, 'priority', 'output'),
+    priority_cache_read_usd_per_million: ruleField(rule, 'priority', 'cache_read'),
+    priority_cache_creation_usd_per_million: ruleField(rule, 'priority', 'cache_creation'),
+    flex_input_usd_per_million: ruleField(rule, 'flex', 'input'),
+    flex_output_usd_per_million: ruleField(rule, 'flex', 'output'),
+    long_context_threshold_tokens: rule?.long_context?.threshold_tokens ? String(rule.long_context.threshold_tokens) : '',
+    long_context_input_multiplier: multiplierField(rule, 'input_multiplier_ppm'),
+    long_context_output_multiplier: multiplierField(rule, 'output_multiplier_ppm'),
+    version_name: '',
+    reason: '',
+  })
+}
+
+async function savePricingRule() {
+  const optional = (value) => String(value || '').trim() || null
+  const result = await mutate('/api/admin/pricing-rules', {
+    model: pricingRuleDialog.model.trim(),
+    input_usd_per_million: pricingRuleDialog.input_usd_per_million,
+    output_usd_per_million: pricingRuleDialog.output_usd_per_million,
+    cache_read_usd_per_million: pricingRuleDialog.cache_read_usd_per_million,
+    cache_creation_usd_per_million: pricingRuleDialog.cache_creation_usd_per_million,
+    priority_input_usd_per_million: optional(pricingRuleDialog.priority_input_usd_per_million),
+    priority_output_usd_per_million: optional(pricingRuleDialog.priority_output_usd_per_million),
+    priority_cache_read_usd_per_million: optional(pricingRuleDialog.priority_cache_read_usd_per_million),
+    priority_cache_creation_usd_per_million: optional(pricingRuleDialog.priority_cache_creation_usd_per_million),
+    flex_input_usd_per_million: optional(pricingRuleDialog.flex_input_usd_per_million),
+    flex_output_usd_per_million: optional(pricingRuleDialog.flex_output_usd_per_million),
+    long_context_threshold_tokens: optional(pricingRuleDialog.long_context_threshold_tokens) === null
+      ? null : Number(pricingRuleDialog.long_context_threshold_tokens),
+    long_context_input_multiplier: pricingRuleDialog.long_context_input_multiplier,
+    long_context_output_multiplier: pricingRuleDialog.long_context_output_multiplier,
+    version_name: optional(pricingRuleDialog.version_name),
+    reason: pricingRuleDialog.reason,
+  }, '手动计费规则已保存，未关闭账期已重新计价', 'PUT')
+  if (result) pricingRuleDialog.open = false
 }
 
 async function syncCpaKeys() {
@@ -542,6 +637,46 @@ onMounted(load)
               </div>
             </section>
           </div>
+
+          <section class="section-band mt-4">
+            <div class="section-band__head">
+              <div>
+                <h2>模型计费规则</h2>
+                <p>
+                  当前 active 版本：{{ admin.pricing_rules?.active_version?.name || '-' }} ·
+                  手动保存会创建新版本并重算未关闭账期，关闭账期保持不变
+                </p>
+              </div>
+              <div class="d-flex align-center ga-2 flex-wrap">
+                <v-text-field v-model="pricingSearch" label="搜索模型" clearable style="width: 220px">
+                  <template #prepend-inner><Search :size="16" /></template>
+                </v-text-field>
+                <v-btn size="small" color="primary" @click="openPricingRule()"><Plus :size="16" class="mr-2" />新增模型规则</v-btn>
+              </div>
+            </div>
+            <div class="section-band__body section-band__body--flush">
+              <v-alert type="info" variant="tonal" class="ma-4">
+                上游同步仍可使用。同步会创建新的上游价格版本，并覆盖当前未关闭账期采用的手动价格；历史版本和已关闭账期不会被修改。
+              </v-alert>
+              <v-data-table
+                :headers="[
+                  {title:'模型',key:'model',minWidth:190},
+                  {title:'Default USD / 1M（I · R · C+ · O）',key:'default',minWidth:300},
+                  {title:'Priority USD / 1M（I · R · C+ · O）',key:'priority',minWidth:300},
+                  {title:'长上下文',key:'long_context',minWidth:170},
+                  {title:'操作',key:'actions',sortable:false,width:110},
+                ]"
+                :items="pricingModels"
+                :items-per-page="25"
+              >
+                <template #item.model="{ item }"><span class="mono">{{ item.model }}</span></template>
+                <template #item.default="{ item }"><span class="mono">{{ pricingLine(item, 'default') }}</span></template>
+                <template #item.priority="{ item }"><span class="mono">{{ pricingLine(item, 'priority') }}</span></template>
+                <template #item.long_context="{ item }"><span class="mono">{{ pricingContext(item) }}</span></template>
+                <template #item.actions="{ item }"><v-btn size="small" variant="text" @click="openPricingRule(item)"><Edit3 :size="15" class="mr-1" />调整</v-btn></template>
+              </v-data-table>
+            </div>
+          </section>
         </v-window-item>
 
         <v-window-item value="adjustments">
@@ -596,7 +731,37 @@ onMounted(load)
 
     <v-dialog v-model="keyProfileDialog.open" max-width="560"><v-card><v-card-title>未绑定 Key 计费档案</v-card-title><v-card-text><v-alert type="info" variant="tonal" class="mb-4"><span class="mono">{{ keyProfileDialog.key?.masked }}</span><br>预估付费 = 本地等效成本 USD × 倍率，结果计入人民币资源池抵扣。</v-alert><v-text-field v-model="keyProfileDialog.name" label="显示别名" /><v-text-field v-model="keyProfileDialog.multiplier" label="倍率（人民币 / USD）" type="number" min="0" step="0.01" /><v-textarea v-model="keyProfileDialog.reason" label="修改原因（选填）" rows="2" /></v-card-text><v-card-actions><v-spacer /><v-btn variant="text" @click="keyProfileDialog.open = false">取消</v-btn><v-btn color="primary" :loading="mutating" @click="saveKeyProfile"><Save :size="16" class="mr-2" />保存</v-btn></v-card-actions></v-card></v-dialog>
 
-    <v-dialog v-model="pricingDialog.open" max-width="560"><v-card><v-card-title>同步上游模型价格</v-card-title><v-card-text><v-alert type="warning" variant="tonal" class="mb-4">同步会创建新价格版本，并重新计价所有未关闭账期的请求。关闭账期保持不变。</v-alert><v-text-field v-model="pricingDialog.name" label="版本名称（留空自动生成）" /><v-textarea v-model="pricingDialog.reason" label="同步原因" rows="2" /></v-card-text><v-card-actions><v-spacer /><v-btn variant="text" @click="pricingDialog.open = false">取消</v-btn><v-btn color="secondary" :loading="mutating" @click="syncPricing"><CloudDownload :size="16" class="mr-2" />同步并重算</v-btn></v-card-actions></v-card></v-dialog>
+    <v-dialog v-model="pricingDialog.open" max-width="560"><v-card><v-card-title>同步上游模型价格</v-card-title><v-card-text><v-alert type="warning" variant="tonal" class="mb-4">同步会创建新的上游价格版本，并重新计价所有未关闭账期的请求。手动调整会被本次同步覆盖，关闭账期保持不变。</v-alert><v-text-field v-model="pricingDialog.name" label="版本名称（留空自动生成）" /><v-textarea v-model="pricingDialog.reason" label="同步原因" rows="2" /></v-card-text><v-card-actions><v-spacer /><v-btn variant="text" @click="pricingDialog.open = false">取消</v-btn><v-btn color="secondary" :loading="mutating" @click="syncPricing"><CloudDownload :size="16" class="mr-2" />同步并重算</v-btn></v-card-actions></v-card></v-dialog>
+
+    <v-dialog v-model="pricingRuleDialog.open" max-width="980">
+      <v-card>
+        <v-card-title>{{ pricingRuleDialog.editing_model ? '手动调整模型计费规则' : '新增模型计费规则' }}</v-card-title>
+        <v-card-text>
+          <v-alert type="warning" variant="tonal" class="mb-4">
+            单位均为 USD / 1M tokens。保存会生成新的 active 版本，并重算未关闭账期；价格版本名称留空时自动生成。
+          </v-alert>
+          <div class="dialog-grid">
+            <v-text-field v-model="pricingRuleDialog.model" label="模型名称" :disabled="Boolean(pricingRuleDialog.editing_model)" class="dialog-wide" />
+            <v-text-field v-model="pricingRuleDialog.input_usd_per_million" label="Default Input" type="number" min="0" step="0.001" prefix="$" />
+            <v-text-field v-model="pricingRuleDialog.output_usd_per_million" label="Default Output" type="number" min="0" step="0.001" prefix="$" />
+            <v-text-field v-model="pricingRuleDialog.cache_read_usd_per_million" label="Default Cache read" type="number" min="0" step="0.001" prefix="$" />
+            <v-text-field v-model="pricingRuleDialog.cache_creation_usd_per_million" label="Default Cache creation" type="number" min="0" step="0.001" prefix="$" />
+            <v-text-field v-model="pricingRuleDialog.priority_input_usd_per_million" label="Priority Input（空=Default）" type="number" min="0" step="0.001" prefix="$" />
+            <v-text-field v-model="pricingRuleDialog.priority_output_usd_per_million" label="Priority Output（空=Default）" type="number" min="0" step="0.001" prefix="$" />
+            <v-text-field v-model="pricingRuleDialog.priority_cache_read_usd_per_million" label="Priority Cache read（空=Default）" type="number" min="0" step="0.001" prefix="$" />
+            <v-text-field v-model="pricingRuleDialog.priority_cache_creation_usd_per_million" label="Priority Cache creation（空=Default）" type="number" min="0" step="0.001" prefix="$" />
+            <v-text-field v-model="pricingRuleDialog.flex_input_usd_per_million" label="Flex Input（空=Default）" type="number" min="0" step="0.001" prefix="$" />
+            <v-text-field v-model="pricingRuleDialog.flex_output_usd_per_million" label="Flex Output（空=Default）" type="number" min="0" step="0.001" prefix="$" />
+            <v-text-field v-model="pricingRuleDialog.long_context_threshold_tokens" label="长上下文阈值 tokens（空=不启用）" type="number" min="0" />
+            <v-text-field v-model="pricingRuleDialog.long_context_input_multiplier" label="长上下文 Input 倍率" type="number" min="0" step="0.000001" suffix="x" />
+            <v-text-field v-model="pricingRuleDialog.long_context_output_multiplier" label="长上下文 Output 倍率" type="number" min="0" step="0.000001" suffix="x" />
+            <v-text-field v-model="pricingRuleDialog.version_name" label="价格版本名称（选填）" />
+            <v-textarea v-model="pricingRuleDialog.reason" label="变更原因" rows="2" class="dialog-wide" />
+          </div>
+        </v-card-text>
+        <v-card-actions><v-spacer /><v-btn variant="text" @click="pricingRuleDialog.open = false">取消</v-btn><v-btn color="primary" :loading="mutating" :disabled="!pricingRuleDialog.model.trim() || !pricingRuleDialog.input_usd_per_million || !pricingRuleDialog.output_usd_per_million || !pricingRuleDialog.cache_read_usd_per_million || !pricingRuleDialog.cache_creation_usd_per_million || !pricingRuleDialog.reason.trim()" @click="savePricingRule"><Save :size="16" class="mr-2" />保存并重算</v-btn></v-card-actions>
+      </v-card>
+    </v-dialog>
 
     <v-dialog v-model="closeDialog.open" max-width="520"><v-card><v-card-title>关闭账期 {{ closeDialog.cycle?.name }}</v-card-title><v-card-text><v-alert type="error" variant="tonal" border="start" class="mb-4">关闭后价格版本、梯度规则和账单金额被冻结且不可修改。</v-alert><v-checkbox v-model="closeDialog.confirm_close" label="确认冻结账单" /><v-checkbox v-if="closeDialog.cycle?.waiver" v-model="closeDialog.confirm_waiver" label="确认数据质量说明" /></v-card-text><v-card-actions><v-spacer /><v-btn variant="text" @click="closeDialog.open = false">取消</v-btn><v-btn color="error" :loading="mutating" @click="closeCycle">关闭账期</v-btn></v-card-actions></v-card></v-dialog>
 

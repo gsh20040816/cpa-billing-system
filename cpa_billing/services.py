@@ -646,6 +646,174 @@ class BillingService:
             "rated_events": rated,
         }
 
+    def update_pricing_rule(
+        self,
+        model: str,
+        values: dict[str, Any],
+        version_name: str | None,
+        reason: str,
+        operator_type: str,
+        operator_id: str,
+    ) -> dict[str, Any]:
+        model = model.strip()
+        reason = reason.strip()
+        if not model:
+            raise BillingError("模型名称不能为空")
+        if len(model) > 160:
+            raise BillingError("模型名称过长")
+        if not reason:
+            raise BillingError("手动调整价格必须填写原因")
+        required_values = (
+            "input_nano_per_token", "output_nano_per_token",
+            "cache_read_nano_per_token", "cache_creation_nano_per_token",
+        )
+        for field in required_values:
+            value = values.get(field)
+            if not isinstance(value, int) or value < 0:
+                raise BillingError(f"{field} 必须是非负整数")
+        optional_values = (
+            "priority_input_nano_per_token", "priority_output_nano_per_token",
+            "priority_cache_read_nano_per_token", "priority_cache_creation_nano_per_token",
+            "flex_input_nano_per_token", "flex_output_nano_per_token",
+        )
+        for field in optional_values:
+            value = values.get(field)
+            if value is not None and (not isinstance(value, int) or value < 0):
+                raise BillingError(f"{field} 必须是非负整数或空值")
+        threshold = values.get("long_threshold_tokens")
+        if threshold is not None and (not isinstance(threshold, int) or threshold < 0):
+            raise BillingError("长上下文阈值必须是非负整数或空值")
+        for field in ("long_input_multiplier_ppm", "long_output_multiplier_ppm"):
+            value = values.get(field)
+            if not isinstance(value, int) or value < 0:
+                raise BillingError(f"{field} 必须是非负整数")
+
+        requested_name = (version_name or "").strip()
+        if requested_name and not re.fullmatch(r"[A-Za-z0-9._-]{1,80}", requested_name):
+            raise BillingError("价格版本名称只能包含字母、数字、点、下划线或短横线")
+
+        version_id: int
+        bounds: tuple[int | None, int | None]
+        cycle_names: list[str]
+        before_payload: dict[str, Any] | None = None
+        with self.db.session() as session:
+            active = session.scalar(
+                select(PricingVersion)
+                .where(PricingVersion.status == "active")
+                .order_by(PricingVersion.id.desc())
+            )
+            if active is None:
+                raise BillingError("没有 active 价格版本")
+            source_rules = list(session.scalars(
+                select(ModelPriceRule)
+                .where(ModelPriceRule.pricing_version_id == active.id)
+                .order_by(ModelPriceRule.model)
+            ))
+            target_rule = next((rule for rule in source_rules if rule.model == model), None)
+            if target_rule is not None:
+                before_payload = self._model_price_payload(target_rule)
+
+            base_name = requested_name or f"manual-{datetime.now(ZoneInfo(self.settings.timezone)):%Y%m%d-%H%M%S}"
+            candidate_name = base_name
+            suffix = 2
+            while session.scalar(select(PricingVersion).where(PricingVersion.name == candidate_name)) is not None:
+                if requested_name:
+                    raise BillingError("价格版本名称已存在")
+                candidate_name = f"{base_name}-{suffix}"
+                suffix += 1
+
+            for item in session.scalars(select(PricingVersion).where(PricingVersion.status == "active")):
+                item.status = "retired"
+            created = now_ms()
+            version = PricingVersion(
+                name=candidate_name,
+                status="active",
+                source="manual adjustment",
+                created_at_ms=created,
+                activated_at_ms=created,
+            )
+            session.add(version)
+            session.flush()
+
+            rule_fields = (
+                "input_nano_per_token", "output_nano_per_token",
+                "cache_read_nano_per_token", "cache_creation_nano_per_token",
+                "input_configured", "output_configured", "cache_read_configured", "cache_creation_configured",
+                "priority_input_nano_per_token", "priority_output_nano_per_token",
+                "priority_cache_read_nano_per_token", "priority_cache_creation_nano_per_token",
+                "flex_input_nano_per_token", "flex_output_nano_per_token",
+                "long_threshold_tokens", "long_input_multiplier_ppm", "long_output_multiplier_ppm", "raw_json",
+            )
+            for source_rule in source_rules:
+                copied = {field: getattr(source_rule, field) for field in rule_fields}
+                if source_rule.model == model:
+                    copied.update({field: values.get(field) for field in rule_fields if field in values})
+                    copied.update({
+                        "input_configured": True,
+                        "output_configured": True,
+                        "cache_read_configured": True,
+                        "cache_creation_configured": True,
+                        "raw_json": None,
+                    })
+                session.add(ModelPriceRule(pricing_version_id=version.id, model=source_rule.model, **copied))
+            if target_rule is None:
+                session.add(ModelPriceRule(
+                    pricing_version_id=version.id,
+                    model=model,
+                    input_nano_per_token=values["input_nano_per_token"],
+                    output_nano_per_token=values["output_nano_per_token"],
+                    cache_read_nano_per_token=values["cache_read_nano_per_token"],
+                    cache_creation_nano_per_token=values["cache_creation_nano_per_token"],
+                    input_configured=True,
+                    output_configured=True,
+                    cache_read_configured=True,
+                    cache_creation_configured=True,
+                    priority_input_nano_per_token=values.get("priority_input_nano_per_token"),
+                    priority_output_nano_per_token=values.get("priority_output_nano_per_token"),
+                    priority_cache_read_nano_per_token=values.get("priority_cache_read_nano_per_token"),
+                    priority_cache_creation_nano_per_token=values.get("priority_cache_creation_nano_per_token"),
+                    flex_input_nano_per_token=values.get("flex_input_nano_per_token"),
+                    flex_output_nano_per_token=values.get("flex_output_nano_per_token"),
+                    long_threshold_tokens=values.get("long_threshold_tokens"),
+                    long_input_multiplier_ppm=values["long_input_multiplier_ppm"],
+                    long_output_multiplier_ppm=values["long_output_multiplier_ppm"],
+                    raw_json=None,
+                ))
+
+            cycles = list(session.scalars(select(BillingCycle).where(BillingCycle.status != "closed")))
+            cycle_ids = [cycle.id for cycle in cycles]
+            for cycle in cycles:
+                cycle.pricing_version_id = version.id
+            self._invalidate_cycle_previews(session, cycle_ids)
+            cycle_names = [cycle.name for cycle in cycles]
+            bounds = (
+                min((cycle.start_at_ms for cycle in cycles), default=None),
+                max((cycle.end_at_ms for cycle in cycles), default=None),
+            )
+            session.add(AuditLog(
+                operator_type=operator_type,
+                operator_id=operator_id,
+                operation="pricing.manual_update",
+                target=f"{candidate_name}:{model}",
+                before_json=json.dumps(before_payload, ensure_ascii=False) if before_payload else None,
+                after_json=json.dumps({"version_id": version.id, "model": model, "values": values}, ensure_ascii=False),
+                reason=reason,
+                created_at_ms=created,
+            ))
+            version_id = version.id
+
+        rated = 0
+        if bounds[0] is not None and bounds[1] is not None:
+            rated = self._rate_until_current(version_id, bounds[0], bounds[1])
+        return {
+            "version_id": version_id,
+            "name": candidate_name,
+            "source": "manual adjustment",
+            "model": model,
+            "cycles": cycle_names,
+            "rated_events": rated,
+        }
+
     def _active_pricing_id(self, session: Any) -> int:
         version = session.scalar(select(PricingVersion).where(PricingVersion.status == "active").order_by(PricingVersion.id.desc()))
         if version is None:
@@ -2358,6 +2526,40 @@ class BillingService:
             "usd_per_million": format(per_million.normalize(), "f"),
         }
 
+    @classmethod
+    def _model_price_payload(cls, rule: ModelPriceRule) -> dict[str, Any]:
+        return {
+            "model": rule.model,
+            "default": {
+                "input": cls._price_rate(rule.input_nano_per_token),
+                "output": cls._price_rate(rule.output_nano_per_token),
+                "cache_read": cls._price_rate(rule.cache_read_nano_per_token),
+                "cache_creation": cls._price_rate(rule.cache_creation_nano_per_token),
+            },
+            "priority": {
+                "input": cls._price_rate(rule.priority_input_nano_per_token),
+                "output": cls._price_rate(rule.priority_output_nano_per_token),
+                "cache_read": cls._price_rate(rule.priority_cache_read_nano_per_token),
+                "cache_creation": cls._price_rate(rule.priority_cache_creation_nano_per_token),
+            },
+            "flex": {
+                "input": cls._price_rate(rule.flex_input_nano_per_token),
+                "output": cls._price_rate(rule.flex_output_nano_per_token),
+            },
+            "configured": {
+                "input": bool(rule.input_configured),
+                "output": bool(rule.output_configured),
+                "cache_read": bool(rule.cache_read_configured),
+                "cache_creation": bool(rule.cache_creation_configured),
+            },
+            "priority_multiplier_ppm": _priority_multiplier_ppm(rule.model),
+            "long_context": {
+                "threshold_tokens": rule.long_threshold_tokens,
+                "input_multiplier_ppm": rule.long_input_multiplier_ppm,
+                "output_multiplier_ppm": rule.long_output_multiplier_ppm,
+            },
+        }
+
     def pricing_snapshot(self, cycle_name: str | None = None) -> dict[str, Any]:
         with self.db.session() as session:
             active_version_id = self._active_pricing_id(session)
@@ -2412,37 +2614,7 @@ class BillingService:
             return {
                 "active_version": version_payload(active_version),
                 "selected_version": version_payload(version, unpriced),
-                "models": [{
-                    "model": rule.model,
-                    "default": {
-                        "input": self._price_rate(rule.input_nano_per_token),
-                        "output": self._price_rate(rule.output_nano_per_token),
-                        "cache_read": self._price_rate(rule.cache_read_nano_per_token),
-                        "cache_creation": self._price_rate(rule.cache_creation_nano_per_token),
-                    },
-                    "priority": {
-                        "input": self._price_rate(rule.priority_input_nano_per_token),
-                        "output": self._price_rate(rule.priority_output_nano_per_token),
-                        "cache_read": self._price_rate(rule.priority_cache_read_nano_per_token),
-                        "cache_creation": self._price_rate(rule.priority_cache_creation_nano_per_token),
-                    },
-                    "flex": {
-                        "input": self._price_rate(rule.flex_input_nano_per_token),
-                        "output": self._price_rate(rule.flex_output_nano_per_token),
-                    },
-                    "configured": {
-                        "input": bool(rule.input_configured),
-                        "output": bool(rule.output_configured),
-                        "cache_read": bool(rule.cache_read_configured),
-                        "cache_creation": bool(rule.cache_creation_configured),
-                    },
-                    "priority_multiplier_ppm": _priority_multiplier_ppm(rule.model),
-                    "long_context": {
-                        "threshold_tokens": rule.long_threshold_tokens,
-                        "input_multiplier_ppm": rule.long_input_multiplier_ppm,
-                        "output_multiplier_ppm": rule.long_output_multiplier_ppm,
-                    },
-                } for rule in rules],
+                "models": [self._model_price_payload(rule) for rule in rules],
                 "billing": {
                     "cycles": [{"name": item.name, "status": item.status} for item in cycles],
                     "cycle": None if cycle is None else {
@@ -3480,6 +3652,12 @@ class BillingService:
             gradient_map = {rule.id: rule for rule in gradients}
             pricing_versions = list(session.scalars(select(PricingVersion).order_by(PricingVersion.id.desc())))
             pricing_map = {version.id: version for version in pricing_versions}
+            active_pricing = next((version for version in pricing_versions if version.status == "active"), None)
+            active_pricing_rules = list(session.scalars(
+                select(ModelPriceRule)
+                .where(ModelPriceRule.pricing_version_id == active_pricing.id)
+                .order_by(ModelPriceRule.model)
+            )) if active_pricing else []
             pools = list(session.scalars(select(ResourcePool).order_by(ResourcePool.id)))
             assignments = list(session.scalars(
                 select(PoolAssignmentRule).order_by(PoolAssignmentRule.priority, PoolAssignmentRule.id)
@@ -3566,6 +3744,15 @@ class BillingService:
                 } for rule in gradients],
                 "pricing": [{"id": p.id, "name": p.name, "status": p.status, "source": p.source,
                              "activated_at": self._iso_timestamp(p.activated_at_ms)} for p in pricing_versions],
+                "pricing_rules": {
+                    "active_version": None if active_pricing is None else {
+                        "id": active_pricing.id,
+                        "name": active_pricing.name,
+                        "source": active_pricing.source,
+                        "activated_at": self._iso_timestamp(active_pricing.activated_at_ms),
+                    },
+                    "models": [self._model_price_payload(rule) for rule in active_pricing_rules],
+                },
                 "adjustments": [{"cycle": next((cycle.name for cycle in cycles if cycle.id == row.cycle_id), str(row.cycle_id)),
                                  "user_id": row.telegram_user_id, "amount": format_cents(row.amount_cents),
                                  "reason": row.reason, "operator": row.operator_user_id,
