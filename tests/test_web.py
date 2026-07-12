@@ -274,7 +274,7 @@ def test_admin_billing_rule_and_key_profile_endpoints(settings, monkeypatch) -> 
     assert key_sync.json()["current"] == 1
 
     monkeypatch.setattr(app.state.service, "sync_upstream_prices", lambda *args, **kwargs: {
-        "version_id": 2, "name": "upstream-test", "rated_events": 10,
+        "version_id": 2, "name": "upstream-test", "rated_events": 0, "rating_status": "queued",
     })
     pricing = client.post(
         "/api/admin/pricing-versions/sync",
@@ -282,7 +282,7 @@ def test_admin_billing_rule_and_key_profile_endpoints(settings, monkeypatch) -> 
         json={"name": "upstream-test", "reason": "refresh prices"},
     )
     assert pricing.status_code == 200
-    assert pricing.json()["rated_events"] == 10
+    assert pricing.json()["rating_status"] == "queued"
 
     manual = client.put(
         "/api/admin/pricing-rules",

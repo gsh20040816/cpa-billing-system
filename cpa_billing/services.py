@@ -322,6 +322,34 @@ class BillingService:
         self._quota_window_starts: dict[tuple[str, str], int] = {}
         self._quota_window_lock = threading.Lock()
         self._manual_usage_lock = threading.Lock()
+        self._db_write_thread_lock = threading.RLock()
+        self._db_write_lock_state = threading.local()
+        self._db_write_lock_path = settings.database_path.parent / "billing-write.lock"
+
+    @contextmanager
+    def _db_write_lock(self) -> Iterator[None]:
+        self._db_write_thread_lock.acquire()
+        depth = int(getattr(self._db_write_lock_state, "depth", 0))
+        handle = None
+        try:
+            if depth == 0:
+                self._db_write_lock_path.parent.mkdir(parents=True, exist_ok=True)
+                handle = self._db_write_lock_path.open("a+", encoding="ascii")
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                self._db_write_lock_state.handle = handle
+            self._db_write_lock_state.depth = depth + 1
+            yield
+        finally:
+            next_depth = int(getattr(self._db_write_lock_state, "depth", 1)) - 1
+            self._db_write_lock_state.depth = next_depth
+            if next_depth == 0:
+                lock_handle = getattr(self._db_write_lock_state, "handle", handle)
+                if lock_handle is not None:
+                    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+                    lock_handle.close()
+                if hasattr(self._db_write_lock_state, "handle"):
+                    del self._db_write_lock_state.handle
+            self._db_write_thread_lock.release()
 
     def bootstrap(self) -> None:
         self.db.initialize()
@@ -406,6 +434,10 @@ class BillingService:
         return len(pending)
 
     def sync_cpamp(self, batch_size: int = 1000) -> int:
+        with self._db_write_lock():
+            return self._sync_cpamp_locked(batch_size)
+
+    def _sync_cpamp_locked(self, batch_size: int = 1000) -> int:
         imported = 0
         with self._cpamp() as source_db:
             fingerprint = self._schema_fingerprint(source_db)
@@ -496,7 +528,7 @@ class BillingService:
         if not rows:
             raise BillingError("CPAMP model_prices is empty")
         created = now_ms()
-        with self.db.session() as session:
+        with self._db_write_lock(), self.db.session() as session:
             for active in session.scalars(select(PricingVersion).where(PricingVersion.status == "active")):
                 active.status = "retired"
             version = PricingVersion(
@@ -597,44 +629,34 @@ class BillingService:
         except httpx.HTTPError as exc:
             raise BillingDependencyError("CPAMP 上游价格同步失败") from exc
         version_name = (name or "").strip() or f"cpamp-{datetime.now(ZoneInfo(self.settings.timezone)):%Y%m%d-%H%M%S}"
-        version_id = self.import_cpamp_prices(
-            version_name,
-            operator_type=operator_type,
-            operator_id=operator_id,
-            allow_existing=False,
-        )
-        with self.db.session() as session:
-            cycles = list(session.scalars(select(BillingCycle).where(BillingCycle.status != "closed")))
-            cycle_ids = [cycle.id for cycle in cycles]
-            for cycle in cycles:
-                cycle.pricing_version_id = version_id
-            self._invalidate_cycle_previews(session, cycle_ids)
-            session.add(AuditLog(
+        with self._db_write_lock():
+            version_id = self.import_cpamp_prices(
+                version_name,
                 operator_type=operator_type,
                 operator_id=operator_id,
-                operation="pricing.sync",
-                target=version_name,
-                after_json=json.dumps({
-                    "version_id": version_id,
-                    "cycles": [cycle.name for cycle in cycles],
-                    "source": upstream.get("source"),
-                    "imported": upstream.get("imported"),
-                    "unmatched": upstream.get("unmatched") or [],
-                }),
-                reason=reason.strip(),
-                created_at_ms=now_ms(),
-            ))
-            bounds = (
-                min((cycle.start_at_ms for cycle in cycles), default=None),
-                max((cycle.end_at_ms for cycle in cycles), default=None),
+                allow_existing=False,
             )
-        rated = 0
-        if bounds[0] is not None and bounds[1] is not None:
-            while True:
-                batch = self.rate_events(limit=5000, version_id=version_id, start_ms=bounds[0], end_ms=bounds[1])
-                rated += batch
-                if batch == 0:
-                    break
+            with self.db.session() as session:
+                cycles = list(session.scalars(select(BillingCycle).where(BillingCycle.status != "closed")))
+                cycle_ids = [cycle.id for cycle in cycles]
+                for cycle in cycles:
+                    cycle.pricing_version_id = version_id
+                self._invalidate_cycle_previews(session, cycle_ids)
+                session.add(AuditLog(
+                    operator_type=operator_type,
+                    operator_id=operator_id,
+                    operation="pricing.sync",
+                    target=version_name,
+                    after_json=json.dumps({
+                        "version_id": version_id,
+                        "cycles": [cycle.name for cycle in cycles],
+                        "source": upstream.get("source"),
+                        "imported": upstream.get("imported"),
+                        "unmatched": upstream.get("unmatched") or [],
+                    }),
+                    reason=reason.strip(),
+                    created_at_ms=now_ms(),
+                ))
         return {
             "version_id": version_id,
             "name": version_name,
@@ -643,7 +665,8 @@ class BillingService:
             "imported": int(upstream.get("imported") or 0),
             "skipped": int(upstream.get("skipped") or 0),
             "unmatched": upstream.get("unmatched") or [],
-            "rated_events": rated,
+            "rated_events": 0,
+            "rating_status": "queued",
         }
 
     def update_pricing_rule(
@@ -693,10 +716,9 @@ class BillingService:
             raise BillingError("价格版本名称只能包含字母、数字、点、下划线或短横线")
 
         version_id: int
-        bounds: tuple[int | None, int | None]
         cycle_names: list[str]
         before_payload: dict[str, Any] | None = None
-        with self.db.session() as session:
+        with self._db_write_lock(), self.db.session() as session:
             active = session.scalar(
                 select(PricingVersion)
                 .where(PricingVersion.status == "active")
@@ -786,10 +808,6 @@ class BillingService:
                 cycle.pricing_version_id = version.id
             self._invalidate_cycle_previews(session, cycle_ids)
             cycle_names = [cycle.name for cycle in cycles]
-            bounds = (
-                min((cycle.start_at_ms for cycle in cycles), default=None),
-                max((cycle.end_at_ms for cycle in cycles), default=None),
-            )
             session.add(AuditLog(
                 operator_type=operator_type,
                 operator_id=operator_id,
@@ -801,17 +819,14 @@ class BillingService:
                 created_at_ms=created,
             ))
             version_id = version.id
-
-        rated = 0
-        if bounds[0] is not None and bounds[1] is not None:
-            rated = self._rate_until_current(version_id, bounds[0], bounds[1])
         return {
             "version_id": version_id,
             "name": candidate_name,
             "source": "manual adjustment",
             "model": model,
             "cycles": cycle_names,
-            "rated_events": rated,
+            "rated_events": 0,
+            "rating_status": "queued",
         }
 
     def _active_pricing_id(self, session: Any) -> int:
@@ -819,20 +834,6 @@ class BillingService:
         if version is None:
             raise BillingError("no active pricing version")
         return version.id
-
-    def _rate_until_current(self, version_id: int, start_ms: int | None = None,
-                            end_ms: int | None = None) -> int:
-        total = 0
-        while True:
-            rated = self.rate_events(
-                limit=5000,
-                version_id=version_id,
-                start_ms=start_ms,
-                end_ms=end_ms,
-            )
-            total += rated
-            if rated == 0:
-                return total
 
     def _owner_at(self, session: Any, key_hash: str | None, occurred_at_ms: int) -> int | None:
         if not key_hash:
@@ -932,8 +933,13 @@ class BillingService:
         }
         return cost, long_context, detail
 
-    def rate_events(self, limit: int = 2000, version_id: int | None = None,
+    def rate_events(self, limit: int = 500, version_id: int | None = None,
                     start_ms: int | None = None, end_ms: int | None = None) -> int:
+        with self._db_write_lock():
+            return self._rate_events_locked(limit, version_id, start_ms, end_ms)
+
+    def _rate_events_locked(self, limit: int = 500, version_id: int | None = None,
+                            start_ms: int | None = None, end_ms: int | None = None) -> int:
         rated = 0
         with self.db.session() as session:
             selected_version_id = version_id or self._active_pricing_id(session)
@@ -1690,15 +1696,6 @@ class BillingService:
                                  after_json=json.dumps({"waiver": cycle.data_quality_waiver}), created_at_ms=now_ms()))
 
     def dashboard(self, cycle_name: str | None = None) -> dict[str, Any]:
-        with self.db.session() as session:
-            selected = self._display_cycle(session, cycle_name)
-            selected_bounds = None if selected is None or selected.status == "closed" else (
-                selected.pricing_version_id,
-                selected.start_at_ms,
-                selected.end_at_ms,
-            )
-        if selected_bounds:
-            self._rate_until_current(*selected_bounds)
         with self.db.session() as session:
             cycle = self._display_cycle(session, cycle_name)
             cycles = list(session.scalars(select(BillingCycle).order_by(BillingCycle.start_at_ms.desc())))
@@ -2804,7 +2801,6 @@ class BillingService:
     def _hydrate_account_usage(self, accounts: list[dict[str, Any]], auth_by_account: dict[str, str]) -> None:
         with self.db.session() as session:
             version_id = self._active_pricing_id(session)
-        self._rate_until_current(version_id)
         current = now_ms()
         with self.db.session() as session:
             for account in accounts:
@@ -3378,7 +3374,6 @@ class BillingService:
         realtime_start_ms = now_ms() - int(window.removesuffix("m")) * 60_000
         with self.db.session() as session:
             version_id = self._active_pricing_id(session)
-        self._rate_until_current(version_id, min(range_start_ms, realtime_start_ms), max(range_end_ms, now_ms()))
         overview = self._local_overview(version_id, range_start_ms, range_end_ms)
         realtime = self._local_realtime(version_id, window)
         keeper: dict[str, Any]

@@ -28,7 +28,7 @@ def worker(service: BillingService, interval: float, once: bool) -> None:
     while True:
         try:
             imported = service.sync_cpamp()
-            rated = service.rate_events()
+            rated = service.rate_events(limit=500)
             logging.info("worker imported=%s rated=%s", imported, rated)
         except Exception:
             logging.exception("usage sync iteration failed")

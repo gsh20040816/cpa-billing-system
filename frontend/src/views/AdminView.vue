@@ -269,7 +269,7 @@ async function syncPricing() {
   const result = await mutate('/api/admin/pricing-versions/sync', {
     name: pricingDialog.name || null,
     reason: pricingDialog.reason,
-  }, '上游价格已同步，未关闭账期已重新计价')
+  }, '上游价格已同步，未关闭账期已提交后台重算')
   if (result) pricingDialog.open = false
 }
 
@@ -339,7 +339,7 @@ async function savePricingRule() {
     long_context_output_multiplier: pricingRuleDialog.long_context_output_multiplier,
     version_name: optional(pricingRuleDialog.version_name),
     reason: pricingRuleDialog.reason,
-  }, '手动计费规则已保存，未关闭账期已重新计价', 'PUT')
+  }, '手动计费规则已保存，未关闭账期已提交后台重算', 'PUT')
   if (result) pricingRuleDialog.open = false
 }
 
@@ -644,7 +644,7 @@ onMounted(load)
                 <h2>模型计费规则</h2>
                 <p>
                   当前 active 版本：{{ admin.pricing_rules?.active_version?.name || '-' }} ·
-                  手动保存会创建新版本并重算未关闭账期，关闭账期保持不变
+                  手动保存会创建新版本并提交未关闭账期后台重算，关闭账期保持不变
                 </p>
               </div>
               <div class="d-flex align-center ga-2 flex-wrap">
@@ -656,7 +656,7 @@ onMounted(load)
             </div>
             <div class="section-band__body section-band__body--flush">
               <v-alert type="info" variant="tonal" class="ma-4">
-                上游同步仍可使用。同步会创建新的上游价格版本，并覆盖当前未关闭账期采用的手动价格；历史版本和已关闭账期不会被修改。
+                上游同步仍可使用。同步会创建新的上游价格版本，并提交未关闭账期后台重算；历史版本和已关闭账期不会被修改。
               </v-alert>
               <v-data-table
                 :headers="[
@@ -731,14 +731,14 @@ onMounted(load)
 
     <v-dialog v-model="keyProfileDialog.open" max-width="560"><v-card><v-card-title>未绑定 Key 计费档案</v-card-title><v-card-text><v-alert type="info" variant="tonal" class="mb-4"><span class="mono">{{ keyProfileDialog.key?.masked }}</span><br>预估付费 = 本地等效成本 USD × 倍率，结果计入人民币资源池抵扣。</v-alert><v-text-field v-model="keyProfileDialog.name" label="显示别名" /><v-text-field v-model="keyProfileDialog.multiplier" label="倍率（人民币 / USD）" type="number" min="0" step="0.01" /><v-textarea v-model="keyProfileDialog.reason" label="修改原因（选填）" rows="2" /></v-card-text><v-card-actions><v-spacer /><v-btn variant="text" @click="keyProfileDialog.open = false">取消</v-btn><v-btn color="primary" :loading="mutating" @click="saveKeyProfile"><Save :size="16" class="mr-2" />保存</v-btn></v-card-actions></v-card></v-dialog>
 
-    <v-dialog v-model="pricingDialog.open" max-width="560"><v-card><v-card-title>同步上游模型价格</v-card-title><v-card-text><v-alert type="warning" variant="tonal" class="mb-4">同步会创建新的上游价格版本，并重新计价所有未关闭账期的请求。手动调整会被本次同步覆盖，关闭账期保持不变。</v-alert><v-text-field v-model="pricingDialog.name" label="版本名称（留空自动生成）" /><v-textarea v-model="pricingDialog.reason" label="同步原因" rows="2" /></v-card-text><v-card-actions><v-spacer /><v-btn variant="text" @click="pricingDialog.open = false">取消</v-btn><v-btn color="secondary" :loading="mutating" @click="syncPricing"><CloudDownload :size="16" class="mr-2" />同步并重算</v-btn></v-card-actions></v-card></v-dialog>
+    <v-dialog v-model="pricingDialog.open" max-width="560"><v-card><v-card-title>同步上游模型价格</v-card-title><v-card-text><v-alert type="warning" variant="tonal" class="mb-4">同步会创建新的上游价格版本，并提交未关闭账期后台重算。手动调整会被本次同步覆盖，关闭账期保持不变。</v-alert><v-text-field v-model="pricingDialog.name" label="版本名称（留空自动生成）" /><v-textarea v-model="pricingDialog.reason" label="同步原因" rows="2" /></v-card-text><v-card-actions><v-spacer /><v-btn variant="text" @click="pricingDialog.open = false">取消</v-btn><v-btn color="secondary" :loading="mutating" @click="syncPricing"><CloudDownload :size="16" class="mr-2" />同步并后台重算</v-btn></v-card-actions></v-card></v-dialog>
 
     <v-dialog v-model="pricingRuleDialog.open" max-width="980">
       <v-card>
         <v-card-title>{{ pricingRuleDialog.editing_model ? '手动调整模型计费规则' : '新增模型计费规则' }}</v-card-title>
         <v-card-text>
           <v-alert type="warning" variant="tonal" class="mb-4">
-            单位均为 USD / 1M tokens。保存会生成新的 active 版本，并重算未关闭账期；价格版本名称留空时自动生成。
+            单位均为 USD / 1M tokens。保存会生成新的 active 版本，并提交未关闭账期后台重算；价格版本名称留空时自动生成。
           </v-alert>
           <div class="dialog-grid">
             <v-text-field v-model="pricingRuleDialog.model" label="模型名称" :disabled="Boolean(pricingRuleDialog.editing_model)" class="dialog-wide" />
@@ -759,7 +759,7 @@ onMounted(load)
             <v-textarea v-model="pricingRuleDialog.reason" label="变更原因" rows="2" class="dialog-wide" />
           </div>
         </v-card-text>
-        <v-card-actions><v-spacer /><v-btn variant="text" @click="pricingRuleDialog.open = false">取消</v-btn><v-btn color="primary" :loading="mutating" :disabled="!pricingRuleDialog.model.trim() || !pricingRuleDialog.input_usd_per_million || !pricingRuleDialog.output_usd_per_million || !pricingRuleDialog.cache_read_usd_per_million || !pricingRuleDialog.cache_creation_usd_per_million || !pricingRuleDialog.reason.trim()" @click="savePricingRule"><Save :size="16" class="mr-2" />保存并重算</v-btn></v-card-actions>
+        <v-card-actions><v-spacer /><v-btn variant="text" @click="pricingRuleDialog.open = false">取消</v-btn><v-btn color="primary" :loading="mutating" :disabled="!pricingRuleDialog.model.trim() || !pricingRuleDialog.input_usd_per_million || !pricingRuleDialog.output_usd_per_million || !pricingRuleDialog.cache_read_usd_per_million || !pricingRuleDialog.cache_creation_usd_per_million || !pricingRuleDialog.reason.trim()" @click="savePricingRule"><Save :size="16" class="mr-2" />保存并后台重算</v-btn></v-card-actions>
       </v-card>
     </v-dialog>
 

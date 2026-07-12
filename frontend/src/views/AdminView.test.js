@@ -268,7 +268,7 @@ describe('AdminView manual usage', () => {
     await input.setValue('2')
     await reason.setValue('手动调价测试')
     await dialog.findAllComponents({ name: 'VBtn' })
-      .find((item) => item.text().includes('保存并重算')).trigger('click')
+      .find((item) => item.text().includes('保存并后台重算')).trigger('click')
     await flushPromises()
 
     expect(api).toHaveBeenCalledWith('/api/admin/pricing-rules', expect.objectContaining({

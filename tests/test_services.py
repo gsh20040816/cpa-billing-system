@@ -963,7 +963,9 @@ def test_upstream_price_sync_rerates_open_cycles_only(service, settings, monkeyp
 
     monkeypatch.setattr(service.cpamp, "sync_model_prices", sync_prices)
     result = service.sync_upstream_prices("synced-prices", "web-admin", "admin-token", "test refresh")
-    assert result["rated_events"] >= 1
+    assert result["rated_events"] == 0
+    assert result["rating_status"] == "queued"
+    assert service.rate_events(limit=500) >= 1
     assert Decimal(service.dashboard("open-price")["totals"]["actual"].replace(",", "")) > Decimal(before_open.replace(",", ""))
     assert service.dashboard("closed-price")["totals"]["actual"] == before_closed
     assert service.request_history(2)["items"][0]["cost"] == before_closed
@@ -1009,7 +1011,9 @@ def test_manual_price_update_creates_version_and_rerates_open_cycles_only(servic
     )
 
     assert result["name"] == "manual-prices"
-    assert result["rated_events"] >= 1
+    assert result["rated_events"] == 0
+    assert result["rating_status"] == "queued"
+    assert service.rate_events(limit=500) >= 1
     assert Decimal(service.dashboard("open-manual-price")["totals"]["actual"].replace(",", "")) > Decimal(before_open.replace(",", ""))
     assert service.dashboard("closed-manual-price")["totals"]["actual"] == before_closed
     with service.db.session() as session:
@@ -1017,6 +1021,35 @@ def test_manual_price_update_creates_version_and_rerates_open_cycles_only(servic
         closed = session.scalar(select(BillingCycle).where(BillingCycle.name == "closed-manual-price"))
         assert session.get(PricingVersion, opened.pricing_version_id).name == "manual-prices"
         assert session.get(PricingVersion, closed.pricing_version_id).name == "cpamp-initial"
+
+
+def test_read_pages_do_not_rate_events(service, settings, monkeypatch) -> None:
+    current = int(time.time() * 1000)
+    zone = ZoneInfo(settings.timezone)
+    start = (datetime.fromtimestamp(current / 1000, zone) - timedelta(hours=1)).isoformat()
+    end = (datetime.fromtimestamp(current / 1000, zone) + timedelta(hours=1)).isoformat()
+    service.create_cycle("pending-pages", start, end, 0)
+    insert_event(settings, "pending-key", current - 1000, event_hash="pending-page-event")
+    service.sync_cpamp()
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("read pages must not synchronously rate events")
+
+    monkeypatch.setattr(service, "_rate_until_current", fail_if_called, raising=False)
+
+    dashboard = service.dashboard("pending-pages")
+    assert dashboard["cycle"]["unpriced_events"] == 1
+
+    class FakeKeeper:
+        def status_snapshot(self, range_name, window, start, end):
+            return {"status": {}, "version": {}, "update": {}}
+
+        def accounts_snapshot(self):
+            return {"identities": [], "quota": {"items": []}, "inspection": {}}
+
+    monkeypatch.setattr(service, "keeper", FakeKeeper())
+    assert service.site_status("24h", "15m")["keeper"]["overview"]["summary"]["unpriced_events"] == 1
+    assert service.accounts_snapshot()["accounts"] == []
 
 
 def test_site_status_usage_is_calculated_locally(service, settings, monkeypatch) -> None:
