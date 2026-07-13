@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ArrowUpRight, RefreshCw } from '@lucide/vue'
 import { api } from '../api'
@@ -7,6 +7,7 @@ import { VChart } from '../charts'
 import MetricRail from '../components/MetricRail.vue'
 import LoadingState from '../components/LoadingState.vue'
 import PageHeader from '../components/PageHeader.vue'
+import { useAutoRefresh } from '../lib/autoRefresh'
 import { dateTime, money, number } from '../lib/format'
 import { toQuery } from '../lib/query'
 
@@ -15,7 +16,6 @@ const loading = ref(true)
 const error = ref('')
 const data = ref(null)
 const cycle = ref('')
-let refreshTimer = null
 
 const headers = [
   { title: '#', key: 'rank', width: 58, sortable: false },
@@ -72,16 +72,11 @@ function openUser(item) {
   if (item.telegram_user_id !== null) router.push(`/users/${item.telegram_user_id}${toQuery({ cycle: data.value?.cycle?.name })}`)
 }
 
+const autoRefresh = useAutoRefresh((silent) => load(silent), { interval: 15_000 })
+
 watch(cycle, (value, previous) => {
-  if (previous && value !== previous) load()
+  if (previous && value !== previous) autoRefresh.refresh()
 })
-onMounted(load)
-onMounted(() => {
-  refreshTimer = window.setInterval(() => {
-    if (!document.hidden) load(true)
-  }, 15000)
-})
-onBeforeUnmount(() => window.clearInterval(refreshTimer))
 </script>
 
 <template>
@@ -109,13 +104,13 @@ onBeforeUnmount(() => window.clearInterval(refreshTimer))
         </v-select>
         <v-tooltip text="刷新账务总览">
           <template #activator="{ props }">
-            <v-btn v-bind="props" icon variant="outlined" :loading="loading" @click="load"><RefreshCw :size="18" /></v-btn>
+            <v-btn v-bind="props" icon variant="outlined" :loading="loading" @click="autoRefresh.refresh()"><RefreshCw :size="18" /></v-btn>
           </template>
         </v-tooltip>
       </template>
     </PageHeader>
 
-    <LoadingState :loading="loading" :error="error" :empty="!data?.cycle" empty-text="尚未创建账期" @retry="load">
+    <LoadingState :loading="loading" :error="error" :empty="!data?.cycle" empty-text="尚未创建账期" @retry="autoRefresh.refresh()">
       <v-alert v-if="data?.cycle?.waiver" type="warning" variant="tonal" border="start" class="mb-4">
         <strong>数据质量说明：</strong>{{ data.cycle.waiver }}
       </v-alert>

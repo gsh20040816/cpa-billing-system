@@ -1,9 +1,10 @@
 <script setup>
-import { computed, inject, onMounted, reactive, ref } from 'vue'
+import { computed, inject, reactive, ref } from 'vue'
 import { Copy, KeyRound, Pencil, Plus, RefreshCw, RotateCw, Trash2 } from '@lucide/vue'
 import { api, setCsrf } from '../api'
 import LoadingState from '../components/LoadingState.vue'
 import PageHeader from '../components/PageHeader.vue'
+import { useAutoRefresh } from '../lib/autoRefresh'
 import { dateTime } from '../lib/format'
 
 const userSession = inject('userSession')
@@ -40,8 +41,8 @@ function notify(text, color = 'success') {
   snackbar.show = true
 }
 
-async function load() {
-  loading.value = true
+async function load(silent = false) {
+  if (!silent) loading.value = true
   error.value = ''
   try {
     if (managementSession.value) {
@@ -53,7 +54,7 @@ async function load() {
   } catch (exc) {
     error.value = exc.message
   } finally {
-    loading.value = false
+    if (!silent) loading.value = false
   }
 }
 
@@ -91,7 +92,7 @@ async function executeAction() {
       window.location.assign('/login')
       return
     }
-    await load()
+    await autoRefresh.refresh()
     if (userSession?.value && result.new_key_id && actionDialog.target?.id === userSession.value.login_key_id) {
       userSession.value.login_key_id = result.new_key_id
     }
@@ -115,7 +116,7 @@ async function rename() {
     await api(`/api/me/keys/${renameDialog.key.id}`, { method: 'PATCH', body: { name: renameDialog.name } })
     renameDialog.open = false
     notify('名称已更新')
-    await load()
+    await autoRefresh.refresh()
   } catch (exc) {
     notify(exc.message, 'error')
   } finally {
@@ -132,7 +133,7 @@ async function copyKey() {
   }
 }
 
-onMounted(load)
+const autoRefresh = useAutoRefresh((silent) => load(silent), { interval: 60_000 })
 </script>
 
 <template>
@@ -140,14 +141,14 @@ onMounted(load)
       <PageHeader :title="managementSession ? '全部 API Key' : '我的 API Key'" :subtitle="managementSession ? '全站 Key 只读视图，完整 Key 永不显示' : '新增、命名、重置与吊销'">
         <template #actions>
         <v-btn v-if="!managementSession" color="primary" @click="openAction('add')"><Plus :size="17" class="mr-2" />新增 Key</v-btn>
-        <v-tooltip text="刷新 Key 列表"><template #activator="{ props }"><v-btn v-bind="props" icon variant="outlined" :loading="loading" @click="load"><RefreshCw :size="18" /></v-btn></template></v-tooltip>
+        <v-tooltip text="刷新 Key 列表"><template #activator="{ props }"><v-btn v-bind="props" icon variant="outlined" :loading="loading" @click="autoRefresh.refresh()"><RefreshCw :size="18" /></v-btn></template></v-tooltip>
       </template>
     </PageHeader>
 
     <section class="section-band">
       <div class="section-band__head"><div><h2>API Keys</h2><p>完整 Key 仅在创建或重置成功后显示一次</p></div></div>
       <div class="section-band__body section-band__body--flush">
-        <LoadingState :loading="loading" :error="error" :empty="!data?.keys?.length" empty-text="暂无 API Key" @retry="load">
+        <LoadingState :loading="loading" :error="error" :empty="!data?.keys?.length" empty-text="暂无 API Key" @retry="autoRefresh.refresh()">
           <v-data-table :headers="headers" :items="data?.keys || []" :items-per-page="25">
             <template #item.masked="{ item }">
               <div class="d-flex align-center ga-2"><KeyRound :size="16" class="data-muted" /><span class="mono">{{ item.masked }}</span></div>

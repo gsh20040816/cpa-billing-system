@@ -576,6 +576,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/me/usage/events")
     def api_request_history(
+        range_name: str = Query("24h", alias="range"),
+        cycle: str | None = Query(None),
+        hours: int | None = Query(None, ge=1),
         start: str | None = Query(None),
         end: str | None = Query(None),
         model: list[str] = Query(default=[]),
@@ -605,6 +608,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return service.request_history(
             None if all_users else auth.user.telegram_user_id,
             all_users=all_users,
+            range_name=range_name,
+            cycle_name=cycle,
+            custom_hours=hours,
             start=start,
             end=end,
             models=model,
@@ -636,6 +642,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/admin/usage/events")
     def api_admin_request_history(
+        range_name: str = Query("24h", alias="range"),
+        cycle: str | None = Query(None),
+        hours: int | None = Query(None, ge=1),
         start: str | None = Query(None),
         end: str | None = Query(None),
         model: list[str] = Query(default=[]),
@@ -664,6 +673,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return service.request_history(
             None,
             all_users=True,
+            range_name=range_name,
+            cycle_name=cycle,
+            custom_hours=hours,
             start=start,
             end=end,
             models=model,
@@ -695,10 +707,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         start: str | None = Query(None),
         end: str | None = Query(None),
         cycle: str | None = Query(None),
+        hours: int | None = Query(None, ge=1),
         sort: str = Query("cost"),
         _: tuple[Any, Any] = Depends(current),
     ) -> dict[str, Any]:
-        return service.ranking_snapshot(range_name, start, end, cycle, sort)
+        return service.ranking_snapshot(range_name, start, end, cycle, sort, hours)
 
     @app.get("/api/pricing")
     def api_pricing(cycle: str | None = Query(None), _: tuple[Any, Any] = Depends(current)) -> dict[str, Any]:
@@ -714,9 +727,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         window: str = Query("60m"),
         start: str | None = Query(None),
         end: str | None = Query(None),
+        cycle: str | None = Query(None),
+        hours: int | None = Query(None, ge=1),
         _: tuple[Any, Any] = Depends(current),
     ) -> dict[str, Any]:
-        return await asyncio.to_thread(service.site_status, range_name, window, start, end)
+        return await asyncio.to_thread(service.site_status, range_name, window, start, end, cycle, hours)
 
     @app.get("/api/site/accounts")
     async def api_accounts(_: tuple[Any, Any] = Depends(current)) -> dict[str, Any]:

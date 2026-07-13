@@ -560,6 +560,31 @@ def test_admin_request_history_includes_all_users_and_unowned_events(service, se
     assert options["models"] == ["gpt-test"]
 
 
+def test_usage_ranges_share_today_cycle_and_integer_hours_semantics(service) -> None:
+    create_owner(service, "range-key", 2, 0)
+    current = int(time.time() * 1000)
+    zone = ZoneInfo(service.settings.timezone)
+    cycle_start = datetime.fromtimestamp((current - 3_600_000) / 1000, zone).isoformat()
+    cycle_end = datetime.fromtimestamp((current + 3_600_000) / 1000, zone).isoformat()
+    service.create_cycle("range-cycle", cycle_start, cycle_end, 0)
+
+    history = service.request_history(2, range_name="custom", custom_hours=2)
+    assert history["pagination"]["total"] == 0
+    ranking = service.ranking_snapshot("cycle", cycle_name="range-cycle")
+    assert ranking["range"]["cycle"] == "range-cycle"
+
+    with service.db.session() as session:
+        start, end, selected = service._resolve_time_range(session, "24h")
+        assert selected is None
+        assert end - start == 24 * 60 * 60 * 1000
+        today_start, today_end, _ = service._resolve_time_range(session, "today")
+        yesterday_start, yesterday_end, _ = service._resolve_time_range(session, "yesterday")
+        assert today_start < today_end
+        assert yesterday_start < yesterday_end == today_start
+        with pytest.raises(BillingError, match="正整数小时"):
+            service._resolve_time_range(session, "custom", custom_hours=1.5)
+
+
 def test_web_key_actions_execute_directly_and_invalidate_target_sessions(service, settings, monkeypatch) -> None:
     raw_keys = ["current-key", "target-key"]
 

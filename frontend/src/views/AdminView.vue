@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, reactive, ref } from 'vue'
 import {
   Activity, ArrowDown, ArrowUp, CloudDownload, Edit3, KeyRound, Plus, RefreshCw, ShieldCheck,
   Save, Scale, Search, Shuffle, Trash2, XCircle,
@@ -8,6 +8,7 @@ import { api } from '../api'
 import LoadingState from '../components/LoadingState.vue'
 import MetricRail from '../components/MetricRail.vue'
 import PageHeader from '../components/PageHeader.vue'
+import { useAutoRefresh } from '../lib/autoRefresh'
 import { dateTime, money, number } from '../lib/format'
 
 const loading = ref(true)
@@ -86,15 +87,15 @@ function notify(text, color = 'success') {
   snackbar.show = true
 }
 
-async function load() {
-  loading.value = true
+async function load(silent = false) {
+  if (!silent) loading.value = true
   error.value = ''
   try {
     data.value = await api('/api/admin/snapshot', { admin: true })
   } catch (exc) {
     error.value = exc.message
   } finally {
-    loading.value = false
+    if (!silent) loading.value = false
   }
 }
 
@@ -103,7 +104,7 @@ async function mutate(path, body, success, method = 'POST') {
   try {
     const result = await api(path, { admin: true, body, method })
     notify(success)
-    await load()
+    await autoRefresh.refresh()
     return result || true
   } catch (exc) {
     notify(exc.message, 'error')
@@ -464,7 +465,7 @@ async function saveKeyProfile() {
   if (result) keyProfileDialog.open = false
 }
 
-onMounted(load)
+const autoRefresh = useAutoRefresh((silent) => load(silent), { interval: 30_000 })
 </script>
 
 <template>
@@ -473,13 +474,13 @@ onMounted(load)
       <template #actions>
         <v-tooltip text="刷新管理数据">
           <template #activator="{ props }">
-            <v-btn v-bind="props" icon variant="outlined" :loading="loading" @click="load"><RefreshCw :size="18" /></v-btn>
+            <v-btn v-bind="props" icon variant="outlined" :loading="loading" @click="autoRefresh.refresh()"><RefreshCw :size="18" /></v-btn>
           </template>
         </v-tooltip>
       </template>
     </PageHeader>
 
-    <LoadingState :loading="loading" :error="error" :empty="!data" @retry="load">
+    <LoadingState :loading="loading" :error="error" :empty="!data" @retry="autoRefresh.refresh()">
       <v-alert v-if="!reconciliation.ok" type="error" variant="tonal" border="start" class="mb-4">
         对账完整性异常：Dead letter {{ number(reconciliation.dead_letters) }}，镜像多出 {{ number(reconciliation.raw_excess) }}，未分池 {{ number(reconciliation.unassigned_events) }}。
       </v-alert>

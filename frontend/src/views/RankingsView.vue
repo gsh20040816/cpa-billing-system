@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, reactive, ref, watch } from 'vue'
 import { RefreshCw } from '@lucide/vue'
 import { useRouter } from 'vue-router'
 import { api } from '../api'
@@ -7,24 +7,23 @@ import { VChart } from '../charts'
 import LoadingState from '../components/LoadingState.vue'
 import MetricRail from '../components/MetricRail.vue'
 import PageHeader from '../components/PageHeader.vue'
+import TimeRangeSelector from '../components/TimeRangeSelector.vue'
+import { useAutoRefresh } from '../lib/autoRefresh'
 import { createDebouncedTask } from '../lib/debounce'
 import { money, number, percent } from '../lib/format'
 import { toQuery } from '../lib/query'
+import { DEFAULT_TIME_RANGE, isTimeRangeReady, timeRangeQuery } from '../lib/timeRange'
 
 const router = useRouter()
 const loading = ref(true)
 const error = ref('')
 const data = ref(null)
-const filters = reactive({ range: '24h', start: '', end: '', cycle: '', sort: 'cost' })
+const filters = reactive({ ...DEFAULT_TIME_RANGE, sort: 'cost' })
+const timeRangeModel = computed({
+  get: () => filters,
+  set: (value) => Object.assign(filters, value),
+})
 let requestSequence = 0
-const ranges = [
-  { title: '24h', value: '24h' },
-  { title: '7d', value: '7d' },
-  { title: '30d', value: '30d' },
-  { title: '当前账期', value: 'cycle' },
-  { title: '全部', value: 'all' },
-  { title: '自定义', value: 'custom' },
-]
 const sorts = [
   { title: '等效成本', value: 'cost' },
   { title: 'Tokens', value: 'tokens' },
@@ -83,18 +82,15 @@ const chartOption = computed(() => {
 
 function rankingParams() {
   return {
-    range: filters.range,
-    start: filters.range === 'custom' ? filters.start : null,
-    end: filters.range === 'custom' ? filters.end : null,
-    cycle: filters.range === 'cycle' ? filters.cycle : null,
+    ...timeRangeQuery(filters),
     sort: filters.sort,
   }
 }
 
-async function load() {
-  if (filters.range === 'custom' && (!filters.start || !filters.end)) return
+async function load(silent = false) {
+  if (!isTimeRangeReady(filters)) return
   const sequence = ++requestSequence
-  loading.value = true
+  if (!silent) loading.value = true
   error.value = ''
   try {
     const result = await api(`/api/rankings${toQuery(rankingParams())}`)
@@ -102,19 +98,18 @@ async function load() {
   } catch (exc) {
     if (sequence === requestSequence) error.value = exc.message
   } finally {
-    if (sequence === requestSequence) loading.value = false
+    if (sequence === requestSequence && !silent) loading.value = false
   }
 }
 
-const autoReload = createDebouncedTask(load, 180)
+const autoRefresh = useAutoRefresh((silent) => load(silent))
+const filterReload = createDebouncedTask(() => autoRefresh.refresh(), 180)
 
 watch(
-  () => [filters.range, filters.start, filters.end, filters.cycle, filters.sort],
-  () => autoReload.schedule(),
+  () => [filters.range, filters.cycle, filters.custom_hours, filters.sort],
+  () => filterReload.schedule(),
 )
-
-onMounted(load)
-onBeforeUnmount(autoReload.cancel)
+onBeforeUnmount(filterReload.cancel)
 </script>
 
 <template>
@@ -123,23 +118,17 @@ onBeforeUnmount(autoReload.cancel)
       <template #actions>
         <v-select v-model="filters.sort" :items="sorts" label="排序指标" style="width: 160px" />
         <v-tooltip text="刷新排行">
-          <template #activator="{ props }"><v-btn v-bind="props" icon variant="outlined" :loading="loading" @click="autoReload.run()"><RefreshCw :size="18" /></v-btn></template>
+          <template #activator="{ props }"><v-btn v-bind="props" icon variant="outlined" :loading="loading" @click="autoRefresh.refresh()"><RefreshCw :size="18" /></v-btn></template>
         </v-tooltip>
       </template>
     </PageHeader>
 
     <div class="d-flex align-center ga-3 flex-wrap mb-4">
-      <v-btn-toggle v-model="filters.range" mandatory divided color="primary" density="compact">
-        <v-btn v-for="item in ranges" :key="item.value" :value="item.value" size="small">{{ item.title }}</v-btn>
-      </v-btn-toggle>
-      <template v-if="filters.range === 'custom'">
-        <v-text-field v-model="filters.start" type="date" label="开始" style="max-width: 180px" />
-        <v-text-field v-model="filters.end" type="date" label="结束" style="max-width: 180px" />
-      </template>
+      <TimeRangeSelector v-model="timeRangeModel" />
       <v-progress-circular v-if="loading && data" indeterminate color="primary" size="20" width="2" aria-label="正在更新排行" />
     </div>
 
-    <LoadingState :loading="loading && !data" :error="error" :empty="!data" @retry="autoReload.run()">
+    <LoadingState :loading="loading && !data" :error="error" :empty="!data" @retry="autoRefresh.refresh()">
       <MetricRail :items="metrics" :columns="5" />
       <section class="section-band">
         <div class="section-band__head"><div><h2>排行分布</h2><p>前 12 个聚合项</p></div></div>

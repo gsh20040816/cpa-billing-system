@@ -1,13 +1,16 @@
 <script setup>
-import { computed, inject, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import { computed, inject, nextTick, onBeforeUnmount, reactive, ref, watch } from 'vue'
 import { Filter, RefreshCw, RotateCcw, Search, SlidersHorizontal } from '@lucide/vue'
 import { api } from '../api'
 import LoadingState from '../components/LoadingState.vue'
 import MetricRail from '../components/MetricRail.vue'
 import PageHeader from '../components/PageHeader.vue'
+import TimeRangeSelector from '../components/TimeRangeSelector.vue'
+import { useAutoRefresh } from '../lib/autoRefresh'
 import { createDebouncedTask } from '../lib/debounce'
 import { dateTime, duration, money, number } from '../lib/format'
 import { activeFilterCount, toQuery } from '../lib/query'
+import { DEFAULT_TIME_RANGE, isTimeRangeReady, timeRangeQuery } from '../lib/timeRange'
 
 const props = defineProps({
   admin: { type: Boolean, default: false },
@@ -28,11 +31,15 @@ let optionsSequence = 0
 let suppressFilterReload = false
 
 const defaults = {
-  start: '', end: '', model: [], tier: '', provider: '', status: 'all', key_id: '', failure_code: '',
+  ...DEFAULT_TIME_RANGE, model: [], tier: '', provider: '', status: 'all', key_id: '', failure_code: '',
   min_tokens: '', max_tokens: '', min_cost: '', max_cost: '', min_latency: '', max_latency: '',
   min_ttft: '', max_ttft: '', min_tps: '', max_tps: '', long_context: '', q: '', sort: 'time_desc', page: 1, page_size: 50,
 }
 const filters = reactive({ ...defaults })
+const timeRangeModel = computed({
+  get: () => filters,
+  set: (value) => Object.assign(filters, value),
+})
 
 const statusItems = [
   { title: '全部', value: 'all' },
@@ -72,7 +79,7 @@ const headers = computed(() => [
   { title: '状态', key: 'status', width: 94 },
 ])
 
-const filterCount = computed(() => activeFilterCount(filters, ['page', 'page_size', 'sort']))
+const filterCount = computed(() => activeFilterCount(filters, ['page', 'page_size', 'sort', 'range', 'cycle', 'custom_hours']))
 const detailOpen = computed({
   get: () => detail.value !== null,
   set: (open) => {
@@ -92,8 +99,13 @@ const metrics = computed(() => {
 })
 
 function requestParams() {
+  const { range, cycle, hours } = timeRangeQuery(filters)
   return {
     ...filters,
+    range,
+    cycle,
+    hours,
+    custom_hours: null,
     key_id: filters.key_id || null,
     failure_code: filters.failure_code === '' ? null : filters.failure_code,
     long_context: filters.long_context === '' ? null : filters.long_context,
@@ -102,7 +114,7 @@ function requestParams() {
 
 const filterSignature = computed(() => {
   const { page: _page, ...params } = requestParams()
-  return JSON.stringify(params)
+  return JSON.stringify({ ...params, custom_hours: filters.custom_hours })
 })
 
 async function loadOptions() {
@@ -111,14 +123,16 @@ async function loadOptions() {
   try {
     const result = await api(`${endpointBase.value}/filter-options`, apiOptions.value)
     if (sequence === optionsSequence) options.value = result
+  } catch (exc) {
+    if (sequence === optionsSequence) error.value = exc.message
   } finally {
     if (sequence === optionsSequence) optionsLoading.value = false
   }
 }
 
-async function load() {
+async function load(silent = false) {
   const sequence = ++requestSequence
-  loading.value = true
+  if (!silent) loading.value = true
   error.value = ''
   try {
     const result = await api(`${endpointBase.value}/events${toQuery(requestParams())}`, apiOptions.value)
@@ -126,7 +140,7 @@ async function load() {
   } catch (exc) {
     if (sequence === requestSequence) error.value = exc.message
   } finally {
-    if (sequence === requestSequence) loading.value = false
+    if (sequence === requestSequence && !silent) loading.value = false
   }
 }
 
@@ -138,15 +152,13 @@ function reloadFromFirstPage() {
   return load()
 }
 
-const autoReload = createDebouncedTask(reloadFromFirstPage, 300)
-
 function refreshCurrentPage() {
-  autoReload.cancel()
-  return load()
+  filterReload.cancel()
+  return autoRefresh.refresh()
 }
 
 function refreshFromFirstPage() {
-  return autoReload.run()
+  return filterReload.run()
 }
 
 function resetFilters() {
@@ -163,27 +175,31 @@ function ownerLabel(owner) {
 }
 
 async function reloadForScope() {
-  autoReload.cancel()
+  filterReload.cancel()
   suppressFilterReload = true
   Object.assign(filters, defaults)
   await nextTick()
   suppressFilterReload = false
   detail.value = null
   data.value = null
-  await Promise.all([loadOptions(), load()])
+  await autoRefresh.refresh()
 }
 
-onMounted(async () => {
-  await Promise.all([loadOptions(), load()])
-})
+async function loadAll(silent = false) {
+  await Promise.all([loadOptions(), load(silent)])
+}
+
+const autoRefresh = useAutoRefresh(loadAll)
+const filterReload = createDebouncedTask(reloadFromFirstPage, 300)
+
 watch(filterSignature, () => {
-  if (!suppressFilterReload) autoReload.schedule()
+  if (!suppressFilterReload) filterReload.schedule()
 })
 watch(globalScope, reloadForScope)
 watch(() => filters.page, () => {
-  if (!suppressFilterReload) load()
+  if (!suppressFilterReload) autoRefresh.refresh()
 })
-onBeforeUnmount(autoReload.cancel)
+onBeforeUnmount(filterReload.cancel)
 </script>
 
 <template>
@@ -212,12 +228,11 @@ onBeforeUnmount(autoReload.cancel)
           <v-btn size="small" variant="text" @click="resetFilters"><RotateCcw :size="16" class="mr-2" />重置</v-btn>
         </div>
         <div class="section-band__body">
+          <div class="mb-4"><TimeRangeSelector v-model="timeRangeModel" /></div>
           <div class="filter-grid filter-grid--six">
             <v-text-field v-model="filters.q" label="Request ID / 模型" clearable @keyup.enter="refreshFromFirstPage">
               <template #prepend-inner><Search :size="16" /></template>
             </v-text-field>
-            <v-text-field v-model="filters.start" label="开始时间" type="datetime-local" />
-            <v-text-field v-model="filters.end" label="结束时间" type="datetime-local" />
             <v-autocomplete v-model="filters.model" :items="options.models" label="模型" multiple chips clearable :loading="optionsLoading" />
             <v-select v-model="filters.tier" :items="options.tiers" label="Service Tier" clearable />
             <v-select v-model="filters.provider" :items="options.providers" label="Provider" clearable />

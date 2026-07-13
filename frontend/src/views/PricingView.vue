@@ -1,9 +1,10 @@
 <script setup>
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { RefreshCw, Search } from '@lucide/vue'
 import { api } from '../api'
 import LoadingState from '../components/LoadingState.vue'
 import PageHeader from '../components/PageHeader.vue'
+import { useAutoRefresh } from '../lib/autoRefresh'
 import { dateTime, money, number } from '../lib/format'
 import { effectiveRate, priceSourceText } from '../lib/pricing'
 import { toQuery } from '../lib/query'
@@ -52,8 +53,8 @@ const models = computed(() => {
   }))
 })
 
-async function load() {
-  loading.value = true
+async function load(silent = false) {
+  if (!silent) loading.value = true
   error.value = ''
   try {
     data.value = await api(`/api/pricing${toQuery({ cycle: cycle.value })}`)
@@ -61,12 +62,13 @@ async function load() {
   } catch (exc) {
     error.value = exc.message
   } finally {
-    loading.value = false
+    if (!silent) loading.value = false
   }
 }
 
-watch(cycle, (value, previous) => { if (previous && value !== previous) load() })
-onMounted(load)
+const autoRefresh = useAutoRefresh((silent) => load(silent), { interval: 60_000 })
+
+watch(cycle, (value, previous) => { if (previous && value !== previous) autoRefresh.refresh() })
 </script>
 
 <template>
@@ -74,11 +76,11 @@ onMounted(load)
     <PageHeader title="费用规则" :subtitle="data?.selected_version ? `${data.selected_version.name} · ${data.selected_version.source}` : '当前价格版本'">
       <template #actions>
         <v-select v-if="data?.billing?.cycles?.length" v-model="cycle" :items="data.billing.cycles" item-title="name" item-value="name" label="账期" style="width: 210px" />
-        <v-tooltip text="刷新费用规则"><template #activator="{ props }"><v-btn v-bind="props" icon variant="outlined" :loading="loading" @click="load"><RefreshCw :size="18" /></v-btn></template></v-tooltip>
+        <v-tooltip text="刷新费用规则"><template #activator="{ props }"><v-btn v-bind="props" icon variant="outlined" :loading="loading" @click="autoRefresh.refresh()"><RefreshCw :size="18" /></v-btn></template></v-tooltip>
       </template>
     </PageHeader>
 
-    <LoadingState :loading="loading" :error="error" :empty="!data" @retry="load">
+    <LoadingState :loading="loading" :error="error" :empty="!data" @retry="autoRefresh.refresh()">
       <v-alert v-if="data?.selected_version?.unpriced_events" type="warning" variant="tonal" border="start" class="mb-4">
         所选账期有 {{ number(data.selected_version.unpriced_events) }} 条未计价事件。
       </v-alert>

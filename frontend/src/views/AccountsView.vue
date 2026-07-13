@@ -1,10 +1,11 @@
 <script setup>
-import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
+import { computed, onBeforeUnmount, reactive, ref } from 'vue'
 import { RefreshCw, ServerCog } from '@lucide/vue'
 import { api } from '../api'
 import LoadingState from '../components/LoadingState.vue'
 import MetricRail from '../components/MetricRail.vue'
 import PageHeader from '../components/PageHeader.vue'
+import { useAutoRefresh } from '../lib/autoRefresh'
 import { dateTime, money, number, percent, quotaTone } from '../lib/format'
 
 const loading = ref(true)
@@ -53,15 +54,15 @@ function availableQuotaUnavailableText(estimate) {
   return '上游使用率无效，暂无法估计'
 }
 
-async function load() {
-  loading.value = true
+async function load(silent = false) {
+  if (!silent) loading.value = true
   error.value = ''
   try {
     data.value = await api('/api/site/accounts')
   } catch (exc) {
     error.value = exc.message
   } finally {
-    loading.value = false
+    if (!silent) loading.value = false
   }
 }
 
@@ -82,7 +83,7 @@ async function poll(accountId) {
       const result = await api(`/api/site/accounts/${encodeURIComponent(accountId)}/refresh`)
       if (result.status === 'completed') {
         notify('额度已刷新')
-        await load()
+        await autoRefresh.refresh()
         return
       }
       if (result.status === 'failed') {
@@ -119,7 +120,7 @@ async function refreshAccounts(accountIds = []) {
   }
 }
 
-onMounted(load)
+const autoRefresh = useAutoRefresh((silent) => load(silent), { interval: 60_000 })
 onBeforeUnmount(() => timers.forEach((id) => window.clearTimeout(id)))
 </script>
 
@@ -133,7 +134,7 @@ onBeforeUnmount(() => timers.forEach((id) => window.clearTimeout(id)))
       </template>
     </PageHeader>
 
-    <LoadingState :loading="loading" :error="error" :empty="!data?.accounts?.length" empty-text="Keeper 暂无上游账号" @retry="load">
+    <LoadingState :loading="loading" :error="error" :empty="!data?.accounts?.length" empty-text="Keeper 暂无上游账号" @retry="autoRefresh.refresh()">
       <MetricRail :items="metrics" :columns="6" />
       <div class="account-list">
         <v-card v-for="account in data?.accounts || []" :key="account.id" border class="account-card">

@@ -1654,6 +1654,53 @@ class BillingService:
             parsed += timedelta(days=1)
         return int(parsed.timestamp() * 1000)
 
+    def _resolve_time_range(
+        self,
+        session: Any,
+        range_name: str,
+        start: str | None = None,
+        end: str | None = None,
+        cycle_name: str | None = None,
+        custom_hours: int | None = None,
+    ) -> tuple[int | None, int | None, BillingCycle | None]:
+        allowed_ranges = {"today", "yesterday", "24h", "7d", "30d", "cycle", "custom", "all"}
+        if range_name not in allowed_ranges:
+            raise BillingError("时间范围无效")
+
+        current = now_ms()
+        zone = ZoneInfo(self.settings.timezone)
+        current_dt = datetime.fromtimestamp(current / 1000, zone)
+        today = current_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+        selected_cycle: BillingCycle | None = None
+        if range_name == "today":
+            return int(today.timestamp() * 1000), current, None
+        if range_name == "yesterday":
+            return int((today - timedelta(days=1)).timestamp() * 1000), int(today.timestamp() * 1000), None
+        if range_name == "24h":
+            return current - 24 * 60 * 60 * 1000, current, None
+        if range_name == "7d":
+            return current - 7 * 24 * 60 * 60 * 1000, current, None
+        if range_name == "30d":
+            return current - 30 * 24 * 60 * 60 * 1000, current, None
+        if range_name == "all":
+            return None, current, None
+        if range_name == "cycle":
+            selected_cycle = self._display_cycle(session, cycle_name)
+            if selected_cycle is None:
+                raise BillingError("尚未创建账期")
+            return selected_cycle.start_at_ms, selected_cycle.end_at_ms, selected_cycle
+        if custom_hours is not None:
+            if isinstance(custom_hours, bool) or not isinstance(custom_hours, int) or custom_hours <= 0:
+                raise BillingError("自定义时间范围必须是正整数小时")
+            return current - custom_hours * 60 * 60 * 1000, current, None
+
+        # Keep the service-level date bounds for existing internal callers; the web UI uses hours.
+        start_ms = self._parse_filter_time(start)
+        end_ms = self._parse_filter_time(end, end_of_date=True)
+        if start_ms is None or end_ms is None or start_ms >= end_ms:
+            raise BillingError("自定义时间范围需要有效的开始和结束时间")
+        return start_ms, end_ms, selected_cycle
+
     @staticmethod
     def _usd_filter_to_nano(value: str | None) -> int | None:
         if value is None or not value.strip():
@@ -2266,6 +2313,9 @@ class BillingService:
         user_id: int | None,
         *,
         all_users: bool = False,
+        range_name: str | None = None,
+        cycle_name: str | None = None,
+        custom_hours: int | None = None,
         start: str | None = None,
         end: str | None = None,
         models: list[str] | None = None,
@@ -2303,10 +2353,6 @@ class BillingService:
                 raise BillingError(f"{label} 筛选值必须是非负数")
             if minimum is not None and maximum is not None and minimum > maximum:
                 raise BillingError(f"{label} 筛选下限不能大于上限")
-        since_ms = self._parse_filter_time(start)
-        until_ms = self._parse_filter_time(end, end_of_date=True)
-        if since_ms is not None and until_ms is not None and since_ms >= until_ms:
-            raise BillingError("结束时间必须晚于开始时间")
         min_cost_nano = self._usd_filter_to_nano(min_cost)
         max_cost_nano = self._usd_filter_to_nano(max_cost)
         if min_cost_nano is not None and max_cost_nano is not None and min_cost_nano > max_cost_nano:
@@ -2318,6 +2364,20 @@ class BillingService:
             raise BillingError("TPS 筛选下限不能大于上限")
 
         with self.db.session() as session:
+            if range_name is None:
+                since_ms = self._parse_filter_time(start)
+                until_ms = self._parse_filter_time(end, end_of_date=True)
+                if since_ms is not None and until_ms is not None and since_ms >= until_ms:
+                    raise BillingError("结束时间必须晚于开始时间")
+            else:
+                since_ms, until_ms, _ = self._resolve_time_range(
+                    session,
+                    range_name,
+                    start=start,
+                    end=end,
+                    cycle_name=cycle_name,
+                    custom_hours=custom_hours,
+                )
             active_version_id = self._active_pricing_id(session)
             cycle_pricing_version = (
                 select(BillingCycle.pricing_version_id)
@@ -2532,38 +2592,18 @@ class BillingService:
             }
 
     def ranking_snapshot(self, range_name: str, start: str | None = None, end: str | None = None,
-                         cycle_name: str | None = None, sort: str = "cost") -> dict[str, Any]:
-        current = now_ms()
-        since_ms: int | None
-        until_ms: int | None
-        selected_cycle: BillingCycle | None = None
+                         cycle_name: str | None = None, sort: str = "cost",
+                         custom_hours: int | None = None) -> dict[str, Any]:
         with self.db.session() as session:
-            if range_name == "24h":
-                since_ms, until_ms = current - 86_400_000, current
-                version_id = self._active_pricing_id(session)
-            elif range_name == "7d":
-                since_ms, until_ms = current - 7 * 86_400_000, current
-                version_id = self._active_pricing_id(session)
-            elif range_name == "30d":
-                since_ms, until_ms = current - 30 * 86_400_000, current
-                version_id = self._active_pricing_id(session)
-            elif range_name == "all":
-                since_ms, until_ms = None, current
-                version_id = self._active_pricing_id(session)
-            elif range_name == "cycle":
-                selected_cycle = self._display_cycle(session, cycle_name)
-                if selected_cycle is None:
-                    raise BillingError("尚未创建账期")
-                since_ms, until_ms = selected_cycle.start_at_ms, selected_cycle.end_at_ms
-                version_id = selected_cycle.pricing_version_id
-            elif range_name == "custom":
-                since_ms = self._parse_filter_time(start)
-                until_ms = self._parse_filter_time(end, end_of_date=True)
-                if since_ms is None or until_ms is None or since_ms >= until_ms:
-                    raise BillingError("自定义排行需要有效的开始和结束时间")
-                version_id = self._active_pricing_id(session)
-            else:
-                raise BillingError("排行时间范围无效")
+            since_ms, until_ms, selected_cycle = self._resolve_time_range(
+                session,
+                range_name,
+                start=start,
+                end=end,
+                cycle_name=cycle_name,
+                custom_hours=custom_hours,
+            )
+            version_id = selected_cycle.pricing_version_id if selected_cycle else self._active_pricing_id(session)
 
             ranking_source = (
                 RawUsageEvent.__table__
@@ -3299,30 +3339,6 @@ class BillingService:
             "reset_credits_available": credits,
         }
 
-    def _status_range_bounds(self, range_name: str, start: str | None, end: str | None) -> tuple[int, int]:
-        zone = ZoneInfo(self.settings.timezone)
-        current = datetime.now(zone)
-        today = current.replace(hour=0, minute=0, second=0, microsecond=0)
-        if range_name == "today":
-            start_dt, end_dt = today, current
-        elif range_name == "yesterday":
-            start_dt, end_dt = today - timedelta(days=1), today
-        elif range_name == "24h":
-            start_dt, end_dt = current - timedelta(hours=24), current
-        elif range_name == "7d":
-            start_dt, end_dt = current - timedelta(days=7), current
-        elif range_name == "30d":
-            start_dt, end_dt = current - timedelta(days=30), current
-        elif range_name == "custom":
-            start_ms = self._parse_filter_time(start)
-            end_ms = self._parse_filter_time(end, end_of_date=True)
-            if start_ms is None or end_ms is None or start_ms >= end_ms:
-                raise BillingError("自定义状态范围需要有效的开始和结束时间")
-            return start_ms, end_ms
-        else:
-            raise BillingError("全站状态时间范围无效")
-        return int(start_dt.timestamp() * 1000), int(end_dt.timestamp() * 1000)
-
     @staticmethod
     def _percentile(values: list[int], percentile: float) -> int | None:
         if not values:
@@ -3645,19 +3661,23 @@ class BillingService:
         }
 
     def site_status(self, range_name: str = "24h", window: str = "60m",
-                    start: str | None = None, end: str | None = None) -> dict[str, Any]:
-        allowed_ranges = {"today", "yesterday", "24h", "7d", "30d", "custom"}
+                    start: str | None = None, end: str | None = None,
+                    cycle_name: str | None = None, custom_hours: int | None = None) -> dict[str, Any]:
         allowed_windows = {"15m", "30m", "45m", "60m"}
-        if range_name not in allowed_ranges:
-            raise BillingError("全站状态时间范围无效")
         if window not in allowed_windows:
             raise BillingError("实时窗口无效")
-        if range_name == "custom" and (not start or not end):
-            raise BillingError("自定义状态范围需要开始和结束时间")
-        range_start_ms, range_end_ms = self._status_range_bounds(range_name, start, end)
-        realtime_start_ms = now_ms() - int(window.removesuffix("m")) * 60_000
         with self.db.session() as session:
-            version_id = self._active_pricing_id(session)
+            range_start_ms, range_end_ms, selected_cycle = self._resolve_time_range(
+                session,
+                range_name,
+                start=start,
+                end=end,
+                cycle_name=cycle_name,
+                custom_hours=custom_hours,
+            )
+            if range_start_ms is None or range_end_ms is None:
+                raise BillingError("全站状态需要有限的时间范围")
+            version_id = selected_cycle.pricing_version_id if selected_cycle else self._active_pricing_id(session)
         overview = self._local_overview(version_id, range_start_ms, range_end_ms)
         realtime = self._local_realtime(version_id, window)
         keeper: dict[str, Any]

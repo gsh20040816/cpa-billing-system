@@ -1,12 +1,12 @@
 <script setup>
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, ref } from 'vue'
 import { RefreshCw } from '@lucide/vue'
 import { api } from '../api'
 import { dateTime, number } from '../lib/format'
+import { useAutoRefresh } from '../lib/autoRefresh'
 
 const data = ref(null)
 const loading = ref(false)
-let timer = null
 
 const tone = (ok, warn = false) => (ok ? (warn ? 'warn' : 'ok') : 'error')
 
@@ -61,14 +61,7 @@ async function load() {
   }
 }
 
-onMounted(() => {
-  load()
-  timer = window.setInterval(() => {
-    if (document.visibilityState === 'visible') load()
-  }, 60000)
-})
-
-onBeforeUnmount(() => window.clearInterval(timer))
+const autoRefresh = useAutoRefresh(() => load(), { interval: 60_000 })
 </script>
 
 <template>
@@ -84,7 +77,7 @@ onBeforeUnmount(() => window.clearInterval(timer))
     </div>
     <v-tooltip text="刷新系统状态" location="bottom">
       <template #activator="{ props }">
-        <v-btn v-bind="props" class="pulse-refresh" icon size="x-small" variant="text" :loading="loading" @click="load">
+        <v-btn v-bind="props" class="pulse-refresh" icon size="x-small" variant="text" :loading="loading" @click="autoRefresh.refresh()">
           <RefreshCw :size="15" />
         </v-btn>
       </template>
