@@ -76,6 +76,10 @@ DEFAULT_TIERS = [
 
 LOGGER = logging.getLogger(__name__)
 
+QUOTA_MODEL_ALIASES = {
+    "codex_bengalfox": "gpt-5.3-codex-spark",
+}
+
 
 class BillingError(RuntimeError):
     pass
@@ -2859,6 +2863,25 @@ class BillingService:
         credits = payload.get("rateLimitResetCreditsAvailableCount")
         return rows, int(credits) if isinstance(credits, (int, float)) else None
 
+    @staticmethod
+    def _quota_model_info(quota: dict[str, Any]) -> tuple[str | None, str | None]:
+        metric = _model_slug(str(quota.get("metric") or ""))
+        labels = {
+            "gpt-5.3-codex-spark": "GPT-5.3-Codex-Spark",
+        }
+        key = str(quota.get("key") or "")
+        prefix = "additional_rate_limits."
+        if key.lower().startswith(prefix):
+            suffix = key[len(prefix):]
+            match = re.match(r"^(.+?)\.(?:primary|secondary)_window$", suffix, re.IGNORECASE)
+            if match:
+                key_model = match.group(1).strip()
+                canonical = _model_slug(key_model)
+                if canonical:
+                    return canonical, labels.get(canonical, key_model)
+        canonical = QUOTA_MODEL_ALIASES.get(metric, metric) or None
+        return canonical, labels.get(canonical or "", canonical)
+
     def _external_timestamp_ms(self, value: Any) -> int | None:
         if value is None or value == "":
             return None
@@ -2986,11 +3009,14 @@ class BillingService:
                 if not auth_index:
                     continue
                 account["usage"] = self._account_usage_aggregate(session, version_id, auth_index)
-                additional_metrics = tuple(sorted({
-                    _model_slug(str(quota.get("metric")))
-                    for quota in account["quota"]
-                    if quota.get("scope") == "additional" and quota.get("metric")
-                }))
+                additional_metric_labels: dict[str, str] = {}
+                for quota in account["quota"]:
+                    if quota.get("scope") != "additional":
+                        continue
+                    metric, label = self._quota_model_info(quota)
+                    if metric:
+                        additional_metric_labels.setdefault(metric, label or metric)
+                additional_metrics = tuple(sorted(additional_metric_labels))
                 for quota in account["quota"]:
                     window_seconds = int(quota.get("window_seconds") or 0)
                     reset_at_ms = self._external_timestamp_ms(quota.get("reset_at"))
@@ -3007,7 +3033,7 @@ class BillingService:
                         candidate_start_ms,
                     )
                     is_additional = quota.get("scope") == "additional"
-                    model_metric = _model_slug(str(quota["metric"])) if is_additional and quota.get("metric") else None
+                    model_metric, model_label = self._quota_model_info(quota) if is_additional else (None, None)
                     excluded_model_metrics = () if is_additional else additional_metrics
                     usage = self._account_usage_aggregate(
                         session,
@@ -3019,11 +3045,19 @@ class BillingService:
                         excluded_model_metrics=excluded_model_metrics,
                     )
                     if model_metric:
-                        quota["usage_filter"] = {"mode": "only_model", "models": [model_metric]}
+                        quota["usage_filter"] = {
+                            "mode": "only_model",
+                            "models": [model_metric],
+                            "display_models": [model_label or model_metric],
+                        }
                     elif additional_metrics:
-                        quota["usage_filter"] = {"mode": "all_except_models", "models": list(additional_metrics)}
+                        quota["usage_filter"] = {
+                            "mode": "all_except_models",
+                            "models": list(additional_metrics),
+                            "display_models": [additional_metric_labels[metric] for metric in additional_metrics],
+                        }
                     else:
-                        quota["usage_filter"] = {"mode": "all_models", "models": []}
+                        quota["usage_filter"] = {"mode": "all_models", "models": [], "display_models": []}
                     quota["window_started_at"] = self._iso_timestamp(window_start_ms)
                     quota["window_ended_at"] = self._iso_timestamp(window_end_ms)
                     quota["window_usage_requests"] = usage["requests"]

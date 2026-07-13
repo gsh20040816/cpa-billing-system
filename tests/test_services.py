@@ -688,7 +688,7 @@ def test_keeper_accounts_are_sanitized_and_refresh_uses_public_account_ids(servi
                     "key": "additional_rate_limits.gpt-5.3-codex-spark.primary_window",
                     "label": "GPT-5.3-Codex-Spark 5h",
                     "scope": "additional",
-                    "metric": "gpt-5.3-codex-spark",
+                    "metric": "codex_bengalfox",
                     "usedPercent": 7,
                     "window": {"seconds": 18000},
                     "resetAt": reset_at,
@@ -761,6 +761,7 @@ def test_keeper_accounts_are_sanitized_and_refresh_uses_public_account_ids(servi
     assert primary["usage_filter"] == {
         "mode": "all_except_models",
         "models": ["gpt-5.3-codex-spark"],
+        "display_models": ["GPT-5.3-Codex-Spark"],
     }
     assert primary["window_started_at"] == datetime.fromtimestamp(
         (current - 4 * 3_600_000) / 1000,
@@ -773,6 +774,7 @@ def test_keeper_accounts_are_sanitized_and_refresh_uses_public_account_ids(servi
     assert additional["usage_filter"] == {
         "mode": "only_model",
         "models": ["gpt-5.3-codex-spark"],
+        "display_models": ["GPT-5.3-Codex-Spark"],
     }
 
     raw["quota"]["items"][0]["quota"]["quota"][0]["resetAt"] = datetime.fromtimestamp(
