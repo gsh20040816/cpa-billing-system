@@ -9,7 +9,7 @@ export const TIME_RANGE_ITEMS = [
 ]
 
 export const DEFAULT_TIME_RANGE = {
-  range: '24h',
+  range: 'today',
   cycle: '',
   custom_hours: '',
 }

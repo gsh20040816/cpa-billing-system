@@ -576,7 +576,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/me/usage/events")
     def api_request_history(
-        range_name: str = Query("24h", alias="range"),
+        range_name: str = Query("today", alias="range"),
         cycle: str | None = Query(None),
         hours: int | None = Query(None, ge=1),
         start: str | None = Query(None),
@@ -642,7 +642,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/admin/usage/events")
     def api_admin_request_history(
-        range_name: str = Query("24h", alias="range"),
+        range_name: str = Query("today", alias="range"),
         cycle: str | None = Query(None),
         hours: int | None = Query(None, ge=1),
         start: str | None = Query(None),
@@ -703,7 +703,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/rankings")
     def api_rankings(
-        range_name: str = Query("24h", alias="range"),
+        range_name: str = Query("today", alias="range"),
         start: str | None = Query(None),
         end: str | None = Query(None),
         cycle: str | None = Query(None),
@@ -723,7 +723,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/site/status")
     async def api_site_status(
-        range_name: str = Query("24h", alias="range"),
+        range_name: str = Query("today", alias="range"),
         window: str = Query("60m"),
         start: str | None = Query(None),
         end: str | None = Query(None),

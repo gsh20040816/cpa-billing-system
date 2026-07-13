@@ -3660,7 +3660,7 @@ class BillingService:
             },
         }
 
-    def site_status(self, range_name: str = "24h", window: str = "60m",
+    def site_status(self, range_name: str = "today", window: str = "60m",
                     start: str | None = None, end: str | None = None,
                     cycle_name: str | None = None, custom_hours: int | None = None) -> dict[str, Any]:
         allowed_windows = {"15m", "30m", "45m", "60m"}

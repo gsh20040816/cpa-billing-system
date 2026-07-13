@@ -8,6 +8,11 @@ import {
 } from './timeRange'
 
 describe('time range helpers', () => {
+  it('uses today as the default range', () => {
+    expect(DEFAULT_TIME_RANGE.range).toBe('today')
+    expect(timeRangeQuery(DEFAULT_TIME_RANGE)).toEqual({ range: 'today', cycle: null, hours: null })
+  })
+
   it('serializes the shared fixed ranges', () => {
     expect(timeRangeQuery({ ...DEFAULT_TIME_RANGE, range: 'today' })).toEqual({ range: 'today', cycle: null, hours: null })
     expect(timeRangeQuery({ ...DEFAULT_TIME_RANGE, range: 'cycle', cycle: '2026-07' })).toEqual({ range: 'cycle', cycle: '2026-07', hours: null })
