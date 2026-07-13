@@ -256,6 +256,7 @@ onBeforeUnmount(filterReload.cancel)
 .status-panel span, .status-panel small { display: block; color: #66706d; }
 .status-panel strong { display: block; margin: 5px 0; font-size: 1.1rem; }
 .chart-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; align-items: stretch; }
+.chart-grid > .section-band + .section-band { margin-top: 0; }
 .chart-panel { display: flex; flex-direction: column; min-width: 0; }
 .chart-panel__body { flex: 1; min-height: 352px; display: flex; }
 .chart-panel__body .chart { flex: 1; min-height: 320px; }
