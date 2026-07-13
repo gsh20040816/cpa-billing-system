@@ -4,9 +4,10 @@ import asyncio
 import html
 import json
 import logging
+import re
 import tempfile
 from datetime import datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -25,6 +26,9 @@ from .services import BillingError, BillingService, DEFAULT_TIERS
 
 LOG = logging.getLogger("cpa_billing.bot")
 MEMBER = {"creator", "administrator", "member"}
+COMMAND_MESSAGE_LIMIT = 3900
+MEMBERSHIP_CACHE_TTL_MS = 5 * 60_000
+HTML_TAG = re.compile(r"<(/?)([A-Za-z][A-Za-z0-9-]*)(?:\s[^>]*)?>")
 
 
 def esc(value: Any) -> str:
@@ -41,6 +45,110 @@ def compact(value: int) -> str:
     return str(value)
 
 
+def telegram_length(value: str) -> int:
+    return len(value.encode("utf-16-le")) // 2
+
+
+def html_chunks(text: str, limit: int = COMMAND_MESSAGE_LIMIT) -> list[str]:
+    """Split Telegram HTML messages without leaving an unclosed tag in a chunk."""
+    if telegram_length(text) <= limit:
+        return [text]
+
+    chunks: list[str] = []
+    current = ""
+    open_tags: list[tuple[str, str]] = []
+
+    def closing_tags() -> str:
+        return "".join(f"</{name}>" for name, _ in reversed(open_tags))
+
+    def flush() -> None:
+        nonlocal current
+        if not current:
+            return
+        chunks.append(current + closing_tags())
+        current = "".join(tag for _, tag in open_tags)
+
+    def next_tags(part: str) -> list[tuple[str, str]]:
+        updated = list(open_tags)
+        match = HTML_TAG.fullmatch(part)
+        if not match:
+            return updated
+        closing, name = match.groups()
+        name = name.lower()
+        if closing:
+            for index in range(len(updated) - 1, -1, -1):
+                if updated[index][0] == name:
+                    del updated[index]
+                    break
+        elif not part.endswith("/>"):
+            updated.append((name, part))
+        return updated
+
+    def take_prefix(value: str, available: int) -> str:
+        used = 0
+        index = 0
+        for index, character in enumerate(value):
+            units = telegram_length(character)
+            if used + units > available:
+                break
+            used += units
+        else:
+            return value
+        return value[:index]
+
+    for part in re.split(r"(<(?:/?)[A-Za-z][^>]*>)", text):
+        if not part:
+            continue
+        match = HTML_TAG.fullmatch(part)
+        if match:
+            updated = next_tags(part)
+            closing_after = "".join(f"</{name}>" for name, _ in reversed(updated))
+            if current and telegram_length(current) + telegram_length(part) + telegram_length(closing_after) > limit:
+                flush()
+            current += part
+            open_tags[:] = updated
+            continue
+
+        remaining = part
+        while remaining:
+            available = limit - telegram_length(current) - telegram_length(closing_tags())
+            if available <= 0:
+                flush()
+                continue
+            prefix = take_prefix(remaining, available)
+            if not prefix:
+                flush()
+                continue
+            current += prefix
+            remaining = remaining[len(prefix):]
+            if remaining:
+                flush()
+
+    if current:
+        flush()
+    return chunks or [""]
+
+
+def parse_user_id(args: str) -> int | None:
+    token = args.strip().split(maxsplit=1)
+    if not token:
+        return None
+    try:
+        return int(token[0])
+    except ValueError:
+        return None
+
+
+def parse_fixed_cost_cents(value: str) -> int | None:
+    try:
+        amount = Decimal(value.strip())
+    except (InvalidOperation, ValueError):
+        return None
+    if not amount.is_finite() or amount < 0:
+        return None
+    return int((amount * 100).to_integral_value(rounding=ROUND_HALF_UP))
+
+
 class TelegramAPI:
     def __init__(self, token: str) -> None:
         self.url = f"https://api.telegram.org/bot{token}"
@@ -55,16 +163,22 @@ class TelegramAPI:
         return data.get("result")
 
     async def send(self, chat_id: int, text: str) -> None:
-        for offset in range(0, max(1, len(text)), 3900):
-            await self.call("sendMessage", {"chat_id": chat_id, "text": text[offset:offset + 3900], "parse_mode": "HTML", "disable_web_page_preview": True})
+        for chunk in html_chunks(text):
+            await self.call("sendMessage", {"chat_id": chat_id, "text": chunk, "parse_mode": "HTML", "disable_web_page_preview": True})
 
     async def member(self, chat_id: int, user_id: int) -> dict[str, Any]:
         return dict(await self.call("getChatMember", {"chat_id": chat_id, "user_id": user_id}) or {})
+
+    async def me(self) -> dict[str, Any]:
+        return dict(await self.call("getMe") or {})
 
     async def photo(self, chat_id: int, path: Path, caption: str) -> None:
         with path.open("rb") as image:
             response = await self.client.post(f"{self.url}/sendPhoto", data={"chat_id": str(chat_id), "caption": caption}, files={"photo": image})
         response.raise_for_status()
+        data = response.json()
+        if not data.get("ok"):
+            raise BillingError("Telegram sendPhoto failed")
 
 
 class BillingBot:
@@ -73,10 +187,13 @@ class BillingBot:
             raise RuntimeError("TG_BOT_TOKEN is required")
         self.settings, self.service = settings, service
         self.tg = TelegramAPI(settings.telegram_token)
+        self.bot_username: str | None = None
 
     async def eligible(self, user: dict[str, Any]) -> bool:
         user_id = int(user["id"])
-        if user_id in self.settings.admin_user_ids or self.service.user_is_eligible_cached(user_id):
+        if user_id in self.settings.admin_user_ids:
+            return True
+        if await asyncio.to_thread(self.service.user_is_eligible_cached, user_id, MEMBERSHIP_CACHE_TTL_MS):
             return True
         for group_id in self.settings.allowed_group_ids:
             try:
@@ -93,6 +210,20 @@ class BillingBot:
     def is_admin(self, user: dict[str, Any]) -> bool:
         return int(user.get("id", 0)) in self.settings.admin_user_ids
 
+    async def handle_chat_member(self, update: dict[str, Any]) -> None:
+        change = update.get("chat_member") or {}
+        chat = change.get("chat") or {}
+        chat_id = int(chat.get("id", 0))
+        if chat_id not in self.settings.allowed_group_ids:
+            return
+        member = change.get("new_chat_member") or {}
+        user = member.get("user") or {}
+        if not user or user.get("is_bot"):
+            return
+        status = str(member.get("status", ""))
+        legal = status in MEMBER or (status == "restricted" and bool(member.get("is_member")))
+        await asyncio.to_thread(self.service.set_membership, user, chat_id, status, legal)
+
     async def dispatch(self, message: dict[str, Any]) -> str:
         chat, user = message.get("chat") or {}, message.get("from") or {}
         if not user or user.get("is_bot"):
@@ -100,9 +231,13 @@ class BillingBot:
         text = str(message.get("text") or "").strip()
         if not text.startswith("/"):
             return ""
+        command_token, *arg_parts = text.split(maxsplit=1)
+        args = arg_parts[0] if arg_parts else ""
+        command_name, mention_separator, mention = command_token.partition("@")
+        if mention_separator and (not self.bot_username or mention.casefold() != self.bot_username.casefold()):
+            return ""
         await asyncio.to_thread(self.service.upsert_user, user)
-        command, _, args = text.partition(" ")
-        command = command.split("@", 1)[0].lower()
+        command = command_name.lower()
         private = chat.get("type") == "private"
         if command in {"/start", "/help"}:
             return self.help(self.is_admin(user))
@@ -148,7 +283,8 @@ class BillingBot:
         if command == "/cancel":
             return "没有正在进行的交互操作。"
         if command in {"/usage", "/models", "/ranking", "/chart", "/accounts", "/billing", "/sub2billing"}:
-            if not (self.service.chat_is_allowed(int(chat.get("id", 0))) or await self.eligible(user)):
+            chat_allowed = await asyncio.to_thread(self.service.chat_is_allowed, int(chat.get("id", 0)))
+            if not (chat_allowed or await self.eligible(user)):
                 return "没有权限查询。"
             if command == "/usage":
                 data = await asyncio.to_thread(self.service.usage_summary)
@@ -194,20 +330,23 @@ class BillingBot:
             rows = await asyncio.to_thread(self.service.list_users)
             return f"当前状态：\n用户：<code>{len(rows)}</code>\n有效注册：<code>{sum(1 for r in rows if r['registered'])}</code>"
         if command == "/allowuser":
-            if not args.strip().split():
+            target = parse_user_id(args)
+            if target is None:
                 return f"用法：<code>{command} USER_ID</code>"
-            target = int(args.strip().split()[0])
             await asyncio.to_thread(self.service.set_manual_allowed, target, True)
             return f"已授权用户 <code>{target}</code>。"
         if command == "/revokeuser":
-            if not args.strip().split():
+            target = parse_user_id(args)
+            if target is None:
                 return "用法：<code>/revokeuser USER_ID</code>"
-            target = int(args.strip().split()[0])
             count = await asyncio.to_thread(self.service.revoke_user, target)
             return f"已吊销用户 <code>{target}</code> 的 API Key <code>{count}</code> 个，并移除手动授权。"
         if command == "/checkuser":
-            target = int(args.strip().split()[0])
-            return f"用户 <code>{target}</code> cached_legal=<code>{self.service.user_is_eligible_cached(target)}</code>"
+            target = parse_user_id(args)
+            if target is None:
+                return "用法：<code>/checkuser USER_ID</code>"
+            cached = await asyncio.to_thread(self.service.user_is_eligible_cached, target)
+            return f"用户 <code>{target}</code> cached_legal=<code>{cached}</code>"
         if command == "/billconfig":
             parts = args.split()
             if not parts:
@@ -225,13 +364,16 @@ class BillingBot:
             if len(parts) not in {4, 5}:
                 return "参数数量不正确。发送 <code>/billconfig</code> 查看示例和可用规则。"
             name, start, end, fixed = parts[:4]
-            rule_id = int(parts[4]) if len(parts) == 5 else None
+            fixed_cents = parse_fixed_cost_cents(fixed)
+            rule_id = parse_user_id(parts[4]) if len(parts) == 5 else None
+            if fixed_cents is None or (len(parts) == 5 and rule_id is None):
+                return "固定成本必须是非负金额，规则 ID 必须是整数。"
             await asyncio.to_thread(
                 self.service.create_cycle,
                 name,
                 start,
                 end,
-                int(Decimal(fixed) * 100),
+                fixed_cents,
                 None,
                 rule_id,
             )
@@ -252,12 +394,16 @@ class BillingBot:
         if command == "/allowchat":
             parts = args.split(maxsplit=1)
             if not parts: return "用法：<code>/allowchat CHAT_ID [NOTE]</code>"
-            await asyncio.to_thread(self.service.set_allowed_chat, int(parts[0]), parts[1] if len(parts) > 1 else "manual")
+            chat_id = parse_user_id(parts[0])
+            if chat_id is None:
+                return "用法：<code>/allowchat CHAT_ID [NOTE]</code>"
+            await asyncio.to_thread(self.service.set_allowed_chat, chat_id, parts[1] if len(parts) > 1 else "manual")
             return f"已添加可查询 chat_id：<code>{parts[0]}</code>"
         if command == "/delchat":
-            if not args.strip(): return "用法：<code>/delchat CHAT_ID</code>"
-            await asyncio.to_thread(self.service.remove_allowed_chat, int(args.split()[0]))
-            return f"已删除可查询 chat_id：<code>{args.split()[0]}</code>"
+            chat_id = parse_user_id(args)
+            if chat_id is None: return "用法：<code>/delchat CHAT_ID</code>"
+            await asyncio.to_thread(self.service.remove_allowed_chat, chat_id)
+            return f"已删除可查询 chat_id：<code>{chat_id}</code>"
         if command == "/listchats":
             chats = await asyncio.to_thread(self.service.list_allowed_chats)
             return "<b>可查询 chat_id</b>\n" + "\n".join(f"<code>{c['chat_id']}</code> {esc(c['note'] or '-')}" for c in chats)
@@ -265,10 +411,26 @@ class BillingBot:
 
     def help(self, is_admin: bool) -> str:
         lines = ["CPA 自助 API Key Bot", "", "用户命令：", "/register - 首次注册或新增 API Key", "/mykey - 查看已绑定的掩码 Key",
+                 "/resetkey /revoke - 重置或吊销指定 Key", "/confirm - 确认待处理操作", "/cancel - 取消当前操作",
                  "/usage /models /ranking /chart /billing /sub2billing /accounts", "/id /help", "", f"Web：<code>{esc(self.settings.public_base_url)}</code>"]
         if is_admin:
             lines += ["", "管理员命令：", "/billconfig /billcycle /billcycles", "/stats /users /allowuser /revokeuser /checkuser", "/namekey /allowchat /delchat /listchats"]
         return "\n".join(lines)
+
+    @staticmethod
+    def _select_active_sub2_cycle(
+        cycles: dict[str, Any], now: datetime, zone: ZoneInfo,
+    ) -> tuple[datetime, datetime, str, dict[str, Any]] | None:
+        active: list[tuple[datetime, datetime, str, dict[str, Any]]] = []
+        for name, cycle in cycles.items():
+            start, end = datetime.fromisoformat(cycle["start_at"]), datetime.fromisoformat(cycle["end_at"])
+            if start.tzinfo is None:
+                start = start.replace(tzinfo=zone)
+            if end.tzinfo is None:
+                end = end.replace(tzinfo=zone)
+            if start <= now < end:
+                active.append((start, end, name, cycle))
+        return max(active, key=lambda item: (item[0], item[2])) if active else None
 
     def sub2billing(self) -> str:
         if not self.settings.sub2_state_file.exists():
@@ -276,15 +438,10 @@ class BillingBot:
         data = json.loads(self.settings.sub2_state_file.read_text())
         cycles = data.get("billing_cycles", {})
         zone, now = ZoneInfo(self.settings.timezone), datetime.now(ZoneInfo(self.settings.timezone))
-        active = []
-        for name, cycle in cycles.items():
-            start, end = datetime.fromisoformat(cycle["start_at"]), datetime.fromisoformat(cycle["end_at"])
-            if start.tzinfo is None: start = start.replace(tzinfo=zone)
-            if end.tzinfo is None: end = end.replace(tzinfo=zone)
-            if start <= now < end: active.append((start, name, cycle))
-        if not active:
+        selected = self._select_active_sub2_cycle(cycles, now, zone)
+        if selected is None:
             return "<b>Sub2API 当前计费周期费用</b>\n\n当前没有活跃 Sub2API 计费周期。"
-        _, name, cycle = sorted(active, reverse=True)[0]
+        start, end, name, cycle = selected
         if not self.settings.sub2_postgres_dsn:
             raise BillingError("SUB2API_POSTGRES_DSN is not configured")
         with psycopg.connect(self.settings.sub2_postgres_dsn) as connection:
@@ -307,58 +464,133 @@ class BillingBot:
             lines.append(f"{index}. <b>{esc(names[uid])}</b>\n实际=<code>{format_usd_nano(actual[uid])}</code> 计费=<code>{format_usd_nano(billed[uid])}</code> 预估付费=<code>{format_cents(allocated[uid])}</code>")
         return "\n".join(lines)
 
+    @staticmethod
+    def _render_chart(labels: list[str], series: list[dict[str, Any]]) -> Path:
+        fig, ax = plt.subplots(figsize=(12, 6), dpi=130)
+        handle = tempfile.NamedTemporaryFile(prefix="cpa-chart-", suffix=".png", delete=False); handle.close()
+        path = Path(handle.name)
+        try:
+            for item in series[:12]:
+                ax.plot(labels, [item["values"].get(label, 0) for label in labels], label=item["name"], linewidth=2)
+            ax.set_title("Recent CPA Usage", loc="left")
+            ax.grid(True, color="#e5e7eb")
+            ax.tick_params(axis="x", labelsize=7, rotation=25)
+            ax.legend(fontsize=8, ncol=3)
+            fig.tight_layout()
+            fig.savefig(path)
+            return path
+        except Exception:
+            path.unlink(missing_ok=True)
+            raise
+        finally:
+            plt.close(fig)
+
     async def send_chart(self, chat_id: int) -> None:
         labels, series = await asyncio.to_thread(self.service.hourly_usage, 24)
         if not series:
             await self.tg.send(chat_id, "最近 24 小时没有可绘制的用量。")
             return
-        fig, ax = plt.subplots(figsize=(12, 6), dpi=130)
-        for item in series[:12]:
-            ax.plot(labels, [item["values"].get(label, 0) for label in labels], label=item["name"], linewidth=2)
-        ax.set_title("Recent CPA Usage", loc="left")
-        ax.grid(True, color="#e5e7eb")
-        ax.tick_params(axis="x", labelsize=7, rotation=25)
-        ax.legend(fontsize=8, ncol=3)
-        fig.tight_layout()
-        handle = tempfile.NamedTemporaryFile(prefix="cpa-chart-", suffix=".png", delete=False); handle.close()
-        path = Path(handle.name)
+        path = await asyncio.to_thread(self._render_chart, labels, series)
         try:
-            fig.savefig(path)
             await self.tg.photo(chat_id, path, "最近 24 小时 CPA 使用（按 Telegram 用户聚合）")
         finally:
-            plt.close(fig); path.unlink(missing_ok=True)
+            path.unlink(missing_ok=True)
 
     async def handle(self, update: dict[str, Any]) -> None:
+        if update.get("chat_member"):
+            try:
+                await self.handle_chat_member(update)
+            except Exception:
+                LOG.exception("membership update failed")
+            return
+
         message = update.get("message")
         if not message:
             return
         try:
             reply = await self.dispatch(message)
-        except Exception as exc:
-            LOG.exception("command failed")
+        except BillingError as exc:
+            LOG.warning("command rejected: %s", exc)
             reply = f"执行失败：<code>{esc(exc)}</code>"
-        if reply:
+        except Exception:
+            LOG.exception("command failed")
+            reply = "执行失败，请稍后重试。"
+        if not reply:
+            return
+        try:
             await self.tg.send(int((message.get("chat") or {}).get("id")), reply)
+        except Exception:
+            LOG.exception("reply failed")
+
+    async def configure_commands(self) -> None:
+        common = [
+            {"command": "start", "description": "打开帮助"},
+            {"command": "help", "description": "查看帮助"},
+            {"command": "usage", "description": "查看 CPA 全局用量"},
+            {"command": "models", "description": "查看模型用量"},
+            {"command": "ranking", "description": "查看全局排行"},
+            {"command": "chart", "description": "查看最近用量图"},
+            {"command": "billing", "description": "查看当前计费周期"},
+            {"command": "sub2billing", "description": "查看 Sub2API 当前周期"},
+            {"command": "accounts", "description": "查看账号用量"},
+            {"command": "id", "description": "显示 Telegram ID"},
+        ]
+        private = common + [
+            {"command": "register", "description": "注册或新增 CPA API Key"},
+            {"command": "mykey", "description": "查看已绑定 Key"},
+            {"command": "resetkey", "description": "重置指定 API Key"},
+            {"command": "revoke", "description": "吊销指定 API Key"},
+            {"command": "confirm", "description": "确认待处理操作"},
+            {"command": "cancel", "description": "取消当前操作"},
+        ]
+        admin = private + [
+            {"command": "billconfig", "description": "创建计费周期"},
+            {"command": "billcycle", "description": "修改计费周期时间"},
+            {"command": "billcycles", "description": "查看计费周期配置"},
+            {"command": "stats", "description": "查看用户统计"},
+            {"command": "users", "description": "查看用户列表"},
+            {"command": "allowuser", "description": "手动授权用户"},
+            {"command": "revokeuser", "description": "吊销用户 Key"},
+            {"command": "checkuser", "description": "检查用户资格"},
+            {"command": "namekey", "description": "命名未绑定 Key"},
+            {"command": "allowchat", "description": "添加可查询群组"},
+            {"command": "delchat", "description": "删除可查询群组"},
+            {"command": "listchats", "description": "查看可查询群组"},
+        ]
+        await self.tg.call("setMyCommands", {"commands": common, "scope": {"type": "default"}})
+        await self.tg.call("setMyCommands", {"commands": private, "scope": {"type": "all_private_chats"}})
+        for user_id in sorted(self.settings.admin_user_ids):
+            await self.tg.call("setMyCommands", {
+                "commands": admin,
+                "scope": {"type": "chat", "chat_id": user_id},
+            })
 
     async def run(self) -> None:
-        commands = [{"command": cmd, "description": desc} for cmd, desc in [
-            ("usage", "查看 CPA 全局用量"), ("models", "查看模型用量"), ("ranking", "查看全局排行"), ("chart", "查看最近排行"),
-            ("billing", "查看当前计费周期"), ("sub2billing", "查看 Sub2API 当前周期"), ("accounts", "查看账号用量"),
-            ("register", "注册或新增 CPA API Key"), ("mykey", "查看已绑定 Key"), ("id", "显示 Telegram id"), ("help", "查看帮助")]]
-        await self.tg.call("setMyCommands", {"commands": commands})
+        me = await self.tg.me()
+        self.bot_username = str(me.get("username") or "").strip()
+        if not self.bot_username:
+            raise BillingError("Telegram getMe 未返回 bot username")
+        await self.configure_commands()
         offset = None
-        while True:
-            try:
-                updates = await self.tg.call("getUpdates", {"offset": offset, "timeout": 30, "allowed_updates": ["message", "chat_member"]}) or []
-                tasks = []
-                for update in updates:
-                    offset = int(update["update_id"]) + 1
-                    tasks.append(asyncio.create_task(self.handle(update)))
-                if tasks:
-                    await asyncio.gather(*tasks)
-            except Exception:
-                LOG.exception("polling failed")
-                await asyncio.sleep(3)
+        tasks: set[asyncio.Task[None]] = set()
+        try:
+            while True:
+                try:
+                    updates = await self.tg.call("getUpdates", {"offset": offset, "timeout": 30, "allowed_updates": ["message", "chat_member"]}) or []
+                    for update in updates:
+                        offset = int(update["update_id"]) + 1
+                        task = asyncio.create_task(self.handle(update))
+                        tasks.add(task)
+                        task.add_done_callback(tasks.discard)
+                except Exception:
+                    LOG.exception("polling failed")
+                    await asyncio.sleep(3)
+        finally:
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            await self.tg.client.aclose()
 
 
 async def run_bot() -> None:

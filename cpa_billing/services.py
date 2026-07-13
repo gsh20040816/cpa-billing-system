@@ -1207,14 +1207,20 @@ class BillingService:
             else:
                 row.status, row.legal, row.updated_at_ms = status, legal, now_ms()
 
-    def user_is_eligible_cached(self, user_id: int) -> bool:
+    def user_is_eligible_cached(self, user_id: int, max_age_ms: int | None = None) -> bool:
         if user_id in self.settings.admin_user_ids:
             return True
         with self.db.session() as session:
             user = session.get(TelegramUser, user_id)
             if user and user.manual_allowed:
                 return True
-            return bool(session.scalar(select(func.count()).select_from(GroupMembership).where(GroupMembership.telegram_user_id == user_id, GroupMembership.legal.is_(True))))
+            filters: list[Any] = [
+                GroupMembership.telegram_user_id == user_id,
+                GroupMembership.legal.is_(True),
+            ]
+            if max_age_ms is not None:
+                filters.append(GroupMembership.updated_at_ms >= now_ms() - max(0, int(max_age_ms)))
+            return bool(session.scalar(select(func.count()).select_from(GroupMembership).where(*filters)))
 
     def _insert_key(self, session: Any, raw_key: str, owner_id: int, source: str) -> APIKey:
         key_hash = cpamp_key_hash(raw_key)

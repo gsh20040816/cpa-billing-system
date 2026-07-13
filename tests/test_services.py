@@ -24,6 +24,7 @@ from cpa_billing.models import (
     CyclePoolCost,
     DeadLetter,
     GradientRule,
+    GroupMembership,
     KeyOwnershipPeriod,
     ManualUsageAdjustment,
     MeteredKeyCharge,
@@ -844,6 +845,23 @@ def test_keeper_refresh_accepts_null_task_lists(service, monkeypatch) -> None:
     assert result["tasks"] == []
     assert result["rejected"] == []
     assert result["skipped"] == 1
+
+
+def test_membership_cache_can_require_recent_group_status(service) -> None:
+    current = int(time.time() * 1000)
+    with service.db.session() as session:
+        session.add(TelegramUser(telegram_user_id=42, last_seen_at_ms=current))
+        session.flush()
+        session.add(GroupMembership(
+            telegram_user_id=42,
+            group_chat_id=-100,
+            status="member",
+            legal=True,
+            updated_at_ms=current - 10_000,
+        ))
+
+    assert service.user_is_eligible_cached(42)
+    assert not service.user_is_eligible_cached(42, max_age_ms=5_000)
 
 
 def test_pricing_snapshot_exposes_effective_rules_without_internal_auth_patterns(service) -> None:
