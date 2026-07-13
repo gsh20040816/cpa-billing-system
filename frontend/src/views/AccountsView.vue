@@ -154,7 +154,7 @@ const autoRefresh = useAutoRefresh((silent) => load(silent), { interval: 60_000 
                   <div v-else-if="quota.usage_filter?.mode === 'all_except_models'">模型范围：普通用量（排除 {{ (quota.usage_filter.display_models || quota.usage_filter.models).join('、') }}）</div>
                   <div v-else>模型范围：全部模型</div>
                   <div>统计自 {{ dateTime(quota.window_started_at) }}</div>
-                  <div>重置 {{ dateTime(quota.reset_at) }}</div>
+                  <div>本窗口恢复 {{ dateTime(quota.reset_at) }}</div>
                   <div>{{ number(quota.window_usage_requests) }} 请求 · {{ number(quota.window_usage_tokens) }} tokens</div>
                   <div>{{ money(quota.window_usage_cost) }} 本窗口等效成本</div>
                   <div class="quota-estimate">
@@ -170,7 +170,14 @@ const autoRefresh = useAutoRefresh((silent) => load(silent), { interval: 60_000 
             <v-alert v-else type="warning" variant="tonal" density="compact" class="mt-3">暂无额度缓存</v-alert>
             <div class="account-foot">
               <span>额度刷新 {{ dateTime(account.quota_refreshed_at) }}</span>
-              <span v-if="account.reset_credits_available !== null">额度恢复积分：{{ account.reset_credits_available }}</span>
+              <span v-if="account.reset_credits_available !== null">主动重置次数：{{ account.reset_credits_available }}</span>
+              <span v-if="account.reset_credits_error" class="data-error">{{ account.reset_credits_error }}</span>
+            </div>
+            <div v-if="account.reset_credits?.length" class="reset-credit-list mt-3">
+              <div class="quota-row__label">主动重置过期时间</div>
+              <div v-for="(credit, index) in account.reset_credits" :key="credit.id" class="d-flex justify-space-between text-caption">
+                <span>第 {{ index + 1 }} 次</span><strong>过期 {{ dateTime(credit.expires_at) }}</strong>
+              </div>
             </div>
           </v-card-text>
         </v-card>
@@ -196,6 +203,8 @@ const autoRefresh = useAutoRefresh((silent) => load(silent), { interval: 60_000 
 .quota-estimate span, .quota-estimate small { display: block; color: inherit; }
 .quota-estimate strong { display: block; margin: 2px 0; color: #123f34; font-size: .9rem; }
 .quota-estimate small { font-size: .7rem; }
+.reset-credit-list { border-top: 1px solid #e1e7e4; padding-top: 10px; }
+.reset-credit-list strong { color: #123f34; }
 @media (max-width: 1000px) { .account-usage { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
 @media (max-width: 760px) { .account-card__head { align-items: start; } .account-usage { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 </style>

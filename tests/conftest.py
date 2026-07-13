@@ -8,7 +8,7 @@ import pytest
 
 from cpa_billing.config import Settings
 from cpa_billing.database import Database
-from cpa_billing.services import BillingService
+from cpa_billing.services import BillingService, CPAClient, CPAMPClient
 
 
 def create_cpamp(path: Path) -> None:
@@ -49,6 +49,16 @@ def settings(tmp_path: Path) -> Settings:
                     admin_user_ids=frozenset({1}), allowed_group_ids=frozenset({-100}), public_base_url="https://billing.example",
                     api_key_prefix="sk-cpa", timezone="Asia/Shanghai", worker_interval_seconds=1,
                     action_ttl_seconds=600, session_ttl_seconds=3600, sub2_state_file=tmp_path / "sub2.json", sub2_postgres_dsn=None)
+
+
+@pytest.fixture(autouse=True)
+def block_external_management_requests(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make every test fail instead of sending a CPA/CPAMP HTTP request."""
+    def blocked(*args, **kwargs):
+        raise AssertionError("external CPA/CPAMP HTTP request is forbidden in tests")
+
+    monkeypatch.setattr(CPAClient, "_request", blocked)
+    monkeypatch.setattr(CPAMPClient, "_request", blocked)
 
 
 @pytest.fixture

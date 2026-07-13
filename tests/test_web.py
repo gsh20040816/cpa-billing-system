@@ -180,7 +180,7 @@ def test_site_mutations_require_user_csrf_and_admin_quota_reset(settings, monkey
         headers={"X-CSRF-Token": login["csrf_token"]},
     )
     assert throttled.status_code == 429
-    assert client.post("/api/admin/accounts/account-1/reset-quota", json={}).status_code == 403
+    assert client.post("/api/admin/accounts/account-1/reset-upstream-quota", json={}).status_code == 403
 
     admin_client = TestClient(app, base_url="https://billing.example")
     admin_login = admin_client.post("/auth/admin/login", json={"management_token": settings.admin_token})
@@ -188,21 +188,21 @@ def test_site_mutations_require_user_csrf_and_admin_quota_reset(settings, monkey
     monkeypatch.setattr(
         app.state.service,
         "reset_account_quota",
-        lambda account_id, reason, operator_id, operator_type: {"ok": True, "account_id": account_id, "status": "ok"},
+        lambda account_id, reason, confirmations, operator_id, operator_type: {"ok": True, "account_id": account_id, "status": "reset", "required_confirmations": confirmations},
     )
     missing_reason = admin_client.post(
-        "/api/admin/accounts/account-1/reset-quota",
+        "/api/admin/accounts/account-1/reset-upstream-quota",
         headers={"X-CSRF-Token": admin_csrf},
         json={"reason": ""},
     )
     assert missing_reason.status_code == 422
     reset = admin_client.post(
-        "/api/admin/accounts/account-1/reset-quota",
+        "/api/admin/accounts/account-1/reset-upstream-quota",
         headers={"X-CSRF-Token": admin_csrf},
-        json={"reason": "测试本地额度状态"},
+        json={"reason": "测试上游额度重置", "confirmations": 3},
     )
     assert reset.status_code == 200
-    assert reset.json()["status"] == "ok"
+    assert reset.json()["status"] == "reset"
 
 
 def test_login_limiter_counts_failures_only() -> None:
@@ -220,6 +220,7 @@ def test_login_limiter_counts_failures_only() -> None:
 
 def test_admin_billing_rule_and_key_profile_endpoints(settings, monkeypatch) -> None:
     app = create_app(settings)
+    monkeypatch.setattr(app.state.service, "accounts_snapshot", lambda: {"accounts": [], "inspection": {}})
     client = TestClient(app, base_url="https://billing.example")
     login = client.post("/auth/admin/login", json={"management_token": settings.admin_token})
     csrf = login.json()["csrf_token"]
@@ -335,8 +336,9 @@ def test_admin_billing_rule_and_key_profile_endpoints(settings, monkeypatch) -> 
     assert next(item for item in admin_snapshot["pricing_rules"]["models"] if item["model"] == "gpt-test")["default"]["input"]["usd_per_million"] == "2"
 
 
-def test_admin_can_add_exact_manual_usage_with_independent_auth_and_csrf(settings) -> None:
+def test_admin_can_add_exact_manual_usage_with_independent_auth_and_csrf(settings, monkeypatch) -> None:
     app = create_app(settings)
+    monkeypatch.setattr(app.state.service, "accounts_snapshot", lambda: {"accounts": [], "inspection": {}})
     add_user(app, settings, 2, "sk-cpa-user-two-secret")
     app.state.service.create_cycle("manual-web", "1970-01-01T08:00", "1970-01-02T08:00", 1000)
     client = TestClient(app, base_url="https://billing.example")

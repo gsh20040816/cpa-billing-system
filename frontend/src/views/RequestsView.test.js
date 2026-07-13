@@ -103,6 +103,22 @@ describe('RequestsView', () => {
     wrapper.unmount()
   })
 
+  it('shows separate success, failed-200, and other-failure filters', async () => {
+    const wrapper = mount(RequestsView, {
+      attachTo: document.body,
+      global: {
+        plugins: [vuetify],
+        stubs: { VDataTable: VDataTableStub, VDialog: VDialogStub },
+      },
+    })
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('成功')
+    expect(wrapper.text()).toContain('失败 200')
+    expect(wrapper.text()).toContain('其他失败')
+    wrapper.unmount()
+  })
+
   it('uses the admin endpoints and shows historical ownership in admin mode', async () => {
     const wrapper = mount(RequestsView, {
       props: { admin: true },

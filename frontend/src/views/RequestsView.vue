@@ -44,7 +44,8 @@ const timeRangeModel = computed({
 const statusItems = [
   { title: '全部', value: 'all' },
   { title: '成功', value: 'success' },
-  { title: '失败', value: 'failed' },
+  { title: '失败 200', value: 'failed_200' },
+  { title: '其他失败', value: 'failed_other' },
   { title: '已计价', value: 'priced' },
   { title: '未计价', value: 'unpriced' },
 ]

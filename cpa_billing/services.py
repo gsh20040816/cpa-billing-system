@@ -9,6 +9,7 @@ import re
 import sqlite3
 import threading
 import time
+import uuid
 from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -198,11 +199,82 @@ class CPAClient:
             raise BillingError("CPA api-call response is invalid")
         return result
 
-    def reset_quota(self, auth_index: str) -> dict[str, Any]:
-        result = self._request("POST", "/v0/management/reset-quota", json={"auth_index": auth_index})
-        if not isinstance(result, dict):
-            raise BillingError("CPA reset-quota response is invalid")
-        return result
+    @staticmethod
+    def _codex_headers(account_id: str | None = None, *, reset_credits: bool = False) -> dict[str, str]:
+        headers = {
+            "Authorization": "Bearer $TOKEN$",
+            "Content-Type": "application/json",
+            "User-Agent": "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal",
+        }
+        if account_id:
+            headers["Chatgpt-Account-Id"] = account_id
+        if reset_credits:
+            headers.update({
+                "Accept": "application/json",
+                "OpenAI-Beta": "codex-1",
+                "Originator": "Codex Desktop",
+            })
+        return headers
+
+    def codex_reset_credits(self, auth_index: str, account_id: str | None = None) -> dict[str, Any]:
+        result = self.api_call(
+            auth_index,
+            "GET",
+            "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits",
+            self._codex_headers(account_id, reset_credits=True),
+        )
+        status_code = int(result.get("status_code") or 0)
+        body = result.get("body")
+        payload = json.loads(body) if isinstance(body, str) and body.strip() else body
+        if status_code < 200 or status_code >= 300:
+            raise BillingError(f"主动重置次数接口返回 HTTP {status_code}")
+        if not isinstance(payload, dict):
+            raise BillingError("主动重置次数响应不是 JSON 对象")
+        if "credits" not in payload and "available_count" not in payload and "availableCount" not in payload:
+            raise BillingError("主动重置次数响应格式无效")
+        credits = []
+        for item in payload.get("credits") if isinstance(payload.get("credits"), list) else []:
+            if not isinstance(item, dict):
+                continue
+            reset_type = str(item.get("reset_type", item.get("resetType", ""))).strip()
+            status = str(item.get("status") or "").strip()
+            expires_at = item.get("expires_at", item.get("expiresAt"))
+            if reset_type != "codex_rate_limits" or status != "available" or not expires_at:
+                continue
+            credits.append({
+                "id": str(item.get("id") or ""),
+                "status": status,
+                "granted_at": item.get("granted_at", item.get("grantedAt")),
+                "expires_at": expires_at,
+            })
+        available_count = payload.get("available_count", payload.get("availableCount"))
+        try:
+            available_count = int(available_count) if available_count is not None else len(credits)
+        except (TypeError, ValueError):
+            available_count = len(credits)
+        return {"available_count": available_count, "credits": credits}
+
+    def consume_codex_reset_credit(self, auth_index: str, account_id: str | None = None) -> dict[str, Any]:
+        result = self.api_call(
+            auth_index,
+            "POST",
+            "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume",
+            self._codex_headers(account_id),
+            data=json.dumps({"redeem_request_id": str(uuid.uuid4())}),
+        )
+        status_code = int(result.get("status_code") or 0)
+        body = result.get("body")
+        payload = json.loads(body) if isinstance(body, str) and body.strip() else body
+        if status_code < 200 or status_code >= 300:
+            raise BillingError(f"上游主动重置接口返回 HTTP {status_code}")
+        if not isinstance(payload, dict) or payload.get("code") != "reset":
+            raise BillingError("上游主动重置响应无效")
+        windows_reset = payload.get("windows_reset", payload.get("windowsReset"))
+        try:
+            windows_reset = int(windows_reset)
+        except (TypeError, ValueError):
+            raise BillingError("上游主动重置响应缺少 windows_reset") from None
+        return {"code": "reset", "windows_reset": windows_reset}
 
 
 class CPAMPClient:
@@ -2416,6 +2488,19 @@ class BillingService:
                 filters.append(RawUsageEvent.failed.is_(False))
             elif status == "failed":
                 filters.append(RawUsageEvent.failed.is_(True))
+            elif status == "failed_200":
+                filters.append(and_(
+                    RawUsageEvent.failed.is_(True),
+                    RawUsageEvent.fail_status_code == 200,
+                ))
+            elif status == "failed_other":
+                filters.append(and_(
+                    RawUsageEvent.failed.is_(True),
+                    or_(
+                        RawUsageEvent.fail_status_code.is_(None),
+                        RawUsageEvent.fail_status_code != 200,
+                    ),
+                ))
             elif status == "priced":
                 filters.append(RatedEvent.id.is_not(None))
             elif status == "unpriced":
@@ -3026,6 +3111,46 @@ class BillingService:
         return canonical, labels.get(canonical or "", canonical)
 
     @staticmethod
+    def _quota_reset_guard(identity: dict[str, Any], quota_rows: list[dict[str, Any]]) -> dict[str, Any]:
+        """Describe whether CPA currently reports the account as quota-exhausted."""
+        weekly_windows = []
+        for quota in quota_rows:
+            seconds = int(quota.get("window_seconds") or 0)
+            label = str(quota.get("label") or "")
+            if seconds != 7 * 24 * 60 * 60 and "周" not in label and "week" not in label.lower():
+                continue
+            weekly_windows.append({
+                "key": quota.get("key"),
+                "label": label or "周额度",
+                "used_percent": quota.get("used_percent"),
+                "allowed": quota.get("allowed"),
+                "limit_reached": quota.get("limit_reached"),
+                "reset_at": quota.get("reset_at"),
+            })
+
+        cpa_status = str(identity.get("status") or "unknown").strip().lower()
+        status_message = str(identity.get("status_message") or "").strip()
+        message_lower = status_message.lower()
+        status_signal = (
+            cpa_status in {"error", "paused"}
+            or bool(identity.get("unavailable"))
+            or any(word in message_lower for word in ("quota", "limit", "rate", "cooldown", "exhaust", "暂停", "限额", "用量"))
+        )
+        window_signal = any(
+            quota.get("limit_reached") is True or quota.get("allowed") is False
+            for quota in weekly_windows
+        )
+        weekly_exhausted = bool(weekly_windows) and (status_signal or window_signal)
+        return {
+            "weekly_windows": weekly_windows,
+            "weekly_exhausted": weekly_exhausted,
+            "required_confirmations": 2 if weekly_exhausted else 3,
+            "cpa_status": cpa_status,
+            "cpa_status_message": status_message or None,
+            "cpa_unavailable": bool(identity.get("unavailable")),
+        }
+
+    @staticmethod
     def _quota_available_estimate(used_percent: Any, cost_nano_usd: int) -> dict[str, Any]:
         """Estimate the remaining window cost from the upstream usage percentage."""
         cost_nano_usd = int(cost_nano_usd or 0)
@@ -3300,6 +3425,7 @@ class BillingService:
             for quota in quota_rows:
                 reset_at_ms = self._external_timestamp_ms(quota.get("reset_at"))
                 quota["reset_at"] = self._iso_timestamp(reset_at_ms)
+            quota_reset_guard = self._quota_reset_guard(identity, quota_rows)
             id_token = identity.get("id_token") if isinstance(identity.get("id_token"), dict) else {}
             provider = str(identity.get("provider") or identity.get("type") or "").strip().lower()
             plan_type = identity.get("plan_type") or identity.get("planType") or id_token.get("plan_type") or id_token.get("planType")
@@ -3351,7 +3477,13 @@ class BillingService:
                 "quota_refreshed_at": quota_item.get("refreshed_at"),
                 "quota_http_status": quota_item.get("http_status_code"),
                 "quota_error": quota_item.get("error"),
-                "reset_credits_available": credits,
+                "cpa_status": str(identity.get("status") or "unknown"),
+                "cpa_status_message": str(identity.get("status_message") or "") or None,
+                "cpa_unavailable": bool(identity.get("unavailable")),
+                "quota_reset_guard": quota_reset_guard,
+                "reset_credits_available": quota_item.get("reset_credits_available") if quota_item.get("reset_credits_available") is not None else credits,
+                "reset_credits": quota_item.get("reset_credits") or [],
+                "reset_credits_error": quota_item.get("reset_credits_error"),
                 "can_refresh": bool(auth_index) and provider == "codex" and not bool(identity.get("disabled") or identity.get("unavailable")),
             })
         accounts.sort(key=lambda item: (item["disabled"], str(item["name"]).casefold()))
@@ -3439,6 +3571,24 @@ class BillingService:
                     "quota": {},
                 })
                 continue
+            id_token = item.get("id_token") if isinstance(item.get("id_token"), dict) else {}
+            account_token_id = id_token.get("chatgpt_account_id") or id_token.get("chatgptAccountId")
+            reset_credit_metadata: dict[str, Any] = {
+                "reset_credits_available": None,
+                "reset_credits": [],
+                "reset_credits_error": None,
+            }
+            try:
+                reset_credits = self.cpa.codex_reset_credits(
+                    auth_index,
+                    str(account_token_id) if account_token_id else None,
+                )
+                reset_credit_metadata.update({
+                    "reset_credits_available": reset_credits["available_count"],
+                    "reset_credits": reset_credits["credits"],
+                })
+            except (BillingError, httpx.HTTPError, json.JSONDecodeError) as exc:
+                reset_credit_metadata["reset_credits_error"] = f"主动重置次数读取失败：{type(exc).__name__}"
             try:
                 result = self.cpa.api_call(
                     auth_index,
@@ -3458,6 +3608,7 @@ class BillingService:
                         "error": f"上游额度接口返回 HTTP {status_code}",
                         "refreshed_at": refreshed_at,
                         "quota": {},
+                        **reset_credit_metadata,
                     })
                 elif not isinstance(payload, dict):
                     quota_items.append({
@@ -3468,6 +3619,7 @@ class BillingService:
                         "error": "上游额度响应不是 JSON 对象",
                         "refreshed_at": refreshed_at,
                         "quota": {},
+                        **reset_credit_metadata,
                     })
                 else:
                     quota_items.append({
@@ -3477,6 +3629,7 @@ class BillingService:
                         "http_status_code": status_code,
                         "refreshed_at": refreshed_at,
                         "quota": payload,
+                        **reset_credit_metadata,
                     })
             except (BillingError, httpx.HTTPError, json.JSONDecodeError) as exc:
                 quota_items.append({
@@ -3486,6 +3639,7 @@ class BillingService:
                     "error": f"额度读取失败：{type(exc).__name__}",
                     "refreshed_at": refreshed_at,
                     "quota": {},
+                    **reset_credit_metadata,
                 })
         return {"files": files, "quota": {"items": quota_items}}
 
@@ -3523,33 +3677,59 @@ class BillingService:
         self,
         account_id: str,
         reason: str,
+        confirmations: int = 0,
         operator_id: int | None = None,
         operator_type: str = "web-admin",
     ) -> dict[str, Any]:
         if not reason.strip():
-            raise BillingError("重置额度必须填写原因")
+            raise BillingError("重置上游 Codex 额度必须填写原因")
+        snapshot = self.accounts_snapshot()
+        target_snapshot = next((item for item in snapshot["accounts"] if item.get("id") == account_id), None)
+        if target_snapshot is None:
+            raise BillingError("上游账号不存在或已失效")
+        guard = target_snapshot.get("quota_reset_guard") or {}
+        required_confirmations = int(guard.get("required_confirmations") or 3)
+        if int(confirmations or 0) < required_confirmations:
+            if required_confirmations == 3:
+                raise BillingError("当前 CPA 未报告本周额度已耗尽或账号已暂停，必须完成三次确认")
+            raise BillingError("重置上游 Codex 额度必须完成二次确认")
+        if target_snapshot.get("reset_credits_error"):
+            raise BillingDependencyError(str(target_snapshot["reset_credits_error"]))
+        if not target_snapshot.get("reset_credits"):
+            raise BillingError("该账号没有可用的主动重置次数")
         files = self.cpa.auth_files()
         target = next((item for item in files if str(item.get("id") or "") == account_id), None)
         if target is None or not str(target.get("auth_index") or "").strip():
             raise BillingError("上游账号不存在或已失效")
         if bool(target.get("disabled") or target.get("unavailable")):
-            raise BillingError("已停用的上游账号不能重置额度状态")
+            raise BillingError("已停用的上游账号不能重置上游 Codex 额度")
+        id_token = target.get("id_token") if isinstance(target.get("id_token"), dict) else {}
+        account_token_id = id_token.get("chatgpt_account_id") or id_token.get("chatgptAccountId")
         try:
-            result = self.cpa.reset_quota(str(target["auth_index"]))
+            result = self.cpa.consume_codex_reset_credit(
+                str(target["auth_index"]),
+                str(account_token_id) if account_token_id else None,
+            )
         except (httpx.HTTPError, BillingError) as exc:
-            raise BillingDependencyError("CPA 本地额度状态重置失败") from exc
+            raise BillingDependencyError("上游 Codex 主动重置失败") from exc
         with self.db.session() as session:
             session.add(AuditLog(
                 operator_type=operator_type,
                 operator_id=str(operator_id if operator_id is not None else "admin-token"),
-                operation="account.reset_quota",
+                operation="account.reset_upstream_quota",
                 target=account_id,
                 before_json=None,
-                after_json=json.dumps({"status": result.get("status"), "models": result.get("models", [])}, ensure_ascii=False),
+                after_json=json.dumps({"code": result.get("code"), "windows_reset": result.get("windows_reset")}, ensure_ascii=False),
                 reason=reason.strip(),
                 created_at_ms=now_ms(),
             ))
-        return {"ok": True, "account_id": account_id, "status": result.get("status", "ok")}
+        return {
+            "ok": True,
+            "account_id": account_id,
+            "status": result.get("code", "reset"),
+            "windows_reset": result.get("windows_reset"),
+            "required_confirmations": required_confirmations,
+        }
 
     @staticmethod
     def _percentile(values: list[int], percentile: float) -> int | None:

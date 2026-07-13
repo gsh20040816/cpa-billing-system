@@ -119,6 +119,7 @@ class AccountRefreshPayload(BaseModel):
 
 class AccountResetQuotaPayload(BaseModel):
     reason: str = Field(min_length=1, max_length=1000)
+    confirmations: int = Field(default=0, ge=0, le=3)
 
 
 class PoolCostPayload(BaseModel):
@@ -760,7 +761,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "admin": service.admin_snapshot(),
         }
 
-    @app.post("/api/admin/accounts/{account_id}/reset-quota")
+    @app.post("/api/admin/accounts/{account_id}/reset-upstream-quota")
     async def api_reset_account_quota(
         account_id: str,
         payload: AccountResetQuotaPayload,
@@ -773,6 +774,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             service.reset_account_quota,
             account_id,
             payload.reason,
+            payload.confirmations,
             operator_id,
             "web-admin",
         )

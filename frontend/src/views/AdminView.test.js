@@ -282,4 +282,45 @@ describe('AdminView manual usage', () => {
     }))
     wrapper.unmount()
   })
+
+  it('shows upstream reset-credit expiries and requires the extra confirmation when the week is not exhausted', async () => {
+    const previousAccounts = snapshot.accounts
+    snapshot.accounts = {
+      accounts: [{
+        id: 'account-1',
+        name: 'Shared Pro',
+        type: 'codex',
+        plan_type: 'pro',
+        can_refresh: true,
+        usage: { requests: 1, total_tokens: 100, cost: '1.0000' },
+        quota: [{ key: 'weekly', label: '周额度', used_percent: 81, reset_at: '2026-07-20T03:02:00+08:00' }],
+        reset_credits_available: 1,
+        reset_credits: [{ id: 'credit-1', expires_at: '2026-08-01T03:56:22Z' }],
+        quota_reset_guard: {
+          weekly_exhausted: false,
+          required_confirmations: 3,
+          cpa_status: 'active',
+          weekly_windows: [{ key: 'weekly', label: '周额度', used_percent: 81, reset_at: '2026-07-20T03:02:00+08:00' }],
+        },
+      }],
+    }
+    const wrapper = mount(AdminView, {
+      attachTo: document.body,
+      global: { plugins: [vuetify] },
+    })
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('重置上游额度')
+    expect(wrapper.text()).toContain('主动重置过期')
+    expect(wrapper.text()).toContain('2026/08/01')
+    const resetButton = wrapper.findAllComponents({ name: 'VBtn' })
+      .find((item) => item.text().includes('重置上游额度'))
+    await resetButton.trigger('click')
+    await flushPromises()
+
+    expect(document.body.textContent).toContain('第三次确认')
+    expect(document.body.textContent).toContain('消耗主动重置次数')
+    wrapper.unmount()
+    snapshot.accounts = previousAccounts
+  })
 })

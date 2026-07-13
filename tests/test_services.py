@@ -535,6 +535,41 @@ def test_request_history_uses_historical_ownership_and_keeps_unpriced_events(ser
     assert bot_ranking["requests"] == 2
 
 
+def test_request_history_separates_failed_200_from_other_failures(service, settings) -> None:
+    create_owner(service, "status-key", 2, 0)
+    insert_event(settings, cpamp_key_hash("status-key"), 1000, event_hash="status-success")
+    insert_event(
+        settings,
+        cpamp_key_hash("status-key"),
+        2000,
+        event_hash="status-failed-200",
+        failed=True,
+        fail_status_code=200,
+    )
+    insert_event(
+        settings,
+        cpamp_key_hash("status-key"),
+        3000,
+        event_hash="status-failed-429",
+        failed=True,
+        fail_status_code=429,
+    )
+    insert_event(
+        settings,
+        cpamp_key_hash("status-key"),
+        4000,
+        event_hash="status-failed-unknown",
+        failed=True,
+    )
+    service.sync_cpamp()
+    service.rate_events()
+
+    assert service.request_history(2, status="success")["pagination"]["total"] == 1
+    assert service.request_history(2, status="failed_200")["pagination"]["total"] == 1
+    assert service.request_history(2, status="failed_other")["pagination"]["total"] == 2
+    assert service.request_history(2, status="failed")["pagination"]["total"] == 3
+
+
 def test_admin_request_history_includes_all_users_and_unowned_events(service, settings) -> None:
     create_owner(service, "key-two", 2, 0)
     create_owner(service, "key-three", 3, 0)
@@ -795,6 +830,70 @@ def test_cpa_accounts_are_sanitized_and_refresh_uses_public_account_ids(service,
     refresh = service.refresh_account_quotas(["7"])
     assert refresh["tasks"] == []
     assert refresh["accepted"] == 1
+
+
+def test_upstream_quota_reset_requires_three_confirmations_without_cpa_exhaustion(service, monkeypatch) -> None:
+    files = [{
+        "id": "codex-account",
+        "auth_index": "codex-auth-index",
+        "name": "Codex account",
+        "type": "codex",
+        "provider": "codex",
+        "id_token": {"chatgpt_account_id": "chatgpt-account"},
+        "status": "active",
+        "status_message": "",
+        "unavailable": False,
+        "disabled": False,
+    }]
+    usage = {
+        "plan_type": "pro",
+        "rate_limit": {"secondary_window": {
+            "used_percent": 81,
+            "allowed": True,
+            "limit_reached": False,
+            "limit_window_seconds": 7 * 24 * 60 * 60,
+            "reset_at": int(time.time() * 1000) + 86_400_000,
+        }},
+    }
+    reset_credits = {
+        "available_count": 1,
+        "credits": [{
+            "id": "credit-1",
+            "reset_type": "codex_rate_limits",
+            "status": "available",
+            "expires_at": "2026-08-01T03:56:22Z",
+        }],
+    }
+    monkeypatch.setattr(service.cpa, "auth_files", lambda: files)
+
+    def api_call(_auth_index, _method, url, _headers=None, data=""):
+        assert data == ""
+        assert url == "https://chatgpt.com/backend-api/wham/usage"
+        return {"status_code": 200, "body": json.dumps(usage)}
+
+    monkeypatch.setattr(service.cpa, "api_call", api_call)
+    monkeypatch.setattr(service.cpa, "codex_reset_credits", lambda *_args, **_kwargs: {
+        "available_count": 1,
+        "credits": [{"id": "credit-1", "status": "available", "expires_at": "2026-08-01T03:56:22Z"}],
+    })
+    consumed = []
+    monkeypatch.setattr(service.cpa, "consume_codex_reset_credit", lambda *args, **kwargs: consumed.append((args, kwargs)) or {"code": "reset", "windows_reset": 2})
+
+    snapshot = service.accounts_snapshot()
+    account = snapshot["accounts"][0]
+    assert account["reset_credits"][0]["expires_at"] == "2026-08-01T03:56:22Z"
+    assert account["quota_reset_guard"]["weekly_exhausted"] is False
+    assert account["quota_reset_guard"]["required_confirmations"] == 3
+
+    with pytest.raises(BillingError, match="三次确认"):
+        service.reset_account_quota("codex-account", "测试", confirmations=2)
+    assert consumed == []
+
+    result = service.reset_account_quota("codex-account", "测试上游额度重置", confirmations=3)
+    assert result["status"] == "reset"
+    assert result["windows_reset"] == 2
+    assert len(consumed) == 1
+    assert consumed[0][0] == ("codex-auth-index", "chatgpt-account")
 
 
 def test_quota_available_estimate_uses_half_point_bounds(service) -> None:

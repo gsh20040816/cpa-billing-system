@@ -36,7 +36,7 @@ const gradientDialog = reactive({ open: false, id: null, name: '', description: 
 const deleteGradientDialog = reactive({ open: false, rule: null, reason: '' })
 const keyProfileDialog = reactive({ open: false, key: null, name: '', multiplier: '', reason: '' })
 const userAdminDialog = reactive({ open: false, user: null, is_admin: false, reason: '' })
-const resetQuotaDialog = reactive({ open: false, account: null, reason: '' })
+const resetQuotaDialog = reactive({ open: false, account: null, reason: '', confirm_not_exhausted: false })
 const pricingSearch = ref('')
 const pricingRuleDialog = reactive({
   open: false,
@@ -116,8 +116,11 @@ async function mutate(path, body, success, method = 'POST') {
 }
 
 function openResetQuota(account) {
-  Object.assign(resetQuotaDialog, { open: true, account, reason: '' })
+  Object.assign(resetQuotaDialog, { open: true, account, reason: '', confirm_not_exhausted: false })
 }
+
+const resetQuotaNeedsExtraConfirmation = computed(() => resetQuotaDialog.account?.quota_reset_guard?.weekly_exhausted !== true)
+const resetQuotaRequiredConfirmations = computed(() => resetQuotaNeedsExtraConfirmation.value ? 3 : 2)
 
 async function resetQuota() {
   const account = resetQuotaDialog.account
@@ -125,10 +128,14 @@ async function resetQuota() {
     notify('请填写重置原因', 'warning')
     return
   }
+  if (resetQuotaNeedsExtraConfirmation.value && !resetQuotaDialog.confirm_not_exhausted) {
+    notify('本周额度尚未被 CPA 标记为耗尽，必须完成第三次确认', 'warning')
+    return
+  }
   const result = await mutate(
-    `/api/admin/accounts/${encodeURIComponent(account.id)}/reset-quota`,
-    { reason: resetQuotaDialog.reason.trim() },
-    '已清除 CPA 本地额度状态；这不是上游套餐额度充值',
+    `/api/admin/accounts/${encodeURIComponent(account.id)}/reset-upstream-quota`,
+    { reason: resetQuotaDialog.reason.trim(), confirmations: resetQuotaRequiredConfirmations.value },
+    '已消耗一个主动重置次数并重置上游 Codex 额度',
   )
   if (result) resetQuotaDialog.open = false
 }
@@ -533,7 +540,7 @@ const autoRefresh = useAutoRefresh((silent) => load(silent), { interval: 30_000 
             <div class="section-band__body section-band__body--flush">
               <v-table density="compact">
                 <thead><tr><th>账号</th><th>类型</th><th>计划</th><th class="text-right">请求</th><th class="text-right">Tokens</th><th class="text-right">费用</th><th>额度</th><th class="text-right">操作</th></tr></thead>
-                <tbody><tr v-for="item in data?.accounts?.accounts || []" :key="item.id"><td>{{ item.name }}</td><td>{{ item.type }}</td><td>{{ item.plan_type }}</td><td class="text-right mono">{{ number(item.usage.requests) }}</td><td class="text-right mono">{{ number(item.usage.total_tokens) }}</td><td class="text-right mono">{{ money(item.usage.cost) }}</td><td>{{ item.quota.map(q => `${q.label} ${q.used_percent}%`).join(' · ') || '-' }}</td><td class="text-right"><v-btn v-if="item.can_refresh" size="small" variant="text" color="warning" @click="openResetQuota(item)"><RefreshCw :size="15" class="mr-1" />重置本地状态</v-btn><span v-else class="data-muted">不可用</span></td></tr></tbody>
+                <tbody><tr v-for="item in data?.accounts?.accounts || []" :key="item.id"><td>{{ item.name }}</td><td>{{ item.type }}</td><td>{{ item.plan_type }}</td><td class="text-right mono">{{ number(item.usage.requests) }}</td><td class="text-right mono">{{ number(item.usage.total_tokens) }}</td><td class="text-right mono">{{ money(item.usage.cost) }}</td><td><div v-for="quota in item.quota || []" :key="quota.key"><div>{{ quota.label }}</div><div class="data-muted text-caption">恢复 {{ dateTime(quota.reset_at) }}</div></div><div v-for="credit in item.reset_credits || []" :key="credit.id" class="data-muted text-caption">主动重置过期 {{ dateTime(credit.expires_at) }}</div><span v-if="!item.quota?.length && !item.reset_credits?.length" class="data-muted">-</span></td><td class="text-right"><v-btn v-if="item.can_refresh && item.reset_credits?.length" size="small" variant="text" color="warning" @click="openResetQuota(item)"><RefreshCw :size="15" class="mr-1" />重置上游额度</v-btn><span v-else-if="item.can_refresh" class="data-muted">无可用主动重置次数</span><span v-else class="data-muted">不可用</span></td></tr></tbody>
               </v-table>
             </div>
           </section>
@@ -735,15 +742,33 @@ const autoRefresh = useAutoRefresh((silent) => load(silent), { interval: 30_000 
       </v-window>
     </LoadingState>
 
-    <v-dialog v-model="resetQuotaDialog.open" max-width="520">
+    <v-dialog v-model="resetQuotaDialog.open" max-width="620">
       <v-card>
-        <v-card-title>确认重置 CPA 本地额度状态</v-card-title>
+        <v-card-title>确认重置上游 Codex 额度</v-card-title>
         <v-card-text>
-          <v-alert type="warning" variant="tonal" class="mb-4">该操作只清除 CPA 的 quota/cooldown 路由状态，不会充值或手动重置上游套餐额度。</v-alert>
+          <v-alert type="error" variant="tonal" class="mb-4">该操作会消耗一个上游“主动重置次数”，直接调用 Codex 官方重置接口；不是刷新额度，也不是清除 CPA 本地状态。操作成功后，上游周窗口会重新计算。</v-alert>
           <div class="mb-3">账号：<strong>{{ resetQuotaDialog.account?.name || '-' }}</strong></div>
+          <div v-if="resetQuotaDialog.account?.reset_credits?.length" class="quota-reset-details mb-4">
+            <div class="text-subtitle-2 mb-2">可用主动重置次数及过期时间</div>
+            <div v-for="(credit, index) in resetQuotaDialog.account.reset_credits" :key="credit.id" class="d-flex justify-space-between ga-3 text-body-2">
+              <span>第 {{ index + 1 }} 次</span>
+              <strong>过期 {{ dateTime(credit.expires_at) }}</strong>
+            </div>
+          </div>
+          <div v-if="resetQuotaDialog.account?.quota_reset_guard?.weekly_windows?.length" class="quota-reset-details mb-4">
+            <div class="text-subtitle-2 mb-2">CPA 当前周窗口状态</div>
+            <div v-for="quota in resetQuotaDialog.account.quota_reset_guard.weekly_windows" :key="quota.key" class="d-flex justify-space-between ga-3 text-body-2">
+              <span>{{ quota.label }} · 已用 {{ quota.used_percent ?? '-' }}%</span>
+              <strong>恢复 {{ dateTime(quota.reset_at) }}</strong>
+            </div>
+            <div class="data-muted text-caption mt-2">CPA 状态：{{ resetQuotaDialog.account.quota_reset_guard.cpa_status }}{{ resetQuotaDialog.account.quota_reset_guard.cpa_status_message ? ` · ${resetQuotaDialog.account.quota_reset_guard.cpa_status_message}` : '' }}</div>
+          </div>
+          <v-alert v-if="resetQuotaNeedsExtraConfirmation" type="warning" variant="tonal" class="mb-4">CPA 当前没有报告本周额度已耗尽或账号已暂停。不能仅凭 100% 使用率判断；继续操作需要第三次确认。</v-alert>
+          <v-alert v-else type="warning" variant="tonal" class="mb-4">CPA 当前已报告本周额度耗尽或账号暂停。本操作仍会消耗一个主动重置次数。</v-alert>
+          <v-checkbox v-if="resetQuotaNeedsExtraConfirmation" v-model="resetQuotaDialog.confirm_not_exhausted" color="error" label="我确认当前本周额度未被 CPA 标记为耗尽，仍要消耗主动重置次数" hide-details class="mb-2" />
           <v-textarea v-model="resetQuotaDialog.reason" label="操作原因" rows="3" required />
         </v-card-text>
-        <v-card-actions><v-spacer /><v-btn variant="text" @click="resetQuotaDialog.open = false">取消</v-btn><v-btn color="warning" :loading="mutating" :disabled="!resetQuotaDialog.reason.trim()" @click="resetQuota">确认重置</v-btn></v-card-actions>
+        <v-card-actions><v-spacer /><v-btn variant="text" @click="resetQuotaDialog.open = false">取消</v-btn><v-btn color="error" :loading="mutating" :disabled="!resetQuotaDialog.reason.trim() || (resetQuotaNeedsExtraConfirmation && !resetQuotaDialog.confirm_not_exhausted)" @click="resetQuota">确认重置（第 {{ resetQuotaRequiredConfirmations }} 次）</v-btn></v-card-actions>
       </v-card>
     </v-dialog>
 
