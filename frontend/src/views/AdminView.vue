@@ -36,6 +36,7 @@ const gradientDialog = reactive({ open: false, id: null, name: '', description: 
 const deleteGradientDialog = reactive({ open: false, rule: null, reason: '' })
 const keyProfileDialog = reactive({ open: false, key: null, name: '', multiplier: '', reason: '' })
 const userAdminDialog = reactive({ open: false, user: null, is_admin: false, reason: '' })
+const resetQuotaDialog = reactive({ open: false, account: null, reason: '' })
 const pricingSearch = ref('')
 const pricingRuleDialog = reactive({
   open: false,
@@ -112,6 +113,24 @@ async function mutate(path, body, success, method = 'POST') {
   } finally {
     mutating.value = false
   }
+}
+
+function openResetQuota(account) {
+  Object.assign(resetQuotaDialog, { open: true, account, reason: '' })
+}
+
+async function resetQuota() {
+  const account = resetQuotaDialog.account
+  if (!account || !resetQuotaDialog.reason.trim()) {
+    notify('请填写重置原因', 'warning')
+    return
+  }
+  const result = await mutate(
+    `/api/admin/accounts/${encodeURIComponent(account.id)}/reset-quota`,
+    { reason: resetQuotaDialog.reason.trim() },
+    '已清除 CPA 本地额度状态；这不是上游套餐额度充值',
+  )
+  if (result) resetQuotaDialog.open = false
 }
 
 function initializePoolCosts(target, existing = []) {
@@ -510,11 +529,11 @@ const autoRefresh = useAutoRefresh((silent) => load(silent), { interval: 30_000 
             </div>
           </section>
           <section class="section-band">
-            <div class="section-band__head"><div><h2>上游账号</h2><p>额度百分比来自 Keeper，用量与费用来自本地账本</p></div></div>
+            <div class="section-band__head"><div><h2>上游账号</h2><p>额度与窗口来自 CPA 上游读取，用量与费用来自本地账本</p></div></div>
             <div class="section-band__body section-band__body--flush">
               <v-table density="compact">
-                <thead><tr><th>账号</th><th>类型</th><th>计划</th><th class="text-right">请求</th><th class="text-right">Tokens</th><th class="text-right">费用</th><th>额度</th></tr></thead>
-                <tbody><tr v-for="item in data?.accounts?.accounts || []" :key="item.id"><td>{{ item.name }}</td><td>{{ item.type }}</td><td>{{ item.plan_type }}</td><td class="text-right mono">{{ number(item.usage.requests) }}</td><td class="text-right mono">{{ number(item.usage.total_tokens) }}</td><td class="text-right mono">{{ money(item.usage.cost) }}</td><td>{{ item.quota.map(q => `${q.label} ${q.used_percent}%`).join(' · ') || '-' }}</td></tr></tbody>
+                <thead><tr><th>账号</th><th>类型</th><th>计划</th><th class="text-right">请求</th><th class="text-right">Tokens</th><th class="text-right">费用</th><th>额度</th><th class="text-right">操作</th></tr></thead>
+                <tbody><tr v-for="item in data?.accounts?.accounts || []" :key="item.id"><td>{{ item.name }}</td><td>{{ item.type }}</td><td>{{ item.plan_type }}</td><td class="text-right mono">{{ number(item.usage.requests) }}</td><td class="text-right mono">{{ number(item.usage.total_tokens) }}</td><td class="text-right mono">{{ money(item.usage.cost) }}</td><td>{{ item.quota.map(q => `${q.label} ${q.used_percent}%`).join(' · ') || '-' }}</td><td class="text-right"><v-btn v-if="item.can_refresh" size="small" variant="text" color="warning" @click="openResetQuota(item)"><RefreshCw :size="15" class="mr-1" />重置本地状态</v-btn><span v-else class="data-muted">不可用</span></td></tr></tbody>
               </v-table>
             </div>
           </section>
@@ -715,6 +734,18 @@ const autoRefresh = useAutoRefresh((silent) => load(silent), { interval: 30_000 
         </v-window-item>
       </v-window>
     </LoadingState>
+
+    <v-dialog v-model="resetQuotaDialog.open" max-width="520">
+      <v-card>
+        <v-card-title>确认重置 CPA 本地额度状态</v-card-title>
+        <v-card-text>
+          <v-alert type="warning" variant="tonal" class="mb-4">该操作只清除 CPA 的 quota/cooldown 路由状态，不会充值或手动重置上游套餐额度。</v-alert>
+          <div class="mb-3">账号：<strong>{{ resetQuotaDialog.account?.name || '-' }}</strong></div>
+          <v-textarea v-model="resetQuotaDialog.reason" label="操作原因" rows="3" required />
+        </v-card-text>
+        <v-card-actions><v-spacer /><v-btn variant="text" @click="resetQuotaDialog.open = false">取消</v-btn><v-btn color="warning" :loading="mutating" :disabled="!resetQuotaDialog.reason.trim()" @click="resetQuota">确认重置</v-btn></v-card-actions>
+      </v-card>
+    </v-dialog>
 
     <v-dialog v-model="cycleDialog.open" max-width="760">
       <v-card><v-card-title>创建账期</v-card-title><v-card-text><div class="dialog-grid"><v-text-field v-model="cycleDialog.name" label="名称" /><v-select v-model="cycleDialog.gradient_rule_id" :items="activeGradients" item-title="name" item-value="id" label="梯度规则" /><v-text-field v-model="cycleDialog.start" label="开始时间" type="datetime-local" /><v-text-field v-model="cycleDialog.end" label="结束时间" type="datetime-local" /><div class="dialog-wide pool-cost-editor"><div class="editor-label">资源池固定成本（人民币）</div><v-text-field v-for="pool in activePools" :key="pool.id" v-model="cycleDialog.pool_costs[pool.id]" :label="pool.name" type="number" min="0" step="0.01" prefix="¥" /></div><v-textarea v-model="cycleDialog.waiver" label="数据质量说明" rows="2" class="dialog-wide" /></div></v-card-text><v-card-actions><v-spacer /><v-btn variant="text" @click="cycleDialog.open = false">取消</v-btn><v-btn color="primary" :loading="mutating" @click="createCycle"><Save :size="16" class="mr-2" />创建</v-btn></v-card-actions></v-card>

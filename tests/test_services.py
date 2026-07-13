@@ -671,70 +671,45 @@ def test_confirmation_token_is_claimed_before_external_key_operation(service, mo
     assert len(calls) == 1
 
 
-def test_keeper_accounts_are_sanitized_and_refresh_uses_public_account_ids(service, monkeypatch) -> None:
+def test_cpa_accounts_are_sanitized_and_refresh_uses_public_account_ids(service, monkeypatch) -> None:
     current = int(time.time() * 1000)
-    reset_at = datetime.fromtimestamp((current + 3_600_000) / 1000, ZoneInfo("Asia/Shanghai")).isoformat()
-    raw = {
-        "identities": [{
+    reset_at = current + 3_600_000
+    files = [{
             "id": "7",
             "name": "secret@example.com",
-            "displayName": "Shared Pro",
-            "identity": "raw-auth-index",
-            "file_name": "secret.json",
-            "file_path": "/root/private/secret.json",
+            "label": "Shared Pro",
+            "auth_index": "raw-auth-index",
+            "path": "/root/private/secret.json",
             "type": "codex",
             "provider": "codex",
-            "auth_type_name": "oauth",
-            "plan_type": "pro",
+            "account_type": "oauth",
+            "id_token": {"plan_type": "pro"},
             "disabled": False,
-            "total_requests": 10,
-            "success_count": 9,
-            "failure_count": 1,
-            "total_tokens": 1234,
+        }]
+    quota = {
+        "plan_type": "pro",
+        "rate_limit": {"primary_window": {
+            "used_percent": 42,
+            "allowed": True,
+            "limit_reached": False,
+            "limit_window_seconds": 18000,
+            "reset_at": reset_at,
+        }},
+        "additional_rate_limits": [{
+            "limit_name": "GPT-5.3-Codex-Spark",
+            "metered_feature": "codex_bengalfox",
+            "rate_limit": {"primary_window": {
+                "used_percent": 7,
+                "limit_window_seconds": 18000,
+                "reset_at": reset_at,
+            }},
         }],
-        "quota": {"items": [{
-            "auth_index": "raw-auth-index",
-            "file_name": "secret.json",
-            "status": "completed",
-            "refreshed_at": "2026-07-11T12:00:00+08:00",
-            "quota": {"quota": [
-                {
-                    "key": "rate_limit.primary_window",
-                    "label": "5h",
-                    "scope": "window",
-                    "usedPercent": 42,
-                    "allowed": True,
-                    "limitReached": False,
-                    "window": {"seconds": 18000},
-                    "resetAt": reset_at,
-                    "window_usage_tokens": 999999999,
-                    "window_usage_cost": 999999,
-                },
-                {
-                    "key": "additional_rate_limits.gpt-5.3-codex-spark.primary_window",
-                    "label": "GPT-5.3-Codex-Spark 5h",
-                    "scope": "additional",
-                    "metric": "codex_bengalfox",
-                    "usedPercent": 7,
-                    "window": {"seconds": 18000},
-                    "resetAt": reset_at,
-                },
-            ]},
-        }]},
-        "inspection": {"total": 1, "normal": 1, "results": [{
-            "auth_index": "raw-auth-index", "file_name": "secret.json", "name": "Shared Pro", "status": "normal",
-        }]},
     }
-
-    class FakeKeeper:
-        def accounts_snapshot(self):
-            return raw
-
-        def refresh(self, auth_indexes):
-            assert auth_indexes == ["raw-auth-index"]
-            return {"tasks": [{"authIndex": "raw-auth-index"}], "accepted": 1, "skipped": 0, "limit": 1}
-
-    monkeypatch.setattr(service, "keeper", FakeKeeper())
+    monkeypatch.setattr(service.cpa, "auth_files", lambda: files)
+    monkeypatch.setattr(service.cpa, "api_call", lambda *args, **kwargs: {
+        "status_code": 200,
+        "body": json.dumps(quota),
+    })
     insert_event(
         service.settings,
         "account-key",
@@ -806,17 +781,11 @@ def test_keeper_accounts_are_sanitized_and_refresh_uses_public_account_ids(servi
         "display_models": ["GPT-5.3-Codex-Spark"],
     }
 
-    raw["quota"]["items"][0]["quota"]["quota"][0]["resetAt"] = datetime.fromtimestamp(
-        (current + 3_600_000 + 4 * 60_000) / 1000,
-        ZoneInfo("Asia/Shanghai"),
-    ).isoformat()
+    quota["rate_limit"]["primary_window"]["reset_at"] = current + 3_600_000 + 4 * 60_000
     jittered = service.accounts_snapshot()["accounts"][0]["quota"][0]
     assert jittered["window_started_at"] == primary["window_started_at"]
 
-    raw["quota"]["items"][0]["quota"]["quota"][0]["resetAt"] = datetime.fromtimestamp(
-        (current + 3_600_000 + 6 * 60_000) / 1000,
-        ZoneInfo("Asia/Shanghai"),
-    ).isoformat()
+    quota["rate_limit"]["primary_window"]["reset_at"] = current + 3_600_000 + 6 * 60_000
     shifted = service.accounts_snapshot()["accounts"][0]["quota"][0]
     assert shifted["window_started_at"] == datetime.fromtimestamp(
         (current - 4 * 3_600_000 + 6 * 60_000) / 1000,
@@ -824,7 +793,8 @@ def test_keeper_accounts_are_sanitized_and_refresh_uses_public_account_ids(servi
     ).isoformat()
 
     refresh = service.refresh_account_quotas(["7"])
-    assert refresh["tasks"] == [{"account_id": "7", "status": "queued"}]
+    assert refresh["tasks"] == []
+    assert refresh["accepted"] == 1
 
 
 def test_quota_available_estimate_uses_half_point_bounds(service) -> None:
@@ -845,31 +815,21 @@ def test_quota_available_estimate_uses_half_point_bounds(service) -> None:
     assert zero_cost["reason"] == "zero_cost"
 
 
-def test_keeper_refresh_accepts_null_task_lists(service, monkeypatch) -> None:
-    raw = {
-        "identities": [{
+def test_cpa_refresh_reports_failed_quota_reads_without_tasks(service, monkeypatch) -> None:
+    files = [{
             "id": "7",
-            "identity": "raw-auth-index",
-            "displayName": "Shared Pro",
+            "auth_index": "raw-auth-index",
+            "name": "Shared Pro",
+            "type": "codex",
+            "provider": "codex",
             "disabled": False,
-        }],
-        "quota": {"items": []},
-        "inspection": {},
-    }
-
-    class FakeKeeper:
-        def accounts_snapshot(self):
-            return raw
-
-        def refresh(self, auth_indexes):
-            assert auth_indexes == ["raw-auth-index"]
-            return {"tasks": None, "rejected": None, "accepted": 0, "skipped": 1, "limit": 1}
-
-    monkeypatch.setattr(service, "keeper", FakeKeeper())
+        }]
+    monkeypatch.setattr(service.cpa, "auth_files", lambda: files)
+    monkeypatch.setattr(service.cpa, "api_call", lambda *args, **kwargs: {"status_code": 503, "body": "{}"})
     result = service.refresh_account_quotas(["7"])
     assert result["tasks"] == []
-    assert result["rejected"] == []
-    assert result["skipped"] == 1
+    assert result["rejected"] == [{"account_id": "7", "error": "上游额度接口返回 HTTP 503"}]
+    assert result["accepted"] == 0
 
 
 def test_membership_cache_can_require_recent_group_status(service) -> None:
@@ -1182,15 +1142,8 @@ def test_read_pages_do_not_rate_events(service, settings, monkeypatch) -> None:
     dashboard = service.dashboard("pending-pages")
     assert dashboard["cycle"]["unpriced_events"] == 1
 
-    class FakeKeeper:
-        def status_snapshot(self, range_name, window, start, end):
-            return {"status": {}, "version": {}, "update": {}}
-
-        def accounts_snapshot(self):
-            return {"identities": [], "quota": {"items": []}, "inspection": {}}
-
-    monkeypatch.setattr(service, "keeper", FakeKeeper())
-    assert service.site_status("24h", "15m")["keeper"]["overview"]["summary"]["unpriced_events"] == 1
+    monkeypatch.setattr(service.cpa, "auth_files", lambda: [])
+    assert service.site_status("24h")["overview"]["summary"]["unpriced_events"] == 1
     assert service.accounts_snapshot()["accounts"] == []
 
 
@@ -1200,20 +1153,38 @@ def test_site_status_usage_is_calculated_locally(service, settings, monkeypatch)
     service.sync_cpamp()
     service.rate_events()
 
-    class FakeKeeper:
-        def status_snapshot(self, range_name, window, start, end):
-            return {
-                "status": {"running": True},
-                "version": {"version": "test"},
-                "update": {"updateAvailable": False},
-            }
+    monkeypatch.setattr(service.cpa, "auth_files", lambda: [])
+    status = service.site_status("24h")
+    assert status["overview"]["summary"]["request_count"] == 1
+    assert status["overview"]["summary"]["token_count"] == 1100
+    assert status["overview"]["summary"]["source"] == "billing-panel"
+    assert status["realtime"]["source"] == "billing-panel"
 
-    monkeypatch.setattr(service, "keeper", FakeKeeper())
-    status = service.site_status("24h", "15m")
-    assert status["keeper"]["overview"]["summary"]["request_count"] == 1
-    assert status["keeper"]["overview"]["summary"]["token_count"] == 1100
-    assert status["keeper"]["overview"]["summary"]["source"] == "billing-panel"
-    assert status["keeper"]["realtime"]["source"] == "billing-panel"
+
+def test_site_status_supports_shared_ranges_and_cache_hit_rate(service, settings, monkeypatch) -> None:
+    current = int(time.time() * 1000)
+    insert_event(
+        settings,
+        "cache-key",
+        current - 1000,
+        event_hash="cache-hit",
+        input_tokens=1000,
+        cached_tokens=0,
+        cache_read_tokens=500,
+    )
+    service.sync_cpamp()
+    service.rate_events()
+    monkeypatch.setattr(service.cpa, "auth_files", lambda: [])
+
+    recent = service.site_status("60m")
+    assert recent["range"]["name"] == "60m"
+    assert recent["realtime"]["range"] == "60m"
+    assert any(item["cache_hit_rate"] == 50.0 for item in recent["realtime"]["cache_level"])
+
+    all_time = service.site_status("all")
+    assert all_time["range"]["name"] == "all"
+    assert all_time["range"]["start"] is not None
+    assert all_time["overview"]["summary"]["request_count"] == 1
 
 
 def test_rankings_keep_unowned_keys_separate_and_masked(service, settings) -> None:

@@ -1,10 +1,12 @@
 export const TIME_RANGE_ITEMS = [
   { title: '今天', value: 'today' },
+  { title: '近60min', value: '60m' },
   { title: '昨天', value: 'yesterday' },
   { title: '24h', value: '24h' },
   { title: '7d', value: '7d' },
   { title: '30d', value: '30d' },
   { title: '当前账期', value: 'cycle' },
+  { title: '所有时间', value: 'all' },
   { title: '自定义', value: 'custom' },
 ]
 

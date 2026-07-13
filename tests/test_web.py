@@ -159,7 +159,7 @@ def test_admin_can_grant_and_revoke_web_access_for_telegram_user(settings, monke
     user_client.post("/auth/logout", headers={"X-CSRF-Token": user_login["csrf_token"]})
 
 
-def test_site_mutations_require_user_csrf_and_expose_no_quota_reset(settings, monkeypatch) -> None:
+def test_site_mutations_require_user_csrf_and_admin_quota_reset(settings, monkeypatch) -> None:
     app = create_app(settings)
     add_user(app, settings, 2, "sk-cpa-user-two-secret")
     monkeypatch.setattr(app.state.service.cpa, "list_keys", lambda: ["sk-cpa-user-two-secret"])
@@ -180,7 +180,29 @@ def test_site_mutations_require_user_csrf_and_expose_no_quota_reset(settings, mo
         headers={"X-CSRF-Token": login["csrf_token"]},
     )
     assert throttled.status_code == 429
-    assert client.post("/api/site/accounts/reset", json={}).status_code in {404, 405}
+    assert client.post("/api/admin/accounts/account-1/reset-quota", json={}).status_code == 403
+
+    admin_client = TestClient(app, base_url="https://billing.example")
+    admin_login = admin_client.post("/auth/admin/login", json={"management_token": settings.admin_token})
+    admin_csrf = admin_login.json()["csrf_token"]
+    monkeypatch.setattr(
+        app.state.service,
+        "reset_account_quota",
+        lambda account_id, reason, operator_id, operator_type: {"ok": True, "account_id": account_id, "status": "ok"},
+    )
+    missing_reason = admin_client.post(
+        "/api/admin/accounts/account-1/reset-quota",
+        headers={"X-CSRF-Token": admin_csrf},
+        json={"reason": ""},
+    )
+    assert missing_reason.status_code == 422
+    reset = admin_client.post(
+        "/api/admin/accounts/account-1/reset-quota",
+        headers={"X-CSRF-Token": admin_csrf},
+        json={"reason": "测试本地额度状态"},
+    )
+    assert reset.status_code == 200
+    assert reset.json()["status"] == "ok"
 
 
 def test_login_limiter_counts_failures_only() -> None:

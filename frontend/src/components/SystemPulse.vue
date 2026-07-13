@@ -14,13 +14,13 @@ const items = computed(() => {
   const pulse = data.value
   if (!pulse) return [
     { label: 'CPA', value: '读取中', tone: 'warn' },
-    { label: 'Keeper', value: '读取中', tone: 'warn' },
+    { label: '上游账号', value: '读取中', tone: 'warn' },
     { label: '同步 Worker', value: '读取中', tone: 'warn' },
     { label: '上游额度', value: '读取中', tone: 'warn' },
   ]
-  const quotaTotal = pulse.keeper?.quota_total
-  const quotaNormal = pulse.keeper?.quota_normal
-  const quotaWarn = Number(pulse.keeper?.quota_limit_reached || 0) > 0 || Number(pulse.keeper?.quota_failed || 0) > 0
+  const quotaTotal = pulse.accounts?.total
+  const quotaNormal = pulse.accounts?.normal
+  const quotaWarn = Number(pulse.accounts?.limit_reached || 0) > 0 || Number(pulse.accounts?.failed || 0) > 0
   return [
     {
       label: 'CPA',
@@ -28,9 +28,9 @@ const items = computed(() => {
       tone: tone(Boolean(pulse.cpa?.reachable)),
     },
     {
-      label: 'Keeper',
-      value: pulse.keeper?.available && pulse.keeper?.running ? `运行中 · ${dateTime(pulse.keeper.last_run_at)}` : '不可用',
-      tone: tone(Boolean(pulse.keeper?.available && pulse.keeper?.running), !pulse.keeper?.sync_running),
+      label: '上游账号',
+      value: pulse.accounts?.available ? `${number(quotaTotal)} 个已读取` : '不可用',
+      tone: tone(Boolean(pulse.accounts?.available), quotaWarn),
     },
     {
       label: '同步 Worker',
@@ -40,7 +40,7 @@ const items = computed(() => {
     {
       label: '上游额度',
       value: quotaTotal === undefined || quotaTotal === null ? '暂无缓存' : `${quotaNormal}/${quotaTotal} 正常`,
-      tone: tone(Boolean(pulse.keeper?.available), quotaWarn),
+      tone: tone(Boolean(pulse.accounts?.available), quotaWarn),
     },
   ]
 })
@@ -53,7 +53,7 @@ async function load() {
   } catch {
     data.value = {
       cpa: { reachable: false },
-      keeper: { available: false },
+      accounts: { available: false },
       worker: { healthy: false },
     }
   } finally {

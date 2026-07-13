@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   DEFAULT_TIME_RANGE,
+  TIME_RANGE_ITEMS,
   isTimeRangeReady,
   isValidCustomHours,
   normalizedCustomHours,
@@ -16,6 +17,9 @@ describe('time range helpers', () => {
   it('serializes the shared fixed ranges', () => {
     expect(timeRangeQuery({ ...DEFAULT_TIME_RANGE, range: 'today' })).toEqual({ range: 'today', cycle: null, hours: null })
     expect(timeRangeQuery({ ...DEFAULT_TIME_RANGE, range: 'cycle', cycle: '2026-07' })).toEqual({ range: 'cycle', cycle: '2026-07', hours: null })
+    expect(TIME_RANGE_ITEMS.map((item) => item.value)).toEqual(expect.arrayContaining(['60m', 'all']))
+    expect(timeRangeQuery({ ...DEFAULT_TIME_RANGE, range: '60m' })).toEqual({ range: '60m', cycle: null, hours: null })
+    expect(timeRangeQuery({ ...DEFAULT_TIME_RANGE, range: 'all' })).toEqual({ range: 'all', cycle: null, hours: null })
   })
 
   it('accepts only positive integer custom hours', () => {

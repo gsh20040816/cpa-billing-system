@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onBeforeUnmount, reactive, ref } from 'vue'
+import { computed, reactive, ref } from 'vue'
 import { RefreshCw, ServerCog } from '@lucide/vue'
 import { api } from '../api'
 import LoadingState from '../components/LoadingState.vue'
@@ -13,7 +13,6 @@ const refreshingAll = ref(false)
 const error = ref('')
 const data = ref(null)
 const refreshing = reactive({})
-const timers = new Set()
 const snackbar = reactive({ show: false, text: '', color: 'success' })
 
 const metrics = computed(() => {
@@ -66,52 +65,22 @@ async function load(silent = false) {
   }
 }
 
-function delay(ms) {
-  return new Promise((resolve) => {
-    const id = window.setTimeout(() => {
-      timers.delete(id)
-      resolve()
-    }, ms)
-    timers.add(id)
-  })
-}
-
-async function poll(accountId) {
-  for (let attempt = 0; attempt < 30; attempt += 1) {
-    await delay(2000)
-    try {
-      const result = await api(`/api/site/accounts/${encodeURIComponent(accountId)}/refresh`)
-      if (result.status === 'completed') {
-        notify('额度已刷新')
-        await autoRefresh.refresh()
-        return
-      }
-      if (result.status === 'failed') {
-        notify('额度刷新失败', 'error')
-        return
-      }
-    } catch (exc) {
-      if (exc.status !== 404) {
-        notify(exc.message, 'error')
-        return
-      }
-    }
-  }
-  notify('额度刷新仍在执行，请稍后刷新页面', 'warning')
-}
-
 async function refreshAccounts(accountIds = []) {
   const all = accountIds.length === 0
   if (all) refreshingAll.value = true
   accountIds.forEach((id) => { refreshing[id] = true })
   try {
     const result = await api('/api/site/accounts/refresh', { body: { account_ids: accountIds } })
-    if (!result.tasks.length && result.rejected.length) {
-      notify('Keeper 未接受额度刷新', 'error')
-      return
+    if (result.rejected?.length) {
+      notify(`已重新读取 ${result.accepted} 个账号，${result.rejected.length} 个失败`, 'warning')
+    } else {
+      notify(`已重新读取 ${result.accepted} 个账号`, 'success')
     }
-    notify(`已提交 ${result.accepted} 个额度刷新任务`, 'info')
-    await Promise.all(result.tasks.map((task) => poll(task.account_id)))
+    if (result.accounts) {
+      data.value = { accounts: result.accounts, inspection: result.inspection }
+    } else {
+      await autoRefresh.refresh()
+    }
   } catch (exc) {
     notify(exc.message, 'error')
   } finally {
@@ -121,12 +90,11 @@ async function refreshAccounts(accountIds = []) {
 }
 
 const autoRefresh = useAutoRefresh((silent) => load(silent), { interval: 60_000 })
-onBeforeUnmount(() => timers.forEach((id) => window.clearTimeout(id)))
 </script>
 
 <template>
   <div class="content-shell">
-    <PageHeader title="上游账号" subtitle="额度百分比来自 Keeper；请求、Token 与费用由本面板按 CPAMP 事件计算">
+    <PageHeader title="上游账号" subtitle="额度百分比来自 CPA 上游读取；请求、Token 与费用由本面板按 CPAMP 事件计算">
       <template #actions>
         <v-btn color="primary" :loading="refreshingAll" @click="refreshAccounts()">
           <RefreshCw :size="17" class="mr-2" />刷新全部额度
@@ -134,7 +102,7 @@ onBeforeUnmount(() => timers.forEach((id) => window.clearTimeout(id)))
       </template>
     </PageHeader>
 
-    <LoadingState :loading="loading" :error="error" :empty="!data?.accounts?.length" empty-text="Keeper 暂无上游账号" @retry="autoRefresh.refresh()">
+    <LoadingState :loading="loading" :error="error" :empty="!data?.accounts?.length" empty-text="CPA 暂无上游账号" @retry="autoRefresh.refresh()">
       <MetricRail :items="metrics" :columns="6" />
       <div class="account-list">
         <v-card v-for="account in data?.accounts || []" :key="account.id" border class="account-card">

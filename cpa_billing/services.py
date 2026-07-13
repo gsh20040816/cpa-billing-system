@@ -168,6 +168,42 @@ class CPAClient:
             "latency_ms": round((time.monotonic() - started) * 1000),
         }
 
+    def auth_files(self) -> list[dict[str, Any]]:
+        data = self._request("GET", "/v0/management/auth-files")
+        files = data.get("files") if isinstance(data, dict) else None
+        if not isinstance(files, list):
+            raise BillingError("CPA auth-files response is invalid")
+        return [item for item in files if isinstance(item, dict)]
+
+    def api_call(
+        self,
+        auth_index: str,
+        method: str,
+        url: str,
+        headers: dict[str, str] | None = None,
+        data: str = "",
+    ) -> dict[str, Any]:
+        result = self._request(
+            "POST",
+            "/v0/management/api-call",
+            json={
+                "auth_index": auth_index,
+                "method": method,
+                "url": url,
+                "header": headers or {},
+                "data": data,
+            },
+        )
+        if not isinstance(result, dict):
+            raise BillingError("CPA api-call response is invalid")
+        return result
+
+    def reset_quota(self, auth_index: str) -> dict[str, Any]:
+        result = self._request("POST", "/v0/management/reset-quota", json={"auth_index": auth_index})
+        if not isinstance(result, dict):
+            raise BillingError("CPA reset-quota response is invalid")
+        return result
+
 
 class CPAMPClient:
     def __init__(self, settings: Settings) -> None:
@@ -189,72 +225,6 @@ class CPAMPClient:
         if not isinstance(result, dict):
             raise BillingError("CPAMP model price sync response is invalid")
         return result
-
-
-class KeeperClient:
-    REQUEST_HEADER = {"X-CPA-Usage-Keeper-Request": "fetch"}
-
-    def __init__(self, settings: Settings) -> None:
-        self.base_url = settings.keeper_base_url
-        self.password = settings.keeper_login_password
-
-    @contextmanager
-    def session(self) -> Iterator[httpx.Client]:
-        if not self.password:
-            raise BillingDependencyError("Keeper 登录密码未配置")
-        with httpx.Client(timeout=httpx.Timeout(20, connect=5)) as client:
-            response = client.post(
-                f"{self.base_url}/api/v1/auth/login",
-                json={"password": self.password},
-                headers=self.REQUEST_HEADER,
-            )
-            response.raise_for_status()
-            yield client
-
-    def request(self, client: httpx.Client, method: str, path: str, **kwargs: Any) -> Any:
-        headers = dict(kwargs.pop("headers", {}))
-        headers.update(self.REQUEST_HEADER)
-        response = client.request(method, f"{self.base_url}/api/v1{path}", headers=headers, **kwargs)
-        response.raise_for_status()
-        return response.json() if response.content else None
-
-    def status_snapshot(self, range_name: str, window: str, start: str | None, end: str | None) -> dict[str, Any]:
-        with self.session() as client:
-            try:
-                update_status = self.request(client, "GET", "/update/check")
-            except httpx.HTTPError:
-                update_status = {"available": False, "error": "Keeper 更新检查不可用"}
-            return {
-                "status": self.request(client, "GET", "/status"),
-                "version": self.request(client, "GET", "/version"),
-                "update": update_status,
-            }
-
-    def accounts_snapshot(self) -> dict[str, Any]:
-        with self.session() as client:
-            identities = self.request(client, "GET", "/usage/identities")
-            items = identities.get("identities", []) if isinstance(identities, dict) else []
-            auth_indexes = [str(item.get("identity")) for item in items if item.get("identity")]
-            quota = {"items": []}
-            if auth_indexes:
-                quota = self.request(client, "POST", "/quota/cache", json={"auth_indexes": auth_indexes})
-            inspection = self.request(client, "GET", "/quota/inspection")
-            return {"identities": items, "quota": quota, "inspection": inspection}
-
-    def pulse(self) -> dict[str, Any]:
-        with self.session() as client:
-            return {
-                "status": self.request(client, "GET", "/status"),
-                "inspection": self.request(client, "GET", "/quota/inspection"),
-            }
-
-    def refresh(self, auth_indexes: list[str]) -> Any:
-        with self.session() as client:
-            return self.request(client, "POST", "/quota/refresh", json={"auth_indexes": auth_indexes})
-
-    def refresh_status(self, auth_index: str) -> Any:
-        with self.session() as client:
-            return self.request(client, "GET", f"/quota/refresh/{auth_index}")
 
 
 def _nano_per_token(value: Any) -> int:
@@ -322,7 +292,6 @@ class BillingService:
         self.db = database
         self.cpa = CPAClient(settings)
         self.cpamp = CPAMPClient(settings)
-        self.keeper = KeeperClient(settings)
         self._quota_window_starts: dict[tuple[str, str], int] = {}
         self._quota_window_lock = threading.Lock()
         self._manual_usage_lock = threading.Lock()
@@ -1663,7 +1632,7 @@ class BillingService:
         cycle_name: str | None = None,
         custom_hours: int | None = None,
     ) -> tuple[int | None, int | None, BillingCycle | None]:
-        allowed_ranges = {"today", "yesterday", "24h", "7d", "30d", "cycle", "custom", "all"}
+        allowed_ranges = {"today", "60m", "yesterday", "24h", "7d", "30d", "cycle", "custom", "all"}
         if range_name not in allowed_ranges:
             raise BillingError("时间范围无效")
 
@@ -1674,6 +1643,8 @@ class BillingService:
         selected_cycle: BillingCycle | None = None
         if range_name == "today":
             return int(today.timestamp() * 1000), current, None
+        if range_name == "60m":
+            return current - 60 * 60 * 1000, current, None
         if range_name == "yesterday":
             return int((today - timedelta(days=1)).timestamp() * 1000), int(today.timestamp() * 1000), None
         if range_name == "24h":
@@ -2886,27 +2857,153 @@ class BillingService:
     def _quota_rows(payload: Any) -> tuple[list[dict[str, Any]], int | None]:
         if not isinstance(payload, dict):
             return [], None
-        rows = []
-        for item in payload.get("quota", []) if isinstance(payload.get("quota"), list) else []:
-            if not isinstance(item, dict):
-                continue
-            window = item.get("window") if isinstance(item.get("window"), dict) else {}
+        rows: list[dict[str, Any]] = []
+
+        def window_seconds(window: dict[str, Any]) -> int | None:
+            value = window.get("limit_window_seconds", window.get("limitWindowSeconds"))
+            if value is None:
+                value = window.get("seconds")
+            try:
+                return int(value) if value is not None else None
+            except (TypeError, ValueError):
+                return None
+
+        def window_label(seconds: int | None) -> str:
+            if seconds == 5 * 60 * 60:
+                return "5 小时"
+            if seconds == 7 * 24 * 60 * 60:
+                return "周"
+            if seconds is not None and 28 * 24 * 60 * 60 <= seconds <= 31 * 24 * 60 * 60:
+                return "月"
+            if seconds is None or seconds <= 0:
+                return "窗口"
+            hours = seconds / 3600
+            return f"{hours:g} 小时"
+
+        def add_window(
+            key: str,
+            label: str,
+            window: Any,
+            *,
+            scope: str = "window",
+            metric: str | None = None,
+            allowed: Any = None,
+            limit_reached: Any = None,
+        ) -> None:
+            if not isinstance(window, dict):
+                return
+            seconds = window_seconds(window)
             rows.append({
-                "key": item.get("key"),
-                "label": item.get("label"),
-                "scope": item.get("scope"),
-                "metric": item.get("metric"),
-                "plan_type": item.get("planType"),
-                "used_percent": item.get("usedPercent"),
-                "allowed": item.get("allowed"),
-                "limit_reached": item.get("limitReached"),
-                "window_seconds": window.get("seconds"),
-                "reset_at": item.get("resetAt"),
-                "reset_after_seconds": item.get("resetAfterSeconds"),
+                "key": key,
+                "label": label,
+                "scope": scope,
+                "metric": metric,
+                "plan_type": payload.get("plan_type", payload.get("planType")),
+                "used_percent": window.get("used_percent", window.get("usedPercent")),
+                "allowed": window.get("allowed", allowed),
+                "limit_reached": window.get("limit_reached", window.get("limitReached", limit_reached)),
+                "window_seconds": seconds,
+                "reset_at": window.get("reset_at", window.get("resetAt")),
+                "reset_after_seconds": window.get("reset_after_seconds", window.get("resetAfterSeconds")),
                 "window_usage_tokens": None,
                 "window_usage_cost": None,
             })
-        credits = payload.get("rateLimitResetCreditsAvailableCount")
+
+        # Keep accepting the legacy normalized payload in unit tests and during
+        # a rolling deployment, while CPA's native Codex shape is handled below.
+        if isinstance(payload.get("quota"), list):
+            for item in payload["quota"]:
+                if not isinstance(item, dict):
+                    continue
+                window = item.get("window") if isinstance(item.get("window"), dict) else {}
+                rows.append({
+                    "key": item.get("key"),
+                    "label": item.get("label"),
+                    "scope": item.get("scope"),
+                    "metric": item.get("metric"),
+                    "plan_type": item.get("planType"),
+                    "used_percent": item.get("usedPercent"),
+                    "allowed": item.get("allowed"),
+                    "limit_reached": item.get("limitReached"),
+                    "window_seconds": window.get("seconds"),
+                    "reset_at": item.get("resetAt"),
+                    "reset_after_seconds": item.get("resetAfterSeconds"),
+                    "window_usage_tokens": None,
+                    "window_usage_cost": None,
+                })
+            credits = payload.get("rateLimitResetCreditsAvailableCount")
+            return rows, int(credits) if isinstance(credits, (int, float)) else None
+
+        rate_limit = payload.get("rate_limit", payload.get("rateLimit"))
+        if isinstance(rate_limit, dict):
+            add_window(
+                "rate_limit.primary_window",
+                f"正常用量 · {window_label(window_seconds(rate_limit.get('primary_window') or rate_limit.get('primaryWindow') or {}))}",
+                rate_limit.get("primary_window", rate_limit.get("primaryWindow")),
+                allowed=rate_limit.get("allowed"),
+                limit_reached=rate_limit.get("limit_reached", rate_limit.get("limitReached")),
+            )
+            add_window(
+                "rate_limit.secondary_window",
+                f"正常用量 · {window_label(window_seconds(rate_limit.get('secondary_window') or rate_limit.get('secondaryWindow') or {}))}",
+                rate_limit.get("secondary_window", rate_limit.get("secondaryWindow")),
+                allowed=rate_limit.get("allowed"),
+                limit_reached=rate_limit.get("limit_reached", rate_limit.get("limitReached")),
+            )
+
+        code_review = payload.get("code_review_rate_limit", payload.get("codeReviewRateLimit"))
+        if isinstance(code_review, dict):
+            add_window(
+                "code_review_rate_limit.primary_window",
+                f"代码审查 · {window_label(window_seconds(code_review.get('primary_window') or code_review.get('primaryWindow') or {}))}",
+                code_review.get("primary_window", code_review.get("primaryWindow")),
+                scope="feature",
+                metric="code-review",
+                allowed=code_review.get("allowed"),
+                limit_reached=code_review.get("limit_reached", code_review.get("limitReached")),
+            )
+            add_window(
+                "code_review_rate_limit.secondary_window",
+                f"代码审查 · {window_label(window_seconds(code_review.get('secondary_window') or code_review.get('secondaryWindow') or {}))}",
+                code_review.get("secondary_window", code_review.get("secondaryWindow")),
+                scope="feature",
+                metric="code-review",
+                allowed=code_review.get("allowed"),
+                limit_reached=code_review.get("limit_reached", code_review.get("limitReached")),
+            )
+
+        additional = payload.get("additional_rate_limits", payload.get("additionalRateLimits"))
+        for index, item in enumerate(additional if isinstance(additional, list) else []):
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("limit_name", item.get("limitName")) or item.get("metered_feature") or f"附加用量 {index + 1}").strip()
+            metric = str(item.get("metered_feature", item.get("meteredFeature")) or "").strip() or None
+            rate_info = item.get("rate_limit", item.get("rateLimit"))
+            if not isinstance(rate_info, dict):
+                continue
+            primary = rate_info.get("primary_window", rate_info.get("primaryWindow"))
+            secondary = rate_info.get("secondary_window", rate_info.get("secondaryWindow"))
+            add_window(
+                f"additional_rate_limits.{name}.primary_window",
+                f"{name} · {window_label(window_seconds(primary or {}))}",
+                primary,
+                scope="additional",
+                metric=metric,
+                allowed=rate_info.get("allowed"),
+                limit_reached=rate_info.get("limit_reached", rate_info.get("limitReached")),
+            )
+            add_window(
+                f"additional_rate_limits.{name}.secondary_window",
+                f"{name} · {window_label(window_seconds(secondary or {}))}",
+                secondary,
+                scope="additional",
+                metric=metric,
+                allowed=rate_info.get("allowed"),
+                limit_reached=rate_info.get("limit_reached", rate_info.get("limitReached")),
+            )
+
+        reset_credits = payload.get("rate_limit_reset_credits", payload.get("rateLimitResetCredits"))
+        credits = reset_credits.get("available_count", reset_credits.get("availableCount")) if isinstance(reset_credits, dict) else None
         return rows, int(credits) if isinstance(credits, (int, float)) else None
 
     @staticmethod
@@ -2930,7 +3027,7 @@ class BillingService:
 
     @staticmethod
     def _quota_available_estimate(used_percent: Any, cost_nano_usd: int) -> dict[str, Any]:
-        """Estimate the remaining window cost from Keeper's usage percentage."""
+        """Estimate the remaining window cost from the upstream usage percentage."""
         cost_nano_usd = int(cost_nano_usd or 0)
         payload: dict[str, Any] = {
             "status": "unavailable",
@@ -3179,7 +3276,7 @@ class BillingService:
                     quota["usage_source"] = "billing-panel"
 
     def _sanitize_accounts(self, raw: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, str], dict[str, str]]:
-        identities = raw.get("identities", []) if isinstance(raw, dict) else []
+        identities = raw.get("files", []) if isinstance(raw, dict) else []
         quota_items = raw.get("quota", {}).get("items", []) if isinstance(raw.get("quota"), dict) else []
         quota_by_auth = {
             str(item.get("auth_index")): item
@@ -3193,24 +3290,30 @@ class BillingService:
             if not isinstance(identity, dict):
                 continue
             account_id = str(identity.get("id") or "").strip()
-            auth_index = str(identity.get("identity") or "").strip()
+            auth_index = str(identity.get("auth_index") or "").strip()
             if not account_id or not auth_index:
                 continue
             account_by_auth[auth_index] = account_id
             auth_by_account[account_id] = auth_index
             quota_item = quota_by_auth.get(auth_index, {})
             quota_rows, credits = self._quota_rows(quota_item.get("quota"))
-            health = identity.get("credential_health") if isinstance(identity.get("credential_health"), dict) else None
+            for quota in quota_rows:
+                reset_at_ms = self._external_timestamp_ms(quota.get("reset_at"))
+                quota["reset_at"] = self._iso_timestamp(reset_at_ms)
+            id_token = identity.get("id_token") if isinstance(identity.get("id_token"), dict) else {}
+            provider = str(identity.get("provider") or identity.get("type") or "").strip().lower()
+            plan_type = identity.get("plan_type") or identity.get("planType") or id_token.get("plan_type") or id_token.get("planType")
+            quota_status = str(quota_item.get("status") or "unsupported")
             accounts.append({
                 "id": account_id,
-                "name": identity.get("alias") or identity.get("displayName") or identity.get("name") or f"上游账号 {account_id}",
+                "name": identity.get("label") or identity.get("name") or identity.get("account") or identity.get("email") or f"上游账号 {account_id}",
                 "type": identity.get("type"),
-                "provider": identity.get("provider"),
-                "auth_type": identity.get("auth_type_name"),
-                "plan_type": identity.get("plan_type"),
-                "disabled": bool(identity.get("disabled")),
-                "active_start": identity.get("active_start"),
-                "active_until": identity.get("active_until"),
+                "provider": identity.get("provider") or identity.get("type"),
+                "auth_type": identity.get("account_type") or "oauth",
+                "plan_type": plan_type,
+                "disabled": bool(identity.get("disabled") or identity.get("unavailable")),
+                "active_start": id_token.get("chatgpt_subscription_active_start"),
+                "active_until": id_token.get("chatgpt_subscription_active_until"),
                 "usage": {
                     "requests": 0,
                     "success": 0,
@@ -3230,114 +3333,223 @@ class BillingService:
                     "last_used_at": None,
                     "source": "billing-panel",
                 },
-                "health": None if health is None else {
-                    "window_seconds": health.get("window_seconds"),
-                    "total_success": health.get("total_success"),
-                    "total_failure": health.get("total_failure"),
-                    "success_rate": health.get("success_rate"),
-                    "window_start": health.get("window_start"),
-                    "window_end": health.get("window_end"),
-                    "buckets": health.get("buckets", []),
+                "health": {
+                    "total_success": int(identity.get("success") or 0),
+                    "total_failure": int(identity.get("failed") or 0),
+                    "success_rate": round(
+                        int(identity.get("success") or 0) * 100
+                        / (int(identity.get("success") or 0) + int(identity.get("failed") or 0)),
+                        2,
+                    ) if int(identity.get("success") or 0) + int(identity.get("failed") or 0) else None,
+                    "window_seconds": None,
+                    "window_start": None,
+                    "window_end": None,
+                    "buckets": [],
                 },
                 "quota": quota_rows,
-                "quota_status": quota_item.get("status") or "unknown",
+                "quota_status": quota_status,
                 "quota_refreshed_at": quota_item.get("refreshed_at"),
                 "quota_http_status": quota_item.get("http_status_code"),
+                "quota_error": quota_item.get("error"),
                 "reset_credits_available": credits,
-                "can_refresh": not bool(identity.get("disabled")),
+                "can_refresh": bool(auth_index) and provider == "codex" and not bool(identity.get("disabled") or identity.get("unavailable")),
             })
         accounts.sort(key=lambda item: (item["disabled"], str(item["name"]).casefold()))
         return accounts, account_by_auth, auth_by_account
 
+    @staticmethod
+    def _account_inspection(accounts: list[dict[str, Any]]) -> dict[str, Any]:
+        results: list[dict[str, Any]] = []
+        cached = completed = normal = limit_reached = unauthorized = other_failed = 0
+        for account in accounts:
+            status = str(account.get("quota_status") or "unsupported")
+            if status == "completed":
+                cached += 1
+                completed += 1
+            elif status == "failed":
+                other_failed += 1
+            elif status == "running":
+                pass
+            quota = account.get("quota") if isinstance(account.get("quota"), list) else []
+            has_limit = any(bool(item.get("limit_reached")) for item in quota if isinstance(item, dict))
+            has_auth_failure = account.get("quota_http_status") in {401, 402}
+            if has_limit:
+                limit_reached += 1
+            elif status == "completed" and not has_auth_failure:
+                normal += 1
+            if has_auth_failure:
+                unauthorized += 1
+            results.append({
+                "account_id": account.get("id"),
+                "name": account.get("name"),
+                "type": account.get("type"),
+                "status": "limit_reached" if has_limit else status,
+                "refreshed_at": account.get("quota_refreshed_at"),
+            })
+        return {
+            "total": len(accounts),
+            "cached": cached,
+            "running": 0,
+            "completed": completed,
+            "normal": normal,
+            "limit_reached": limit_reached,
+            "unauthorized_401": unauthorized,
+            "payment_required_402": 0,
+            "unauthorized_401_402": unauthorized,
+            "other_failed": other_failed,
+            "unknown": 0,
+            "results": results,
+        }
+
+    @staticmethod
+    def _cpa_account_provider(item: dict[str, Any]) -> str:
+        return str(item.get("provider") or item.get("type") or "").strip().lower().replace("_", "-")
+
+    @staticmethod
+    def _cpa_account_headers(item: dict[str, Any]) -> dict[str, str]:
+        headers = {
+            "Authorization": "Bearer $TOKEN$",
+            "Content-Type": "application/json",
+            "User-Agent": "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal",
+        }
+        id_token = item.get("id_token") if isinstance(item.get("id_token"), dict) else {}
+        account_id = id_token.get("chatgpt_account_id") or id_token.get("chatgptAccountId")
+        if account_id:
+            headers["Chatgpt-Account-Id"] = str(account_id)
+        return headers
+
+    def _cpa_accounts_raw(self) -> dict[str, Any]:
+        files = self.cpa.auth_files()
+        quota_items: list[dict[str, Any]] = []
+        refreshed_at = self._iso_timestamp(now_ms())
+        for item in files:
+            auth_index = str(item.get("auth_index") or "").strip()
+            if not auth_index:
+                continue
+            account_id = str(item.get("id") or "").strip()
+            if not account_id:
+                continue
+            provider = self._cpa_account_provider(item)
+            if provider != "codex":
+                quota_items.append({
+                    "account_id": account_id,
+                    "auth_index": auth_index,
+                    "status": "unsupported",
+                    "refreshed_at": None,
+                    "quota": {},
+                })
+                continue
+            try:
+                result = self.cpa.api_call(
+                    auth_index,
+                    "GET",
+                    "https://chatgpt.com/backend-api/wham/usage",
+                    self._cpa_account_headers(item),
+                )
+                status_code = int(result.get("status_code") or 0)
+                body = result.get("body")
+                payload = json.loads(body) if isinstance(body, str) and body.strip() else body
+                if status_code < 200 or status_code >= 300:
+                    quota_items.append({
+                        "account_id": account_id,
+                        "auth_index": auth_index,
+                        "status": "failed",
+                        "http_status_code": status_code or None,
+                        "error": f"上游额度接口返回 HTTP {status_code}",
+                        "refreshed_at": refreshed_at,
+                        "quota": {},
+                    })
+                elif not isinstance(payload, dict):
+                    quota_items.append({
+                        "account_id": account_id,
+                        "auth_index": auth_index,
+                        "status": "failed",
+                        "http_status_code": status_code,
+                        "error": "上游额度响应不是 JSON 对象",
+                        "refreshed_at": refreshed_at,
+                        "quota": {},
+                    })
+                else:
+                    quota_items.append({
+                        "account_id": account_id,
+                        "auth_index": auth_index,
+                        "status": "completed",
+                        "http_status_code": status_code,
+                        "refreshed_at": refreshed_at,
+                        "quota": payload,
+                    })
+            except (BillingError, httpx.HTTPError, json.JSONDecodeError) as exc:
+                quota_items.append({
+                    "account_id": account_id,
+                    "auth_index": auth_index,
+                    "status": "failed",
+                    "error": f"额度读取失败：{type(exc).__name__}",
+                    "refreshed_at": refreshed_at,
+                    "quota": {},
+                })
+        return {"files": files, "quota": {"items": quota_items}}
+
     def accounts_snapshot(self) -> dict[str, Any]:
         try:
-            raw = self.keeper.accounts_snapshot()
-        except httpx.HTTPError as exc:
-            raise BillingDependencyError("Keeper 上游账号服务不可用") from exc
+            raw = self._cpa_accounts_raw()
+        except (httpx.HTTPError, BillingError) as exc:
+            raise BillingDependencyError("CPA 上游账号服务不可用") from exc
         accounts, account_by_auth, auth_by_account = self._sanitize_accounts(raw)
         self._hydrate_account_usage(accounts, auth_by_account)
-        inspection_raw = raw.get("inspection", {}) if isinstance(raw, dict) else {}
-        inspection_results = []
-        for item in inspection_raw.get("results", []) if isinstance(inspection_raw, dict) else []:
-            if not isinstance(item, dict):
-                continue
-            account_id = account_by_auth.get(str(item.get("auth_index") or ""))
-            if account_id:
-                inspection_results.append({
-                    "account_id": account_id,
-                    "name": item.get("name"),
-                    "type": item.get("type"),
-                    "status": item.get("status"),
-                    "refreshed_at": item.get("refreshed_at"),
-                })
-        inspection = {
-            key: inspection_raw.get(key)
-            for key in (
-                "total", "cached", "running", "completed", "normal", "limit_reached",
-                "unauthorized_401", "payment_required_402", "unauthorized_401_402",
-                "other_failed", "unknown",
-            )
-        } if isinstance(inspection_raw, dict) else {}
-        inspection["results"] = inspection_results
-        return {"accounts": accounts, "inspection": inspection}
+        return {"accounts": accounts, "inspection": self._account_inspection(accounts)}
 
     def refresh_account_quotas(self, account_ids: list[str]) -> dict[str, Any]:
-        try:
-            raw_accounts = self.keeper.accounts_snapshot()
-            accounts, account_by_auth, auth_by_account = self._sanitize_accounts(raw_accounts)
-            refreshable_ids = {item["id"] for item in accounts if item["can_refresh"]}
-            selected_ids = account_ids or sorted(refreshable_ids)
-            unknown = sorted(set(selected_ids) - refreshable_ids)
-            if unknown:
-                raise BillingError("上游账号不存在或已失效")
-            auth_indexes = [auth_by_account[account_id] for account_id in selected_ids]
-            if not auth_indexes:
-                raise BillingError("没有可刷新的上游账号")
-            raw = self.keeper.refresh(auth_indexes)
-        except httpx.HTTPError as exc:
-            raise BillingDependencyError("Keeper 额度刷新请求失败") from exc
-        tasks = []
-        for item in (raw.get("tasks") or []) if isinstance(raw, dict) else []:
-            if not isinstance(item, dict):
-                continue
-            account_id = account_by_auth.get(str(item.get("authIndex") or ""))
-            if account_id:
-                tasks.append({"account_id": account_id, "status": "queued"})
+        snapshot = self.accounts_snapshot()
+        refreshable_ids = {item["id"] for item in snapshot["accounts"] if item["can_refresh"]}
+        selected_ids = set(account_ids or refreshable_ids)
+        unknown = sorted(selected_ids - refreshable_ids)
+        if unknown:
+            raise BillingError("上游账号不存在、未支持额度查询或已失效")
         rejected = []
-        for item in (raw.get("rejected") or []) if isinstance(raw, dict) else []:
-            if not isinstance(item, dict):
-                continue
-            account_id = account_by_auth.get(str(item.get("authIndex") or ""))
-            if account_id:
-                rejected.append({"account_id": account_id, "error": "额度刷新未被 Keeper 接受"})
+        for account in snapshot["accounts"]:
+            if account["id"] in selected_ids and account.get("quota_status") == "failed":
+                rejected.append({"account_id": account["id"], "error": account.get("quota_error") or "额度读取失败"})
         return {
-            "tasks": tasks,
+            "tasks": [],
             "rejected": rejected,
-            "accepted": int(raw.get("accepted") or 0) if isinstance(raw, dict) else 0,
-            "skipped": int(raw.get("skipped") or 0) if isinstance(raw, dict) else 0,
-            "limit": int(raw.get("limit") or 0) if isinstance(raw, dict) else 0,
+            "accepted": len(selected_ids) - len(rejected),
+            "skipped": len(refreshable_ids - selected_ids),
+            "limit": len(refreshable_ids),
+            "accounts": snapshot["accounts"],
+            "inspection": snapshot["inspection"],
         }
 
-    def account_quota_refresh_status(self, account_id: str) -> dict[str, Any]:
+    def reset_account_quota(
+        self,
+        account_id: str,
+        reason: str,
+        operator_id: int | None = None,
+        operator_type: str = "web-admin",
+    ) -> dict[str, Any]:
+        if not reason.strip():
+            raise BillingError("重置额度必须填写原因")
+        files = self.cpa.auth_files()
+        target = next((item for item in files if str(item.get("id") or "") == account_id), None)
+        if target is None or not str(target.get("auth_index") or "").strip():
+            raise BillingError("上游账号不存在或已失效")
+        if bool(target.get("disabled") or target.get("unavailable")):
+            raise BillingError("已停用的上游账号不能重置额度状态")
         try:
-            raw_accounts = self.keeper.accounts_snapshot()
-            _, _, auth_by_account = self._sanitize_accounts(raw_accounts)
-            auth_index = auth_by_account.get(account_id)
-            if not auth_index:
-                raise BillingError("上游账号不存在或已失效")
-            raw = self.keeper.refresh_status(auth_index)
-        except httpx.HTTPError as exc:
-            raise BillingDependencyError("Keeper 额度刷新状态不可用") from exc
-        quota, credits = self._quota_rows(raw.get("quota") if isinstance(raw, dict) else None)
-        return {
-            "account_id": account_id,
-            "status": raw.get("status") if isinstance(raw, dict) else "unknown",
-            "refreshed_at": raw.get("refreshed_at") if isinstance(raw, dict) else None,
-            "expires_at": raw.get("expiresAt") if isinstance(raw, dict) else None,
-            "http_status": raw.get("http_status_code") if isinstance(raw, dict) else None,
-            "quota": quota,
-            "reset_credits_available": credits,
-        }
+            result = self.cpa.reset_quota(str(target["auth_index"]))
+        except (httpx.HTTPError, BillingError) as exc:
+            raise BillingDependencyError("CPA 本地额度状态重置失败") from exc
+        with self.db.session() as session:
+            session.add(AuditLog(
+                operator_type=operator_type,
+                operator_id=str(operator_id if operator_id is not None else "admin-token"),
+                operation="account.reset_quota",
+                target=account_id,
+                before_json=None,
+                after_json=json.dumps({"status": result.get("status"), "models": result.get("models", [])}, ensure_ascii=False),
+                reason=reason.strip(),
+                created_at_ms=now_ms(),
+            ))
+        return {"ok": True, "account_id": account_id, "status": result.get("status", "ok")}
 
     @staticmethod
     def _percentile(values: list[int], percentile: float) -> int | None:
@@ -3441,12 +3653,14 @@ class BillingService:
         rows.sort(key=lambda item: (Decimal(item["cost"].replace(",", "")), item["requests"]), reverse=True)
         return rows
 
-    def _local_realtime(self, version_id: int, window: str) -> dict[str, Any]:
-        window_minutes = int(window.removesuffix("m"))
-        end_ms = now_ms()
-        start_ms = end_ms - window_minutes * 60_000
-        bucket_ms = 60_000
-        bucket_count = window_minutes
+    def _local_realtime(self, version_id: int, start_ms: int, end_ms: int, range_name: str) -> dict[str, Any]:
+        duration_ms = max(end_ms - start_ms, 60_000)
+        duration_minutes = duration_ms / 60_000
+        if duration_minutes <= 60:
+            bucket_ms = 60_000
+        else:
+            bucket_ms = max(60_000, math.ceil(duration_ms / 120 / 60_000) * 60_000)
+        bucket_count = max(1, math.ceil(duration_ms / bucket_ms))
         with self.db.session() as session:
             rows = session.execute(
                 select(RawUsageEvent, RatedEvent)
@@ -3469,6 +3683,8 @@ class BillingService:
             "success": 0,
             "failure": 0,
             "cached": 0,
+            "input_tokens": 0,
+            "cache_read_tokens": 0,
             "ttft": [],
             "latency": [],
         } for _ in range(bucket_count)]
@@ -3486,6 +3702,8 @@ class BillingService:
             item["requests"] += 1
             item["failure" if event.failed else "success"] += 1
             item["cached"] += self._compatible_cached_tokens(event) + int(event.cache_read_tokens or 0)
+            item["input_tokens"] += max(int(event.input_tokens or 0), 0)
+            item["cache_read_tokens"] += self._effective_cache_read_tokens(event)
             if event.ttft_ms is not None:
                 item["ttft"].append(int(event.ttft_ms))
             if event.latency_ms is not None:
@@ -3509,7 +3727,10 @@ class BillingService:
         cache_level = []
         for index, item in enumerate(buckets):
             bucket_at = self._iso_timestamp(start_ms + index * bucket_ms)
-            token_velocity.append({"bucket": bucket_at, "tokens_per_minute": item["tokens"]})
+            token_velocity.append({
+                "bucket": bucket_at,
+                "tokens_per_minute": round(item["tokens"] * 60_000 / bucket_ms, 2),
+            })
             response_level.append({
                 "bucket": bucket_at,
                 "ttft_p50_ms": self._percentile(item["ttft"], 0.50),
@@ -3523,11 +3744,19 @@ class BillingService:
                 "success": item["success"],
                 "failure": item["failure"],
             })
-            cache_level.append({"bucket": bucket_at, "cached_tokens": item["cached"]})
+            cache_level.append({
+                "bucket": bucket_at,
+                "cached_tokens": item["cached"],
+                "input_tokens": item["input_tokens"],
+                "cache_read_tokens": item["cache_read_tokens"],
+                "cache_hit_rate": round(item["cache_read_tokens"] * 100 / item["input_tokens"], 3)
+                if item["input_tokens"] else None,
+            })
         return {
-            "window": window,
+            "range": range_name,
+            "window": range_name,
             "timezone": self.settings.timezone,
-            "bucket_seconds": 60,
+            "bucket_seconds": round(bucket_ms / 1000),
             "window_start": self._iso_timestamp(start_ms),
             "window_end": self._iso_timestamp(end_ms),
             "token_velocity": token_velocity,
@@ -3623,27 +3852,18 @@ class BillingService:
             )]
 
     def site_pulse(self) -> dict[str, Any]:
-        keeper: dict[str, Any]
         cpa: dict[str, Any]
         try:
-            raw = self.keeper.pulse()
-            status = raw.get("status", {}) if isinstance(raw, dict) else {}
-            inspection = raw.get("inspection", {}) if isinstance(raw, dict) else {}
-            keeper = {
+            accounts = self.accounts_snapshot()
+            account_status = {
                 "available": True,
-                "running": status.get("running"),
-                "sync_running": status.get("sync_running"),
-                "last_run_at": status.get("last_run_at"),
-                "last_status": status.get("last_status"),
-                "quota_normal": inspection.get("normal"),
-                "quota_total": inspection.get("total"),
-                "quota_limit_reached": inspection.get("limit_reached"),
-                "quota_failed": sum(int(inspection.get(key) or 0) for key in (
-                    "unauthorized_401_402", "other_failed", "unknown",
-                )),
+                "total": accounts["inspection"].get("total", 0),
+                "normal": accounts["inspection"].get("normal", 0),
+                "limit_reached": accounts["inspection"].get("limit_reached", 0),
+                "failed": accounts["inspection"].get("other_failed", 0),
             }
-        except (httpx.HTTPError, BillingDependencyError):
-            keeper = {"available": False, "error": "Keeper 不可用"}
+        except (httpx.HTTPError, BillingDependencyError, BillingError):
+            account_status = {"available": False, "error": "CPA 上游账号额度不可用"}
         try:
             cpa = self.cpa.health()
         except (httpx.HTTPError, BillingError):
@@ -3652,7 +3872,7 @@ class BillingService:
         return {
             "generated_at": self._iso_timestamp(now_ms()),
             "cpa": cpa,
-            "keeper": keeper,
+            "accounts": account_status,
             "worker": {
                 "healthy": bool(sync) and all(not item["last_error"] for item in sync),
                 "backlog": sum(int(item["backlog"] or 0) for item in sync),
@@ -3660,12 +3880,9 @@ class BillingService:
             },
         }
 
-    def site_status(self, range_name: str = "today", window: str = "60m",
+    def site_status(self, range_name: str = "today",
                     start: str | None = None, end: str | None = None,
                     cycle_name: str | None = None, custom_hours: int | None = None) -> dict[str, Any]:
-        allowed_windows = {"15m", "30m", "45m", "60m"}
-        if window not in allowed_windows:
-            raise BillingError("实时窗口无效")
         with self.db.session() as session:
             range_start_ms, range_end_ms, selected_cycle = self._resolve_time_range(
                 session,
@@ -3675,33 +3892,16 @@ class BillingService:
                 cycle_name=cycle_name,
                 custom_hours=custom_hours,
             )
-            if range_start_ms is None or range_end_ms is None:
-                raise BillingError("全站状态需要有限的时间范围")
+            if range_end_ms is None:
+                raise BillingError("全站状态缺少结束时间")
+            if range_start_ms is None:
+                range_start_ms = session.scalar(select(func.min(RawUsageEvent.occurred_at_ms)))
+                if range_start_ms is None:
+                    range_start_ms = max(0, range_end_ms - 60_000)
             version_id = selected_cycle.pricing_version_id if selected_cycle else self._active_pricing_id(session)
         overview = self._local_overview(version_id, range_start_ms, range_end_ms)
-        realtime = self._local_realtime(version_id, window)
-        keeper: dict[str, Any]
+        realtime = self._local_realtime(version_id, range_start_ms, range_end_ms, range_name)
         errors: list[str] = []
-        try:
-            raw = self.keeper.status_snapshot(range_name, window, start, end)
-            keeper = {
-                "available": True,
-                "status": raw.get("status", {}),
-                "version": raw.get("version", {}),
-                "update": raw.get("update", {}),
-                "overview": overview,
-                "realtime": realtime,
-                "usage_source": "billing-panel",
-            }
-        except (httpx.HTTPError, BillingDependencyError):
-            keeper = {
-                "available": False,
-                "error": "Keeper 状态接口不可用",
-                "overview": overview,
-                "realtime": realtime,
-                "usage_source": "billing-panel",
-            }
-            errors.append("keeper")
         try:
             cpa = self.cpa.health()
         except (httpx.HTTPError, BillingError):
@@ -3712,12 +3912,34 @@ class BillingService:
         except (sqlite3.Error, BillingError):
             reconciliation = {"ok": False, "error": "CPAMP 对账不可用"}
             errors.append("reconciliation")
+        try:
+            accounts = self.accounts_snapshot()
+            account_status = {
+                "available": True,
+                "inspection": accounts["inspection"],
+                "accounts": [{
+                    "id": item["id"],
+                    "name": item["name"],
+                    "status": item["quota_status"],
+                    "quota_count": len(item["quota"]),
+                } for item in accounts["accounts"]],
+            }
+        except (httpx.HTTPError, BillingDependencyError, BillingError):
+            account_status = {"available": False, "error": "CPA 上游账号额度不可用"}
+            errors.append("accounts")
         return {
             "generated_at": self._iso_timestamp(now_ms()),
             "degraded": bool(errors),
             "errors": errors,
             "cpa": cpa,
-            "keeper": keeper,
+            "range": {
+                "name": range_name,
+                "start": self._iso_timestamp(range_start_ms),
+                "end": self._iso_timestamp(range_end_ms),
+            },
+            "overview": overview,
+            "realtime": realtime,
+            "accounts": account_status,
             "billing": {
                 "sync": self._local_sync_status(),
                 "usage": self.usage_summary(),

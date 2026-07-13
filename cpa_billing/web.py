@@ -117,6 +117,10 @@ class AccountRefreshPayload(BaseModel):
     account_ids: list[str] = Field(default_factory=list, max_length=100)
 
 
+class AccountResetQuotaPayload(BaseModel):
+    reason: str = Field(min_length=1, max_length=1000)
+
+
 class PoolCostPayload(BaseModel):
     pool_id: int = Field(ge=1)
     fixed_cost: str
@@ -724,14 +728,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/site/status")
     async def api_site_status(
         range_name: str = Query("today", alias="range"),
-        window: str = Query("60m"),
         start: str | None = Query(None),
         end: str | None = Query(None),
         cycle: str | None = Query(None),
         hours: int | None = Query(None, ge=1),
         _: tuple[Any, Any] = Depends(current),
     ) -> dict[str, Any]:
-        return await asyncio.to_thread(service.site_status, range_name, window, start, end, cycle, hours)
+        return await asyncio.to_thread(service.site_status, range_name, start, end, cycle, hours)
 
     @app.get("/api/site/accounts")
     async def api_accounts(_: tuple[Any, Any] = Depends(current)) -> dict[str, Any]:
@@ -743,10 +746,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         verify_csrf(request, auth)
         quota_refresh_limiter.check_and_mark(str(auth.user.telegram_user_id if auth.user else "admin-token"))
         return await asyncio.to_thread(service.refresh_account_quotas, payload.account_ids)
-
-    @app.get("/api/site/accounts/{account_id}/refresh")
-    async def api_refresh_status(account_id: str, _: tuple[Any, Any] = Depends(current)) -> dict[str, Any]:
-        return await asyncio.to_thread(service.account_quota_refresh_status, account_id)
 
     @app.get("/api/admin/snapshot")
     async def api_admin_snapshot(_: Any = Depends(admin_current)) -> dict[str, Any]:
@@ -760,6 +759,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "accounts": accounts,
             "admin": service.admin_snapshot(),
         }
+
+    @app.post("/api/admin/accounts/{account_id}/reset-quota")
+    async def api_reset_account_quota(
+        account_id: str,
+        payload: AccountResetQuotaPayload,
+        request: Request,
+        auth: WebAuth = Depends(admin_current),
+    ) -> dict[str, Any]:
+        verify_csrf(request, auth)
+        operator_id = None if auth.user is None else auth.user.telegram_user_id
+        return await asyncio.to_thread(
+            service.reset_account_quota,
+            account_id,
+            payload.reason,
+            operator_id,
+            "web-admin",
+        )
 
     @app.patch("/api/admin/users/{user_id}/admin")
     def api_set_user_admin(
