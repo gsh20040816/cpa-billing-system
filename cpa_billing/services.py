@@ -2882,6 +2882,69 @@ class BillingService:
         canonical = QUOTA_MODEL_ALIASES.get(metric, metric) or None
         return canonical, labels.get(canonical or "", canonical)
 
+    @staticmethod
+    def _quota_available_estimate(used_percent: Any, cost_nano_usd: int) -> dict[str, Any]:
+        """Estimate the remaining window cost from Keeper's usage percentage."""
+        cost_nano_usd = int(cost_nano_usd or 0)
+        payload: dict[str, Any] = {
+            "status": "unavailable",
+            "reason": None,
+            "basis_cost_nano_usd": cost_nano_usd,
+            "basis_cost": format_usd_nano(cost_nano_usd),
+            "used_percent_min": None,
+            "used_percent_max": None,
+            "available_percent_min": None,
+            "available_percent_max": None,
+            "available_cost_lower_nano_usd": None,
+            "available_cost_upper_nano_usd": None,
+            "available_cost_lower": None,
+            "available_cost_upper": None,
+        }
+
+        try:
+            observed = Decimal(str(used_percent))
+        except (InvalidOperation, TypeError, ValueError):
+            payload["reason"] = "invalid_percent"
+            return payload
+        if not observed.is_finite() or observed < 0 or observed > 100:
+            payload["reason"] = "invalid_percent"
+            return payload
+
+        lower = max(observed - Decimal("0.5"), Decimal("0"))
+        upper = min(observed + Decimal("0.5"), Decimal("100"))
+
+        def percent_text(value: Decimal) -> str:
+            text = format(value.quantize(Decimal("0.1"), rounding=ROUND_HALF_UP), "f")
+            return text.rstrip("0").rstrip(".") or "0"
+
+        payload.update({
+            "used_percent_min": percent_text(lower),
+            "used_percent_max": percent_text(upper),
+            "available_percent_min": percent_text(max(Decimal("0"), Decimal("100") - upper)),
+            "available_percent_max": percent_text(min(Decimal("100"), Decimal("100") - lower)),
+        })
+        if observed <= 0:
+            payload["reason"] = "zero_percent"
+            return payload
+        if cost_nano_usd <= 0:
+            payload["reason"] = "zero_cost"
+            return payload
+
+        def remaining_cost(percent: Decimal) -> int:
+            remaining = Decimal(cost_nano_usd) * (Decimal("100") - percent) / percent
+            return max(0, int(remaining.to_integral_value(rounding=ROUND_HALF_UP)))
+
+        lower_cost = remaining_cost(upper)
+        upper_cost = None if lower <= 0 else remaining_cost(lower)
+        payload.update({
+            "status": "estimated",
+            "available_cost_lower_nano_usd": lower_cost,
+            "available_cost_upper_nano_usd": upper_cost,
+            "available_cost_lower": format_usd_nano(lower_cost),
+            "available_cost_upper": None if upper_cost is None else format_usd_nano(upper_cost),
+        })
+        return payload
+
     def _external_timestamp_ms(self, value: Any) -> int | None:
         if value is None or value == "":
             return None
@@ -3064,6 +3127,9 @@ class BillingService:
                     quota["window_usage_tokens"] = usage["total_tokens"]
                     quota["window_usage_cost"] = usage["cost"]
                     quota["window_unpriced"] = usage["unpriced"]
+                    quota["available_estimate"] = self._quota_available_estimate(
+                        quota.get("used_percent"), usage["cost_nano_usd"],
+                    )
                     quota["usage_source"] = "billing-panel"
 
     def _sanitize_accounts(self, raw: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, str], dict[str, str]]:

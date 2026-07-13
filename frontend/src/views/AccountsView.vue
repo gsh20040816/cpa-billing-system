@@ -33,6 +33,26 @@ function notify(text, color = 'success') {
   snackbar.show = true
 }
 
+function availableQuotaText(estimate) {
+  if (!estimate || estimate.status !== 'estimated') return '-'
+  const lower = money(estimate.available_cost_lower)
+  return estimate.available_cost_upper === null
+    ? `≥ ${lower}`
+    : `${lower} – ${money(estimate.available_cost_upper)}`
+}
+
+function availableQuotaPercentText(estimate) {
+  if (!estimate || estimate.status !== 'estimated') return ''
+  return `${percent(estimate.available_percent_min, 1)}–${percent(estimate.available_percent_max, 1)} 可用`
+}
+
+function availableQuotaUnavailableText(estimate) {
+  if (!estimate) return '暂无数据'
+  if (estimate.reason === 'zero_percent') return '使用率为 0%，暂无法从成本反推'
+  if (estimate.reason === 'zero_cost') return '本窗口暂无已计价成本'
+  return '上游使用率无效，暂无法估计'
+}
+
 async function load() {
   loading.value = true
   error.value = ''
@@ -168,6 +188,12 @@ onBeforeUnmount(() => timers.forEach((id) => window.clearTimeout(id)))
                   <div>重置 {{ dateTime(quota.reset_at) }}</div>
                   <div>{{ number(quota.window_usage_requests) }} 请求 · {{ number(quota.window_usage_tokens) }} tokens</div>
                   <div>{{ money(quota.window_usage_cost) }} 本窗口等效成本</div>
+                  <div class="quota-estimate">
+                    <span>本周期预计可用额度</span>
+                    <strong v-if="quota.available_estimate?.status === 'estimated'" class="mono">{{ availableQuotaText(quota.available_estimate) }}</strong>
+                    <span v-else>{{ availableQuotaUnavailableText(quota.available_estimate) }}</span>
+                    <small v-if="quota.available_estimate?.status === 'estimated'">{{ availableQuotaPercentText(quota.available_estimate) }}；按使用率 ±0.5% 估算</small>
+                  </div>
                   <div v-if="quota.window_unpriced" class="data-error">{{ number(quota.window_unpriced) }} 条未计价</div>
                 </div>
               </div>
@@ -197,6 +223,10 @@ onBeforeUnmount(() => timers.forEach((id) => window.clearTimeout(id)))
 .account-usage span { display: block; color: #68716e; font-size: .72rem; }
 .account-usage strong { display: block; margin-top: 5px; overflow-wrap: anywhere; }
 .account-foot { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-top: 12px; color: #717a77; font-size: .72rem; }
+.quota-estimate { margin-top: 7px; color: #1d6956; }
+.quota-estimate span, .quota-estimate small { display: block; color: inherit; }
+.quota-estimate strong { display: block; margin: 2px 0; color: #123f34; font-size: .9rem; }
+.quota-estimate small { font-size: .7rem; }
 @media (max-width: 1000px) { .account-usage { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
 @media (max-width: 760px) { .account-card__head { align-items: start; } .account-usage { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 </style>

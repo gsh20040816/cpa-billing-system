@@ -758,6 +758,9 @@ def test_keeper_accounts_are_sanitized_and_refresh_uses_public_account_ids(servi
     primary = snapshot["accounts"][0]["quota"][0]
     assert primary["window_usage_requests"] == 2
     assert primary["window_usage_tokens"] == 2200
+    assert primary["available_estimate"]["status"] == "estimated"
+    assert primary["available_estimate"]["used_percent_min"] == "41.5"
+    assert primary["available_estimate"]["used_percent_max"] == "42.5"
     assert primary["usage_filter"] == {
         "mode": "all_except_models",
         "models": ["gpt-5.3-codex-spark"],
@@ -796,6 +799,24 @@ def test_keeper_accounts_are_sanitized_and_refresh_uses_public_account_ids(servi
 
     refresh = service.refresh_account_quotas(["7"])
     assert refresh["tasks"] == [{"account_id": "7", "status": "queued"}]
+
+
+def test_quota_available_estimate_uses_half_point_bounds(service) -> None:
+    estimate = service._quota_available_estimate(42, 100 * 1_000_000_000)
+
+    assert estimate["status"] == "estimated"
+    assert estimate["available_percent_min"] == "57.5"
+    assert estimate["available_percent_max"] == "58.5"
+    assert estimate["available_cost_lower"] == "135.2941"
+    assert estimate["available_cost_upper"] == "140.9639"
+
+    zero_percent = service._quota_available_estimate(0, 100 * 1_000_000_000)
+    assert zero_percent["status"] == "unavailable"
+    assert zero_percent["reason"] == "zero_percent"
+
+    zero_cost = service._quota_available_estimate(42, 0)
+    assert zero_cost["status"] == "unavailable"
+    assert zero_cost["reason"] == "zero_cost"
 
 
 def test_keeper_refresh_accepts_null_task_lists(service, monkeypatch) -> None:
