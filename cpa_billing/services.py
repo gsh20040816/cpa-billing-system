@@ -3152,7 +3152,7 @@ class BillingService:
 
     @staticmethod
     def _quota_available_estimate(used_percent: Any, cost_nano_usd: int) -> dict[str, Any]:
-        """Estimate the remaining window cost from the upstream usage percentage."""
+        """Estimate total and remaining window cost from upstream usage percentage."""
         cost_nano_usd = int(cost_nano_usd or 0)
         payload: dict[str, Any] = {
             "status": "unavailable",
@@ -3163,6 +3163,10 @@ class BillingService:
             "used_percent_max": None,
             "available_percent_min": None,
             "available_percent_max": None,
+            "estimated_total_cost_lower_nano_usd": None,
+            "estimated_total_cost_upper_nano_usd": None,
+            "estimated_total_cost_lower": None,
+            "estimated_total_cost_upper": None,
             "available_cost_lower_nano_usd": None,
             "available_cost_upper_nano_usd": None,
             "available_cost_lower": None,
@@ -3202,10 +3206,20 @@ class BillingService:
             remaining = Decimal(cost_nano_usd) * (Decimal("100") - percent) / percent
             return max(0, int(remaining.to_integral_value(rounding=ROUND_HALF_UP)))
 
+        def total_cost(percent: Decimal) -> int:
+            total = Decimal(cost_nano_usd) * Decimal("100") / percent
+            return max(0, int(total.to_integral_value(rounding=ROUND_HALF_UP)))
+
+        total_lower = total_cost(upper)
+        total_upper = None if lower <= 0 else total_cost(lower)
         lower_cost = remaining_cost(upper)
         upper_cost = None if lower <= 0 else remaining_cost(lower)
         payload.update({
             "status": "estimated",
+            "estimated_total_cost_lower_nano_usd": total_lower,
+            "estimated_total_cost_upper_nano_usd": total_upper,
+            "estimated_total_cost_lower": format_usd_nano(total_lower),
+            "estimated_total_cost_upper": None if total_upper is None else format_usd_nano(total_upper),
             "available_cost_lower_nano_usd": lower_cost,
             "available_cost_upper_nano_usd": upper_cost,
             "available_cost_lower": format_usd_nano(lower_cost),

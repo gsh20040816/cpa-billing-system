@@ -33,7 +33,15 @@ function notify(text, color = 'success') {
   snackbar.show = true
 }
 
-function availableQuotaText(estimate) {
+function estimatedTotalQuotaText(estimate) {
+  if (!estimate || estimate.status !== 'estimated') return '-'
+  const lower = money(estimate.estimated_total_cost_lower)
+  return estimate.estimated_total_cost_upper === null
+    ? `≥ ${lower}`
+    : `${lower} – ${money(estimate.estimated_total_cost_upper)}`
+}
+
+function remainingQuotaText(estimate) {
   if (!estimate || estimate.status !== 'estimated') return '-'
   const lower = money(estimate.available_cost_lower)
   return estimate.available_cost_upper === null
@@ -41,9 +49,9 @@ function availableQuotaText(estimate) {
     : `${lower} – ${money(estimate.available_cost_upper)}`
 }
 
-function availableQuotaPercentText(estimate) {
+function remainingQuotaPercentText(estimate) {
   if (!estimate || estimate.status !== 'estimated') return ''
-  return `${percent(estimate.available_percent_min, 1)}–${percent(estimate.available_percent_max, 1)} 可用`
+  return `剩余比例 ${percent(estimate.available_percent_min, 1)}–${percent(estimate.available_percent_max, 1)}`
 }
 
 function availableQuotaUnavailableText(estimate) {
@@ -158,10 +166,13 @@ const autoRefresh = useAutoRefresh((silent) => load(silent), { interval: 60_000 
                   <div>{{ number(quota.window_usage_requests) }} 请求 · {{ number(quota.window_usage_tokens) }} tokens</div>
                   <div>{{ money(quota.window_usage_cost) }} 本窗口等效成本</div>
                   <div class="quota-estimate">
-                    <span>本周期预计可用额度</span>
-                    <strong v-if="quota.available_estimate?.status === 'estimated'" class="mono">{{ availableQuotaText(quota.available_estimate) }}</strong>
+                    <span>本周期预估总额度</span>
+                    <strong v-if="quota.available_estimate?.status === 'estimated'" class="mono">{{ estimatedTotalQuotaText(quota.available_estimate) }}</strong>
                     <span v-else>{{ availableQuotaUnavailableText(quota.available_estimate) }}</span>
-                    <small v-if="quota.available_estimate?.status === 'estimated'">{{ availableQuotaPercentText(quota.available_estimate) }}；按使用率 ±0.5% 估算</small>
+                    <span>本周期剩余额度</span>
+                    <strong v-if="quota.available_estimate?.status === 'estimated'" class="mono">{{ remainingQuotaText(quota.available_estimate) }}</strong>
+                    <span v-else>{{ availableQuotaUnavailableText(quota.available_estimate) }}</span>
+                    <small v-if="quota.available_estimate?.status === 'estimated'">{{ remainingQuotaPercentText(quota.available_estimate) }}；按使用率 ±0.5% 估算</small>
                   </div>
                   <div v-if="quota.window_unpriced" class="data-error">{{ number(quota.window_unpriced) }} 条未计价</div>
                 </div>
