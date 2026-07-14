@@ -1,11 +1,38 @@
+# Local configuration and credentials
 .env
+.env.*
+!.env.example
+
+# Local runtime data
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+*.log
+*.state
+*.state.*
+data/
+backups/
+
+# Secrets and generated archives
+*.pem
+*.key
+*.p12
+*.pfx
+*.secret
+*.token
+*.bundle
+secrets/
+credentials/
+
+# Local tooling and OS files
+.DS_Store
+.idea/
+.vscode/
 .venv/
 __pycache__/
 .pytest_cache/
 *.pyc
 *.egg-info/
-*.sqlite*
-data/
-backups/
 frontend/node_modules/
 frontend/dist/
