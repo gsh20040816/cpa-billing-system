@@ -1330,6 +1330,63 @@ def test_site_status_supports_shared_ranges_and_cache_hit_rate(service, settings
     assert all_time["overview"]["summary"]["request_count"] == 1
 
 
+def test_site_status_expands_backwards_to_stabilize_line_chart_samples(service, settings, monkeypatch) -> None:
+    current = int(time.time() * 1000)
+    monkeypatch.setattr("cpa_billing.services.MIN_SITE_STATUS_SAMPLES", 3)
+    create_owner(service, "sample-key", 2, 0)
+    insert_event(
+        settings,
+        cpamp_key_hash("sample-key"),
+        current - 1_000,
+        event_hash="sample-current",
+        input_tokens=1_000,
+        cached_tokens=0,
+        output_tokens=100,
+        model="gpt-test",
+    )
+    insert_event(
+        settings,
+        cpamp_key_hash("sample-key"),
+        current - 2 * 60 * 60 * 1_000,
+        event_hash="sample-previous-one",
+        input_tokens=1_000,
+        cached_tokens=0,
+        output_tokens=100,
+        model="gpt-test",
+    )
+    insert_event(
+        settings,
+        cpamp_key_hash("sample-key"),
+        current - 3 * 60 * 60 * 1_000,
+        event_hash="sample-previous-two",
+        input_tokens=1_000,
+        cached_tokens=0,
+        output_tokens=100,
+        model="gpt-5.6-luna",
+    )
+    service.sync_cpamp()
+    service.rate_events()
+    monkeypatch.setattr(service.cpa, "auth_files", lambda: [])
+
+    status = service.site_status("60m")
+    policy = status["realtime"]["sample_policy"]
+    assert policy["requested_samples"] == 1
+    assert policy["sample_count"] == 3
+    assert policy["minimum_samples"] == 3
+    assert policy["expanded"] is True
+    assert policy["history_exhausted"] is False
+    assert status["overview"]["summary"]["request_count"] == 3
+
+    efficiency = [
+        model
+        for bucket in status["realtime"]["token_efficiency"]
+        for model in bucket["models"]
+        if model["tokens_per_dollar"] is not None
+    ]
+    assert {item["label"] for item in efficiency} == {"gpt-test", "gpt-5.6-luna"}
+    assert all(item["tokens_per_dollar"] == 687500.0 for item in efficiency)
+
+
 def test_rankings_keep_unowned_keys_separate_and_masked(service, settings) -> None:
     current = int(time.time() * 1000)
     with service.db.session() as session:
