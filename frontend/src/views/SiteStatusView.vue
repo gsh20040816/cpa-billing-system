@@ -104,14 +104,19 @@ const efficiencyOption = computed(() => {
       axisLabel: { formatter: (value) => compactNumber(value) },
       splitLine: { lineStyle: { color: '#e4e9e7' } },
     },
-    series: models.map((model, index) => ({
-      name: model,
-      type: 'line',
-      showSymbol: false,
-      connectNulls: false,
-      data: rows.map((row) => row.models?.find((item) => item.label === model)?.tokens_per_dollar ?? null),
-      lineStyle: { color: palette[index % palette.length], width: 2 },
-    })),
+    series: models.map((model, index) => {
+      const color = palette[index % palette.length]
+      return {
+        name: model,
+        type: 'line',
+        color,
+        itemStyle: { color },
+        showSymbol: false,
+        connectNulls: false,
+        data: rows.map((row) => row.models?.find((item) => item.label === model)?.tokens_per_dollar ?? null),
+        lineStyle: { color, width: 2 },
+      }
+    }),
   }
 })
 

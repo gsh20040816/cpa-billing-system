@@ -80,6 +80,8 @@ describe('SiteStatusView', () => {
     expect(option.series.map((item) => item.name)).toEqual(['gpt-5.5', 'gpt-5.6-sol'])
     expect(option.series[0].data).toEqual([1000000])
     expect(option.yAxis.name).toBe('Tokens / $1')
+    expect(option.series.map((item) => item.color)).toEqual(option.series.map((item) => item.lineStyle.color))
+    expect(option.series.map((item) => item.color)).toEqual(option.series.map((item) => item.itemStyle.color))
     wrapper.unmount()
   })
 })
