@@ -1130,12 +1130,12 @@ class BillingService:
                 + output_tokens * output_rate
             )
         elif cache_read or cache_creation:
-            uncached = max(input_tokens - compatible_cached, 0)
+            read_tokens = compatible_cached + cache_read
+            uncached = max(input_tokens - read_tokens - cache_creation, 0)
             effective_creation_rate = cache_creation_rate if rule.cache_creation_configured or cache_creation_rate > 0 else input_rate
             cost = (
                 uncached * input_rate
-                + compatible_cached * cache_read_rate
-                + cache_read * cache_read_rate
+                + read_tokens * cache_read_rate
                 + cache_creation * effective_creation_rate
                 + output_tokens * output_rate
             )

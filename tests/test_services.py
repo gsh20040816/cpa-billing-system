@@ -120,6 +120,46 @@ def test_rating_uses_cached_subset_and_reasoning_not_added(service, settings) ->
         assert rated.rated_weight_nano_usd == 900 * 1000 + 100 * 100 + 100 * 6000
 
 
+def test_explicit_cache_read_is_not_charged_as_uncached_input(service, settings) -> None:
+    create_owner(service, "key", 2, 0)
+    insert_event(
+        settings,
+        cpamp_key_hash("key"),
+        1000,
+        event_hash="explicit-cache-read",
+        input_tokens=1000,
+        cached_tokens=0,
+        cache_read_tokens=900,
+        output_tokens=100,
+    )
+    service.sync_cpamp(); assert service.rate_events() == 1
+    with service.db.session() as session:
+        rated = session.scalar(select(RatedEvent))
+        detail = json.loads(rated.calculation_json)
+        assert detail["uncached"] == 100
+        assert rated.rated_weight_nano_usd == 100 * 1000 + 900 * 100 + 100 * 6000
+
+
+def test_explicit_cache_creation_is_not_charged_as_uncached_input(service, settings) -> None:
+    create_owner(service, "key", 2, 0)
+    insert_event(
+        settings,
+        cpamp_key_hash("key"),
+        1000,
+        event_hash="explicit-cache-creation",
+        input_tokens=1000,
+        cached_tokens=0,
+        cache_creation_tokens=200,
+        output_tokens=100,
+    )
+    service.sync_cpamp(); assert service.rate_events() == 1
+    with service.db.session() as session:
+        rated = session.scalar(select(RatedEvent))
+        detail = json.loads(rated.calculation_json)
+        assert detail["uncached"] == 800
+        assert rated.rated_weight_nano_usd == 800 * 1000 + 200 * 1250 + 100 * 6000
+
+
 def test_priority_and_long_context_combine(service, settings) -> None:
     create_owner(service, "key", 2, 0)
     insert_event(
