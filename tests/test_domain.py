@@ -1,6 +1,6 @@
 import pytest
 
-from cpa_billing.domain import NANO_USD, largest_remainder, parse_tiers, tiered_weight
+from cpa_billing.domain import NANO_USD, format_yuan_per_usd, largest_remainder, parse_tiers, tiered_weight
 
 
 def test_tiered_weight_is_progressive() -> None:
@@ -16,6 +16,11 @@ def test_largest_remainder_preserves_total() -> None:
 
 def test_negative_adjustment_allocation_preserves_total() -> None:
     assert sum(largest_remainder(-101, {1: 2, 2: 1}).values()) == -101
+
+
+def test_format_yuan_per_usd_uses_integer_units_and_handles_zero_usage() -> None:
+    assert format_yuan_per_usd(3, NANO_USD) == "0.030000"
+    assert format_yuan_per_usd(3, 0) is None
 
 
 def test_tier_parser_rejects_rows_after_open_ended_tier() -> None:

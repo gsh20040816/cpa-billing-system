@@ -13,6 +13,11 @@ export function money(value, currency = '$') {
   return `${currency}${value}`
 }
 
+export function yuanPerDollar(value) {
+  if (value === null || value === undefined || value === '') return '-'
+  return `¥${value}/$`
+}
+
 export function dateTime(value) {
   if (!value) return '-'
   const parsed = new Date(value)

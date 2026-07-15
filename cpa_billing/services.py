@@ -25,7 +25,15 @@ from sqlalchemy.exc import IntegrityError
 
 from .config import Settings
 from .database import Database, now_ms
-from .domain import NANO_USD, format_cents, format_usd_nano, largest_remainder, parse_tiers, tiered_weight
+from .domain import (
+    NANO_USD,
+    format_cents,
+    format_usd_nano,
+    format_yuan_per_usd,
+    largest_remainder,
+    parse_tiers,
+    tiered_weight,
+)
 from .models import (
     APIKey,
     AdminWebSession,
@@ -1982,7 +1990,8 @@ class BillingService:
                         "rows": [], "models": [], "metered_keys": [], "pool_totals": [],
                         "totals": {"requests": 0, "tokens": 0, "actual": "0.0000",
                                    "request_actual": "0.0000", "manual_actual": "0.0000", "billed": "0.0000",
-                                   "member_amount": "0.00", "metered_amount": "0.00", "amount": "0.00"}}
+                                   "member_amount": "0.00", "metered_amount": "0.00", "amount": "0.00",
+                                   "global_rate": None}}
 
             period = (
                 RatedEvent.pricing_version_id == cycle.pricing_version_id,
@@ -2110,6 +2119,7 @@ class BillingService:
                     "billed": format_usd_nano(estimate_values[1]),
                     "amount": format_cents(estimate_values[2]),
                     "amount_cents": estimate_values[2],
+                    "user_rate": format_yuan_per_usd(estimate_values[2], actual),
                     "key_count": key_counts.get(user.telegram_user_id, 0),
                     "unowned": False,
                 })
@@ -2135,6 +2145,7 @@ class BillingService:
                     "billed": "0.0000",
                     "amount": format_cents(sum(item["amount_cents"] for item in metered_keys)),
                     "amount_cents": sum(item["amount_cents"] for item in metered_keys),
+                    "user_rate": None,
                     "key_count": int(unowned_key_count),
                     "unowned": True,
                 })
@@ -2150,6 +2161,7 @@ class BillingService:
             ).all()
             member_amount_cents = sum(item["amount_cents"] for item in rows if not item["unowned"])
             metered_amount_cents = sum(item["amount_cents"] for item in metered_keys)
+            member_billed_nano_usd = sum(value[1] for value in live_user.values())
             unpriced_events = int(session.scalar(
                 select(func.count()).select_from(RawUsageEvent)
                 .outerjoin(RatedEvent, and_(
@@ -2203,6 +2215,7 @@ class BillingService:
                     "metered_amount": format_cents(metered_amount_cents),
                     "amount": format_cents(member_amount_cents + metered_amount_cents),
                     "fixed_cost": format_cents(sum(item["fixed_cost_cents"] for item in pool_totals)),
+                    "global_rate": format_yuan_per_usd(member_amount_cents, member_billed_nano_usd),
                 },
             }
 

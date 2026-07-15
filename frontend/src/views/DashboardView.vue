@@ -8,7 +8,7 @@ import MetricRail from '../components/MetricRail.vue'
 import LoadingState from '../components/LoadingState.vue'
 import PageHeader from '../components/PageHeader.vue'
 import { useAutoRefresh } from '../lib/autoRefresh'
-import { dateTime, money, number } from '../lib/format'
+import { dateTime, money, number, yuanPerDollar } from '../lib/format'
 import { toQuery } from '../lib/query'
 
 const router = useRouter()
@@ -26,6 +26,7 @@ const headers = [
   { title: '人工补录', key: 'manual_actual', align: 'end' },
   { title: '梯度计费', key: 'billed', align: 'end' },
   { title: '应付', key: 'amount', align: 'end' },
+  { title: '用户费率 (¥/$)', key: 'user_rate', align: 'end' },
   { title: 'Keys', key: 'key_count', align: 'end' },
 ]
 
@@ -40,6 +41,7 @@ const metrics = computed(() => {
     { label: '资源池固定成本', value: money(totals.fixed_cost, '¥'), mono: true },
     { label: '按量 Key 应付', value: money(totals.metered_amount, '¥'), mono: true },
     { label: '成员分摊', value: money(totals.member_amount, '¥'), mono: true },
+    { label: '全局费率', value: yuanPerDollar(totals.global_rate), hint: '成员分摊 / 梯度计费用量', mono: true },
   ]
 })
 
@@ -170,7 +172,7 @@ watch(cycle, (value, previous) => {
 
       <section class="section-band">
         <div class="section-band__head">
-          <div><h2>用户排行与账单</h2><p>按 Telegram 用户聚合全部有效 Key</p></div>
+          <div><h2>用户排行与账单</h2><p>按 Telegram 用户聚合全部有效 Key；未绑定 Key 不参与费率计算</p></div>
         </div>
         <div class="section-band__body section-band__body--flush">
           <v-data-table :headers="headers" :items="rows" :items-per-page="25" hover>
@@ -186,6 +188,7 @@ watch(cycle, (value, previous) => {
             <template #item.manual_actual="{ item }"><span class="mono">{{ money(item.manual_actual) }}</span></template>
             <template #item.billed="{ item }"><span class="mono">{{ money(item.billed) }}</span></template>
             <template #item.amount="{ item }"><span class="mono">{{ money(item.amount, '¥') }}</span></template>
+            <template #item.user_rate="{ item }"><span class="mono">{{ yuanPerDollar(item.user_rate) }}</span></template>
           </v-data-table>
         </div>
       </section>

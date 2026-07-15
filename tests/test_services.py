@@ -1162,6 +1162,9 @@ def test_unowned_metered_key_reduces_member_pool_cost(service, settings) -> None
     assert dashboard["totals"]["metered_amount"] == "7.00"
     assert dashboard["totals"]["member_amount"] == "3.00"
     assert dashboard["totals"]["amount"] == "10.00"
+    assert dashboard["totals"]["global_rate"] == "3.000000"
+    assert owned["user_rate"] == "3.000000"
+    assert unowned["user_rate"] is None
 
 
 def test_cpa_key_sync_restores_owned_key_status(service, monkeypatch) -> None:

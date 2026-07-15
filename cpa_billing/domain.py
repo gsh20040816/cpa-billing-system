@@ -82,3 +82,10 @@ def format_usd_nano(value: int) -> str:
 
 def format_cents(value: int) -> str:
     return f"{Decimal(value) / Decimal(100):,.2f}"
+
+
+def format_yuan_per_usd(amount_cents: int, usage_nano_usd: int) -> str | None:
+    if usage_nano_usd == 0:
+        return None
+    rate = Decimal(amount_cents) * Decimal(NANO_USD) / (Decimal(usage_nano_usd) * Decimal(100))
+    return format(rate, ".6f")
