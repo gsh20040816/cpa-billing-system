@@ -16,8 +16,8 @@ provide('adminSession', session)
 async function loadSession() {
   try {
     session.value = await loadAdminSession()
-  } catch {
-    window.location.assign('/admin/login')
+  } catch (exc) {
+    if (exc?.status !== 401) window.location.assign('/admin/login')
   } finally {
     loading.value = false
   }

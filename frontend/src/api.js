@@ -3,6 +3,8 @@ const state = {
   adminCsrf: null,
 }
 
+let sessionRedirecting = false
+
 export class ApiError extends Error {
   constructor(message, status, payload) {
     super(message)
@@ -18,6 +20,18 @@ export function setCsrf(token, admin = false) {
 
 export function clearCsrf(admin = false) {
   setCsrf(null, admin)
+}
+
+function isProtectedPath(path) {
+  return typeof path === 'string' && path.startsWith('/api/')
+}
+
+function redirectAfterSessionExpiry() {
+  clearCsrf()
+  clearCsrf(true)
+  if (sessionRedirecting || typeof window === 'undefined' || window.location.pathname === '/login') return
+  sessionRedirecting = true
+  window.location.replace('/login')
 }
 
 export async function api(path, options = {}) {
@@ -43,8 +57,10 @@ export async function api(path, options = {}) {
   if (!response.ok) {
     const detail = payload?.error || payload?.detail
     const message = typeof detail === 'string' ? detail : `请求失败（HTTP ${response.status}）`
+    if (response.status === 401 && isProtectedPath(path)) redirectAfterSessionExpiry()
     throw new ApiError(message, response.status, payload)
   }
+  if (path === '/auth/api-key/login' || path === '/auth/admin/login') sessionRedirecting = false
   return payload
 }
 

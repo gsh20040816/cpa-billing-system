@@ -46,8 +46,8 @@ watch(mdAndUp, (desktop) => {
 async function loadSession() {
   try {
     session.value = await loadUserSession()
-  } catch {
-    window.location.assign('/login')
+  } catch (exc) {
+    if (exc?.status !== 401) window.location.assign('/login')
   } finally {
     loading.value = false
   }
