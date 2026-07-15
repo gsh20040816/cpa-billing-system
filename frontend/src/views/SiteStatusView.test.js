@@ -33,10 +33,6 @@ describe('SiteStatusView', () => {
         name: '60m',
         start: '2026-07-15T11:00:00+08:00',
         end: '2026-07-15T13:00:00+08:00',
-        sample_count: 120,
-        minimum_samples: 120,
-        expanded: true,
-        history_exhausted: false,
       },
       cpa: { reachable: true, latency_ms: 12, api_key_count: 1 },
       accounts: { available: true, inspection: { total: 1, normal: 1, limit_reached: 0 } },
@@ -46,7 +42,6 @@ describe('SiteStatusView', () => {
         service_health: { total_success: 120, total_failure: 0, success_rate: 100, block_details: [] },
       },
       realtime: {
-        sample_policy: { minimum_samples: 120, sample_count: 120, expanded: true },
         token_velocity: [{ bucket: '2026-07-15T12:00:00+08:00', tokens_per_minute: 1000 }],
         response_level: [{ bucket: '2026-07-15T12:00:00+08:00', ttft_p50_ms: 100, ttft_p95_ms: 200, latency_p50_ms: 500, latency_p95_ms: 800 }],
         cache_level: [{ bucket: '2026-07-15T12:00:00+08:00', cache_hit_rate: 50 }],
@@ -78,8 +73,6 @@ describe('SiteStatusView', () => {
 
     expect(api).toHaveBeenCalledOnce()
     expect(wrapper.text()).toContain('模型 Token 效率')
-    expect(wrapper.text()).toContain('样本 120 / 下限 120')
-    expect(wrapper.text()).toContain('已向前扩展至')
 
     const charts = wrapper.findAllComponents({ name: 'VChart' })
     expect(charts).toHaveLength(5)

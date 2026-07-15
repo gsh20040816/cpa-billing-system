@@ -75,11 +75,6 @@ DEFAULT_TIERS = [
     {"left": 2000, "right": None, "multiplier": 0.6},
 ]
 
-# Percentiles and per-dollar efficiency are unstable when a window contains only a
-# handful of requests. Keep every site-status line chart on at least this many
-# request samples when older events are available.
-MIN_SITE_STATUS_SAMPLES = 120
-
 LOGGER = logging.getLogger(__name__)
 
 QUOTA_MODEL_ALIASES = {
@@ -3758,49 +3753,6 @@ class BillingService:
         index = max(0, min(len(ordered) - 1, math.ceil(percentile * len(ordered)) - 1))
         return int(ordered[index])
 
-    def _site_status_sample_window(
-        self,
-        session: Any,
-        start_ms: int,
-        end_ms: int,
-        minimum: int | None = None,
-    ) -> dict[str, Any]:
-        minimum = MIN_SITE_STATUS_SAMPLES if minimum is None else minimum
-        requested_count = int(session.scalar(
-            select(func.count()).select_from(RawUsageEvent).where(
-                RawUsageEvent.occurred_at_ms >= start_ms,
-                RawUsageEvent.occurred_at_ms < end_ms,
-            )
-        ) or 0)
-        effective_start_ms = start_ms
-        if requested_count < minimum:
-            needed = minimum - requested_count
-            previous_times = session.scalars(
-                select(RawUsageEvent.occurred_at_ms)
-                .where(RawUsageEvent.occurred_at_ms < start_ms)
-                .order_by(RawUsageEvent.occurred_at_ms.desc(), RawUsageEvent.id.desc())
-                .limit(needed)
-            ).all()
-            if previous_times:
-                effective_start_ms = min(start_ms, min(int(value) for value in previous_times))
-        effective_count = int(session.scalar(
-            select(func.count()).select_from(RawUsageEvent).where(
-                RawUsageEvent.occurred_at_ms >= effective_start_ms,
-                RawUsageEvent.occurred_at_ms < end_ms,
-            )
-        ) or 0)
-        return {
-            "requested_start_ms": start_ms,
-            "requested_end_ms": end_ms,
-            "effective_start_ms": effective_start_ms,
-            "effective_end_ms": end_ms,
-            "requested_samples": requested_count,
-            "sample_count": effective_count,
-            "minimum_samples": minimum,
-            "expanded": effective_start_ms < start_ms,
-            "history_exhausted": effective_count < minimum,
-        }
-
     def _local_overview(self, version_id: int, start_ms: int, end_ms: int) -> dict[str, Any]:
         with self.db.session() as session:
             aggregate = session.execute(
@@ -4161,23 +4113,9 @@ class BillingService:
                 range_start_ms = session.scalar(select(func.min(RawUsageEvent.occurred_at_ms)))
                 if range_start_ms is None:
                     range_start_ms = max(0, range_end_ms - 60_000)
-            sample_window = self._site_status_sample_window(session, range_start_ms, range_end_ms)
-            effective_start_ms = sample_window["effective_start_ms"]
             version_id = selected_cycle.pricing_version_id if selected_cycle else self._active_pricing_id(session)
-        overview = self._local_overview(version_id, effective_start_ms, range_end_ms)
-        realtime = self._local_realtime(version_id, effective_start_ms, range_end_ms, range_name)
-        realtime["sample_policy"] = {
-            "minimum_samples": sample_window["minimum_samples"],
-            "requested_samples": sample_window["requested_samples"],
-            "sample_count": sample_window["sample_count"],
-            "requested_start": self._iso_timestamp(sample_window["requested_start_ms"]),
-            "requested_end": self._iso_timestamp(sample_window["requested_end_ms"]),
-            "effective_start": self._iso_timestamp(sample_window["effective_start_ms"]),
-            "effective_end": self._iso_timestamp(sample_window["effective_end_ms"]),
-            "expanded": sample_window["expanded"],
-            "history_exhausted": sample_window["history_exhausted"],
-            "unit": "requests",
-        }
+        overview = self._local_overview(version_id, range_start_ms, range_end_ms)
+        realtime = self._local_realtime(version_id, range_start_ms, range_end_ms, range_name)
         errors: list[str] = []
         try:
             cpa = self.cpa.health()
@@ -4211,14 +4149,8 @@ class BillingService:
             "cpa": cpa,
             "range": {
                 "name": range_name,
-                "start": self._iso_timestamp(effective_start_ms),
+                "start": self._iso_timestamp(range_start_ms),
                 "end": self._iso_timestamp(range_end_ms),
-                "requested_start": self._iso_timestamp(sample_window["requested_start_ms"]),
-                "requested_end": self._iso_timestamp(sample_window["requested_end_ms"]),
-                "sample_count": sample_window["sample_count"],
-                "minimum_samples": sample_window["minimum_samples"],
-                "expanded": sample_window["expanded"],
-                "history_exhausted": sample_window["history_exhausted"],
             },
             "overview": overview,
             "realtime": realtime,

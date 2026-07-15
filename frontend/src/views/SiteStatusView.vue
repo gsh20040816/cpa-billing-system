@@ -27,12 +27,6 @@ const overview = computed(() => data.value?.overview || {})
 const realtime = computed(() => data.value?.realtime || {})
 const summary = computed(() => overview.value.summary || {})
 const serviceHealth = computed(() => overview.value.service_health || {})
-const effectiveWindowLabel = computed(() => {
-  const range = data.value?.range
-  if (!range) return timeRangeLabel(filters)
-  if (range.expanded) return `有效窗口 ${dateTime(range.start)} 至 ${dateTime(range.end)}`
-  return `${timeRangeLabel(filters)} · ${number(range.sample_count)} 个请求`
-})
 const metrics = computed(() => [
   { label: '请求', value: number(summary.value.request_count), mono: true },
   { label: 'Tokens', value: compactNumber(summary.value.token_count), hint: number(summary.value.token_count), mono: true },
@@ -168,7 +162,7 @@ onBeforeUnmount(filterReload.cancel)
 
 <template>
   <div class="content-shell">
-    <PageHeader title="全站状态" subtitle="所有统计、图表、模型与账号健康信息使用同一个有效时间窗口">
+    <PageHeader title="全站状态" subtitle="所有统计、图表、模型与账号健康信息使用同一个时间范围">
       <template #actions>
         <v-tooltip text="刷新全站状态">
           <template #activator="{ props }"><v-btn v-bind="props" icon variant="outlined" :loading="loading" @click="autoRefresh.refresh()"><RefreshCw :size="18" /></v-btn></template>
@@ -178,15 +172,6 @@ onBeforeUnmount(filterReload.cancel)
 
     <div class="d-flex align-center ga-3 flex-wrap mb-4">
       <TimeRangeSelector v-model="timeRangeModel" />
-      <v-chip v-if="data?.range" size="small" variant="tonal" color="secondary">
-        样本 {{ number(data.range.sample_count) }} / 下限 {{ number(data.range.minimum_samples) }}
-      </v-chip>
-      <v-chip v-if="data?.range?.expanded" size="small" variant="tonal" color="warning">
-        已向前扩展至 {{ dateTime(data.range.start) }}
-      </v-chip>
-      <v-chip v-if="data?.range?.history_exhausted" size="small" variant="tonal" color="info">
-        历史样本不足
-      </v-chip>
       <v-progress-circular v-if="loading && data" indeterminate color="primary" size="20" width="2" aria-label="正在更新状态" />
     </div>
 
@@ -227,23 +212,23 @@ onBeforeUnmount(filterReload.cancel)
 
       <div class="chart-grid mt-4">
         <section class="section-band chart-panel">
-          <div class="section-band__head"><div><h2>Token 速度</h2><p>{{ effectiveWindowLabel }} · 每分钟归一化</p></div></div>
+          <div class="section-band__head"><div><h2>Token 速度</h2><p>{{ timeRangeLabel(filters) }} · 每分钟归一化</p></div></div>
           <div class="section-band__body chart-panel__body"><VChart class="chart" :option="tokenOption" autoresize /></div>
         </section>
         <section class="section-band chart-panel">
-          <div class="section-band__head"><div><h2>TTFT</h2><p>{{ effectiveWindowLabel }} · 首字节时间</p></div></div>
+          <div class="section-band__head"><div><h2>TTFT</h2><p>{{ timeRangeLabel(filters) }} · 首字节时间</p></div></div>
           <div class="section-band__body chart-panel__body"><VChart class="chart" :option="ttftOption" autoresize /></div>
         </section>
         <section class="section-band chart-panel">
-          <div class="section-band__head"><div><h2>完整延迟</h2><p>{{ effectiveWindowLabel }} · 请求完成时间</p></div></div>
+          <div class="section-band__head"><div><h2>完整延迟</h2><p>{{ timeRangeLabel(filters) }} · 请求完成时间</p></div></div>
           <div class="section-band__body chart-panel__body"><VChart class="chart" :option="latencyOption" autoresize /></div>
         </section>
         <section class="section-band chart-panel">
-          <div class="section-band__head"><div><h2>缓存命中率</h2><p>{{ effectiveWindowLabel }} · 缓存读取 / 输入 tokens</p></div></div>
+          <div class="section-band__head"><div><h2>缓存命中率</h2><p>{{ timeRangeLabel(filters) }} · 缓存读取 / 输入 tokens</p></div></div>
           <div class="section-band__body chart-panel__body"><VChart class="chart" :option="cacheOption" autoresize /></div>
         </section>
         <section class="section-band chart-panel">
-          <div class="section-band__head"><div><h2>模型 Token 效率</h2><p>{{ effectiveWindowLabel }} · 输入 + 输出 tokens / $1 成本</p></div></div>
+          <div class="section-band__head"><div><h2>模型 Token 效率</h2><p>{{ timeRangeLabel(filters) }} · 输入 + 输出 tokens / $1 成本</p></div></div>
           <div class="section-band__body chart-panel__body"><VChart class="chart" :option="efficiencyOption" autoresize /></div>
         </section>
       </div>
@@ -264,7 +249,7 @@ onBeforeUnmount(filterReload.cancel)
 
       <div class="two-column mt-4">
         <section class="section-band">
-          <div class="section-band__head"><div><h2>当前模型</h2><p>{{ effectiveWindowLabel }}内聚合</p></div></div>
+          <div class="section-band__head"><div><h2>当前模型</h2><p>{{ timeRangeLabel(filters) }}内聚合</p></div></div>
           <div class="section-band__body section-band__body--flush">
             <v-table density="compact">
               <thead><tr><th>模型</th><th class="text-right">请求</th><th class="text-right">Tokens</th><th class="text-right">成本</th></tr></thead>
@@ -273,7 +258,7 @@ onBeforeUnmount(filterReload.cancel)
           </div>
         </section>
         <section class="section-band">
-          <div class="section-band__head"><div><h2>响应分布</h2><p>{{ effectiveWindowLabel }}内最新分位数</p></div></div>
+          <div class="section-band__head"><div><h2>响应分布</h2><p>{{ timeRangeLabel(filters) }}内最新分位数</p></div></div>
           <div class="section-band__body">
             <dl class="response-stats">
               <div><dt>最新 TTFT P50</dt><dd>{{ duration(realtime.response_level?.at?.(-1)?.ttft_p50_ms) }}</dd></div>

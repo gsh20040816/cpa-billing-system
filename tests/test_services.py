@@ -1330,9 +1330,8 @@ def test_site_status_supports_shared_ranges_and_cache_hit_rate(service, settings
     assert all_time["overview"]["summary"]["request_count"] == 1
 
 
-def test_site_status_expands_backwards_to_stabilize_line_chart_samples(service, settings, monkeypatch) -> None:
+def test_site_status_keeps_line_charts_inside_selected_range(service, settings, monkeypatch) -> None:
     current = int(time.time() * 1000)
-    monkeypatch.setattr("cpa_billing.services.MIN_SITE_STATUS_SAMPLES", 3)
     create_owner(service, "sample-key", 2, 0)
     insert_event(
         settings,
@@ -1369,13 +1368,8 @@ def test_site_status_expands_backwards_to_stabilize_line_chart_samples(service, 
     monkeypatch.setattr(service.cpa, "auth_files", lambda: [])
 
     status = service.site_status("60m")
-    policy = status["realtime"]["sample_policy"]
-    assert policy["requested_samples"] == 1
-    assert policy["sample_count"] == 3
-    assert policy["minimum_samples"] == 3
-    assert policy["expanded"] is True
-    assert policy["history_exhausted"] is False
-    assert status["overview"]["summary"]["request_count"] == 3
+    assert status["overview"]["summary"]["request_count"] == 1
+    assert status["range"].keys() == {"name", "start", "end"}
 
     efficiency = [
         model
@@ -1383,7 +1377,7 @@ def test_site_status_expands_backwards_to_stabilize_line_chart_samples(service, 
         for model in bucket["models"]
         if model["tokens_per_dollar"] is not None
     ]
-    assert {item["label"] for item in efficiency} == {"gpt-test", "gpt-5.6-luna"}
+    assert {item["label"] for item in efficiency} == {"gpt-test"}
     assert all(item["tokens_per_dollar"] == 687500.0 for item in efficiency)
 
 
