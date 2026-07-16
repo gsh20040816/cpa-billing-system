@@ -57,19 +57,31 @@ function responseChart(rows, series) {
   }
 }
 
+function responseSeries(name, data, color) {
+  return {
+    name,
+    type: 'line',
+    color,
+    itemStyle: { color },
+    showSymbol: false,
+    data,
+    lineStyle: { color, width: 2 },
+  }
+}
+
 const ttftOption = computed(() => {
   const rows = realtime.value.response_level || []
   return responseChart(rows, [
-    { name: 'TTFT P50', type: 'line', showSymbol: false, data: rows.map((item) => item.ttft_p50_ms), lineStyle: { color: '#006c67', width: 2 } },
-    { name: 'TTFT P95', type: 'line', showSymbol: false, data: rows.map((item) => item.ttft_p95_ms), lineStyle: { color: '#315ea8', width: 2 } },
+    responseSeries('TTFT P50', rows.map((item) => item.ttft_p50_ms), '#006c67'),
+    responseSeries('TTFT P95', rows.map((item) => item.ttft_p95_ms), '#315ea8'),
   ])
 })
 
 const latencyOption = computed(() => {
   const rows = realtime.value.response_level || []
   return responseChart(rows, [
-    { name: 'Latency P50', type: 'line', showSymbol: false, data: rows.map((item) => item.latency_p50_ms), lineStyle: { color: '#a85d00', width: 2 } },
-    { name: 'Latency P95', type: 'line', showSymbol: false, data: rows.map((item) => item.latency_p95_ms), lineStyle: { color: '#b3261e', width: 2 } },
+    responseSeries('Latency P50', rows.map((item) => item.latency_p50_ms), '#a85d00'),
+    responseSeries('Latency P95', rows.map((item) => item.latency_p95_ms), '#b3261e'),
   ])
 })
 

@@ -76,6 +76,11 @@ describe('SiteStatusView', () => {
 
     const charts = wrapper.findAllComponents({ name: 'VChart' })
     expect(charts).toHaveLength(5)
+    for (const chart of [charts[1], charts[2]]) {
+      const series = chart.props('option').series
+      expect(series.map((item) => item.color)).toEqual(series.map((item) => item.lineStyle.color))
+      expect(series.map((item) => item.color)).toEqual(series.map((item) => item.itemStyle.color))
+    }
     const option = charts[4].props('option')
     expect(option.series.map((item) => item.name)).toEqual(['gpt-5.5', 'gpt-5.6-sol'])
     expect(option.series[0].data).toEqual([1000000])
