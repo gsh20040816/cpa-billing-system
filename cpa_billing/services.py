@@ -501,6 +501,49 @@ class BillingService:
             event.reasoning_effort = effort_by_source_id.get(event.source_event_id, "")
         return len(pending)
 
+    def _backfill_cpamp_service_tiers(
+        self,
+        source_db: sqlite3.Connection,
+        session: Any,
+        source_id: int,
+        batch_size: int,
+        has_request_service_tier: bool,
+        has_response_service_tier: bool,
+    ) -> int:
+        missing: list[Any] = []
+        if has_request_service_tier:
+            missing.append(RawUsageEvent.request_service_tier.is_(None))
+        if has_response_service_tier:
+            missing.append(RawUsageEvent.response_service_tier.is_(None))
+        if not missing:
+            return 0
+        pending = session.scalars(
+            select(RawUsageEvent)
+            .where(
+                RawUsageEvent.source_id == source_id,
+                or_(*missing),
+            )
+            .order_by(RawUsageEvent.source_event_id)
+            .limit(min(batch_size, 5000))
+        ).all()
+        if not pending:
+            return 0
+
+        request_column = "request_service_tier" if has_request_service_tier else "NULL AS request_service_tier"
+        response_column = "response_service_tier" if has_response_service_tier else "NULL AS response_service_tier"
+        source_rows = source_db.execute(
+            f"select id,{request_column},{response_column} from usage_events where id between ? and ?",
+            (pending[0].source_event_id, pending[-1].source_event_id),
+        ).fetchall()
+        tiers_by_source_id = {int(row["id"]): row for row in source_rows}
+        for event in pending:
+            row = tiers_by_source_id.get(event.source_event_id)
+            if has_request_service_tier:
+                event.request_service_tier = str(row["request_service_tier"] or "").strip() if row else ""
+            if has_response_service_tier:
+                event.response_service_tier = str(row["response_service_tier"] or "").strip() if row else ""
+        return len(pending)
+
     @staticmethod
     def _raw_event_from_cpamp_row(source_id: int, row: sqlite3.Row) -> RawUsageEvent:
         return RawUsageEvent(
@@ -517,6 +560,8 @@ class BillingService:
             resolved_model=row["resolved_model"],
             reasoning_effort=str(row["reasoning_effort"] or "").strip(),
             service_tier=row["service_tier"],
+            request_service_tier=row["request_service_tier"],
+            response_service_tier=row["response_service_tier"],
             api_key_hash=row["api_key_hash"],
             source_hash=row["source_hash"],
             source_label=row["source"],
@@ -548,6 +593,8 @@ class BillingService:
         source_id: int,
         batch_size: int,
         reasoning_effort_column: str,
+        request_service_tier_column: str,
+        response_service_tier_column: str,
     ) -> int:
         dead_letters = session.scalars(
             select(DeadLetter)
@@ -566,7 +613,8 @@ class BillingService:
                    account_snapshot,auth_index,input_tokens,output_tokens,reasoning_tokens,
                    cached_tokens,cache_tokens,cache_read_tokens,cache_creation_tokens,total_tokens,failed,
                    fail_status_code,latency_ms,ttft_ms,response_metadata_json,header_quota_used_percent,
-                   header_quota_recover_at_ms,header_quota_plan_type,{reasoning_effort_column}
+                   header_quota_recover_at_ms,header_quota_plan_type,{reasoning_effort_column},
+                   {request_service_tier_column},{response_service_tier_column}
             from usage_events where id in ({placeholders})
             """,
             source_ids,
@@ -613,6 +661,12 @@ class BillingService:
             reasoning_effort_column = (
                 "reasoning_effort" if "reasoning_effort" in usage_columns else "NULL AS reasoning_effort"
             )
+            request_service_tier_column = (
+                "request_service_tier" if "request_service_tier" in usage_columns else "NULL AS request_service_tier"
+            )
+            response_service_tier_column = (
+                "response_service_tier" if "response_service_tier" in usage_columns else "NULL AS response_service_tier"
+            )
             with self.db.session() as session:
                 source = session.scalar(select(CPAMPSource).where(CPAMPSource.name == self.settings.cpamp_source_name))
                 if source is None:
@@ -625,7 +679,13 @@ class BillingService:
                     raise BillingError(checkpoint.last_error)
                 source.schema_fingerprint = fingerprint
                 imported += self._retry_cpamp_dead_letters(
-                    source_db, session, source.id, batch_size, reasoning_effort_column,
+                    source_db,
+                    session,
+                    source.id,
+                    batch_size,
+                    reasoning_effort_column,
+                    request_service_tier_column,
+                    response_service_tier_column,
                 )
                 rows = source_db.execute(
                     f"""
@@ -634,7 +694,8 @@ class BillingService:
                            account_snapshot,auth_index,input_tokens,output_tokens,reasoning_tokens,
                            cached_tokens,cache_tokens,cache_read_tokens,cache_creation_tokens,total_tokens,failed,
                            fail_status_code,latency_ms,ttft_ms,response_metadata_json,header_quota_used_percent,
-                           header_quota_recover_at_ms,header_quota_plan_type,{reasoning_effort_column}
+                           header_quota_recover_at_ms,header_quota_plan_type,{reasoning_effort_column},
+                           {request_service_tier_column},{response_service_tier_column}
                     from usage_events where id > ? order by id limit ?
                     """,
                     (checkpoint.last_event_id, batch_size),
@@ -661,6 +722,16 @@ class BillingService:
                 )
                 if backfilled:
                     LOGGER.info("worker backfilled reasoning_effort=%s", backfilled)
+                tier_backfilled = self._backfill_cpamp_service_tiers(
+                    source_db,
+                    session,
+                    source.id,
+                    max(batch_size, 5000),
+                    "request_service_tier" in usage_columns,
+                    "response_service_tier" in usage_columns,
+                )
+                if tier_backfilled:
+                    LOGGER.info("worker backfilled service tier provenance=%s", tier_backfilled)
         return imported
 
     def import_cpamp_prices(self, name: str, operator_type: str | None = None, operator_id: str | None = None,
@@ -1112,6 +1183,25 @@ class BillingService:
     def _effective_cache_read_tokens(cls, event: RawUsageEvent) -> int:
         return cls._compatible_cached_tokens(event) + max(int(event.cache_read_tokens or 0), 0)
 
+    @staticmethod
+    def _normalize_service_tier(value: str | None) -> str:
+        normalized = str(value or "").strip().lower()
+        return "priority" if normalized == "fast" else normalized
+
+    @classmethod
+    def _billing_service_tier(cls, event: RawUsageEvent) -> str:
+        # CPA can record `default` as the upstream response even when the
+        # client explicitly requested priority processing. Preserve that
+        # client intent before falling back to response and legacy fields.
+        requested = cls._normalize_service_tier(event.request_service_tier)
+        if requested == "priority":
+            return "priority"
+        for value in (event.response_service_tier, event.service_tier):
+            normalized = cls._normalize_service_tier(value)
+            if normalized:
+                return normalized
+        return "default"
+
     def _rate_event(self, behavior_model: str, price_model: str, rule: ModelPriceRule,
                     event: RawUsageEvent, tier: str) -> tuple[int, bool, dict[str, Any]]:
         input_rate = rule.input_nano_per_token
@@ -1226,9 +1316,7 @@ class BillingService:
                 rule = prices.get(price_model) if price_model else None
                 if rule is None:
                     continue
-                tier = (event.service_tier or "default").lower()
-                if tier == "fast":
-                    tier = "priority"
+                tier = self._billing_service_tier(event)
                 cost, long_context, detail = self._rate_event(behavior_model, price_model, rule, event, tier)
                 rated_event = RatedEvent(
                     raw_event_id=event.id, pricing_version_id=selected_version_id, pool_id=self._pool_for(session, event),

@@ -101,6 +101,43 @@ def test_sync_accepts_cpamp_derived_schema_columns(service, settings) -> None:
         assert session.scalar(select(func.count()).select_from(RawUsageEvent)) == 2
 
 
+def test_request_priority_provenance_overrides_default_response(service, settings) -> None:
+    create_owner(service, "key", 2, 0)
+    key_hash = cpamp_key_hash("key")
+    insert_event(settings, key_hash, 1000, event_hash="explicit-priority", tier="default")
+    assert service.sync_cpamp() == 1
+
+    db = sqlite3.connect(settings.cpamp_database_path)
+    db.execute("alter table usage_events add column request_service_tier text")
+    db.execute("alter table usage_events add column response_service_tier text")
+    db.execute(
+        "update usage_events set request_service_tier='priority', response_service_tier='default' "
+        "where event_hash='explicit-priority'"
+    )
+    db.commit()
+    insert_event(settings, key_hash, 2000, event_hash="automatic", tier="default")
+    db.execute(
+        "update usage_events set request_service_tier='auto', response_service_tier='default' "
+        "where event_hash='automatic'"
+    )
+    db.commit()
+    db.close()
+
+    assert service.sync_cpamp() == 1
+    assert service.rate_events() == 2
+    with service.db.session() as session:
+        events = {
+            event_hash: rated
+            for event_hash, rated in session.execute(
+                select(RawUsageEvent.event_hash, RatedEvent)
+                .join(RatedEvent, RatedEvent.raw_event_id == RawUsageEvent.id)
+                .order_by(RawUsageEvent.event_hash)
+            )
+        }
+        assert events["explicit-priority"].service_tier == "priority"
+        assert events["automatic"].service_tier == "default"
+
+
 def test_sync_retries_unresolved_dead_letters(service, settings) -> None:
     insert_event(settings, "first", 1000, event_hash="first")
     assert service.sync_cpamp() == 1

@@ -48,6 +48,8 @@ class RawUsageEvent(Base):
     resolved_model: Mapped[str | None] = mapped_column(String(160))
     reasoning_effort: Mapped[str | None] = mapped_column(String(40))
     service_tier: Mapped[str | None] = mapped_column(String(40))
+    request_service_tier: Mapped[str | None] = mapped_column(String(40))
+    response_service_tier: Mapped[str | None] = mapped_column(String(40))
     api_key_hash: Mapped[str | None] = mapped_column(String(64))
     source_hash: Mapped[str | None] = mapped_column(String(64))
     source_label: Mapped[str | None] = mapped_column(String(240))
