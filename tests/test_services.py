@@ -77,6 +77,30 @@ def test_sync_is_incremental_and_idempotent(service, settings) -> None:
         assert session.scalar(select(func.count()).select_from(RawUsageEvent)) == 1
 
 
+def test_sync_accepts_cpamp_derived_schema_columns(service, settings) -> None:
+    insert_event(settings, "before-upgrade", 1000, event_hash="before-upgrade")
+    assert service.sync_cpamp() == 1
+
+    db = sqlite3.connect(settings.cpamp_database_path)
+    for column in (
+        "request_service_tier text",
+        "response_service_tier text",
+        "cache_input_mode text",
+        "normalized_uncached_input_tokens integer",
+        "normalized_total_input_tokens integer",
+        "normalized_cache_read_tokens integer",
+        "normalized_cache_creation_tokens integer",
+    ):
+        db.execute(f"alter table usage_events add column {column}")
+    db.commit()
+    db.close()
+
+    insert_event(settings, "after-upgrade", 2000, event_hash="after-upgrade")
+    assert service.sync_cpamp() == 1
+    with service.db.session() as session:
+        assert session.scalar(select(func.count()).select_from(RawUsageEvent)) == 2
+
+
 def test_sync_retries_unresolved_dead_letters(service, settings) -> None:
     insert_event(settings, "first", 1000, event_hash="first")
     assert service.sync_cpamp() == 1

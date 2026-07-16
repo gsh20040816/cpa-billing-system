@@ -89,6 +89,18 @@ QUOTA_MODEL_ALIASES = {
     "codex_bengalfox": "gpt-5.3-codex-spark",
 }
 
+# CPAMP may append derived accounting columns to usage_events. Billing reads the
+# base event contract below, so additive derived columns must not halt syncing.
+CPAMP_DERIVED_SCHEMA_COLUMNS = (
+    "request_service_tier",
+    "response_service_tier",
+    "cache_input_mode",
+    "normalized_uncached_input_tokens",
+    "normalized_total_input_tokens",
+    "normalized_cache_read_tokens",
+    "normalized_cache_creation_tokens",
+)
+
 
 class BillingError(RuntimeError):
     pass
@@ -450,7 +462,10 @@ class BillingService:
         missing = required - columns
         if missing:
             raise BillingError("CPAMP schema missing columns: " + ", ".join(sorted(missing)))
-        return hashlib.sha256(str(row[0]).encode()).hexdigest()
+        schema_sql = str(row[0])
+        for column in CPAMP_DERIVED_SCHEMA_COLUMNS:
+            schema_sql = re.sub(rf",\s*{re.escape(column)}\s+[^,)]*", "", schema_sql)
+        return hashlib.sha256(schema_sql.encode()).hexdigest()
 
     def _backfill_cpamp_reasoning_effort(
         self,
