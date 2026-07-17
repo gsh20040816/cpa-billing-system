@@ -1,5 +1,5 @@
 <script setup>
-import { computed, reactive, ref } from 'vue'
+import { computed, inject, reactive, ref } from 'vue'
 import { RefreshCw, ServerCog } from '@lucide/vue'
 import { api } from '../api'
 import LoadingState from '../components/LoadingState.vue'
@@ -12,6 +12,8 @@ const loading = ref(true)
 const refreshingAll = ref(false)
 const error = ref('')
 const data = ref(null)
+const userSession = inject('userSession', ref(null))
+const readOnlyGuest = computed(() => Boolean(userSession.value?.read_only))
 const refreshing = reactive({})
 const snackbar = reactive({ show: false, text: '', color: 'success' })
 
@@ -104,7 +106,7 @@ const autoRefresh = useAutoRefresh((silent) => load(silent), { interval: 60_000 
   <div class="content-shell">
     <PageHeader title="上游账号" subtitle="额度百分比来自 CPA 上游读取；请求、Token 与费用由本面板按 CPAMP 事件计算">
       <template #actions>
-        <v-btn color="primary" :loading="refreshingAll" @click="refreshAccounts()">
+        <v-btn v-if="!readOnlyGuest" color="primary" :loading="refreshingAll" @click="refreshAccounts()">
           <RefreshCw :size="17" class="mr-2" />刷新全部额度
         </v-btn>
       </template>
@@ -126,7 +128,7 @@ const autoRefresh = useAutoRefresh((silent) => load(silent), { interval: 60_000 
               <v-chip :color="account.disabled ? 'error' : account.quota_status === 'completed' ? 'success' : 'warning'" variant="tonal">
                 {{ account.disabled ? '已停用' : account.quota_status }}
               </v-chip>
-              <v-tooltip text="刷新该账号额度">
+              <v-tooltip v-if="!readOnlyGuest" text="刷新该账号额度">
                 <template #activator="{ props }">
                   <v-btn v-bind="props" icon variant="outlined" size="small" :disabled="!account.can_refresh" :loading="refreshing[account.id]" @click="refreshAccounts([account.id])">
                     <RefreshCw :size="17" />

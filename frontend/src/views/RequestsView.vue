@@ -17,6 +17,7 @@ const props = defineProps({
 })
 const userSession = inject('userSession', ref(null))
 const globalScope = computed(() => props.admin || userSession.value?.management_session)
+const readOnlyGuest = computed(() => Boolean(userSession.value?.read_only))
 const endpointBase = computed(() => globalScope.value ? '/api/admin/usage' : '/api/me/usage')
 const apiOptions = computed(() => globalScope.value ? { admin: true } : {})
 const loading = ref(true)
@@ -207,7 +208,7 @@ onBeforeUnmount(filterReload.cancel)
   <div class="content-shell">
     <PageHeader
       :title="globalScope ? '全部请求' : '历史请求'"
-      :subtitle="globalScope ? '全站所有 API Key 的完整请求元数据，包含未绑定 Key' : '本人所有 API Key 的完整请求元数据'"
+      :subtitle="globalScope ? '全站所有 API Key 的完整请求元数据，包含未绑定 Key' : readOnlyGuest ? '当前未绑定 API Key 的历史请求，只读查看' : '本人所有 API Key 的完整请求元数据'"
     >
       <template #actions>
         <v-btn variant="outlined" @click="filtersOpen = !filtersOpen">

@@ -116,4 +116,38 @@ describe('UserLayout', () => {
     expect(management.some((item) => item.props('to') === '/admin/requests')).toBe(true)
     wrapper.unmount()
   })
+
+  it('redirects an unowned-key session to the three read-only pages', async () => {
+    loadUserSession.mockResolvedValue({
+      telegram_user_id: null,
+      name: '未绑定 API Key',
+      is_admin: false,
+      management_session: false,
+      read_only: true,
+    })
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1280 })
+    const View = { template: '<div />' }
+    const router = createRouter({
+      history: createMemoryHistory(),
+      routes: ['/', '/requests', '/status', '/accounts', '/rankings', '/pricing', '/keys']
+        .map((path) => ({ path, component: View })),
+    })
+    await router.push('/')
+    await router.isReady()
+
+    const wrapper = mount(UserLayout, {
+      global: {
+        plugins: [router, vuetify],
+        stubs: { SystemPulse: true, RouterView: true },
+      },
+    })
+    await flushPromises()
+
+    expect(router.currentRoute.value.path).toBe('/requests')
+    const destinations = wrapper.findAllComponents({ name: 'VListItem' })
+      .map((item) => item.props('to'))
+      .filter(Boolean)
+    expect(destinations).toEqual(['/requests', '/status', '/accounts'])
+    wrapper.unmount()
+  })
 })

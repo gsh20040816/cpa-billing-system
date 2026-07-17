@@ -29,8 +29,11 @@ const managementNav = [
   { title: '系统管理', to: '/admin', icon: Settings2 },
   { title: '全部请求', to: '/admin/requests', icon: Activity },
 ]
+const readOnlyNav = nav.filter((item) => ['/requests', '/status', '/accounts'].includes(item.to))
+const readOnlyPaths = new Set(readOnlyNav.map((item) => item.to))
 
-const userNav = computed(() => nav)
+const readOnlyGuest = computed(() => Boolean(session.value?.read_only))
+const userNav = computed(() => readOnlyGuest.value ? readOnlyNav : nav)
 const bottomNav = computed(() => [
   ...userNav.value.filter((item) => ['/', '/requests', '/status', '/keys'].includes(item.to)),
   ...(session.value?.is_admin ? [managementNav[0]] : []),
@@ -46,12 +49,19 @@ watch(mdAndUp, (desktop) => {
 async function loadSession() {
   try {
     session.value = await loadUserSession()
+    if (readOnlyGuest.value && !readOnlyPaths.has(route.path)) {
+      await router.replace('/requests')
+    }
   } catch (exc) {
     if (exc?.status !== 401) window.location.assign('/login')
   } finally {
     loading.value = false
   }
 }
+
+watch(() => route.path, (path) => {
+  if (readOnlyGuest.value && !readOnlyPaths.has(path)) router.replace('/requests')
+})
 
 async function logout() {
   try {
@@ -112,8 +122,8 @@ onMounted(loadSession)
         </template>
         <v-list density="compact" min-width="190">
           <v-list-item
-            :title="session?.management_session ? '管理 Token 会话' : 'Telegram 用户'"
-            :subtitle="session?.telegram_user_id ? String(session.telegram_user_id) : '全站管理权限'"
+            :title="session?.management_session ? '管理 Token 会话' : session?.read_only ? '未绑定 API Key（只读）' : 'Telegram 用户'"
+            :subtitle="session?.telegram_user_id ? String(session.telegram_user_id) : session?.read_only ? '仅历史请求、全站状态、上游账号' : '全站管理权限'"
           />
           <v-divider />
           <v-list-item title="退出登录" @click="logout">

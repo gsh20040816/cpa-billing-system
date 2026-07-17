@@ -39,10 +39,79 @@ def add_user(app, settings, user_id: int, raw_key: str, *, is_admin: bool = Fals
         ))
 
 
+def add_unowned_key(app, settings, raw_key: str) -> int:
+    service = app.state.service
+    with service.db.session() as session:
+        key = APIKey(
+            cpamp_hash=cpamp_key_hash(raw_key),
+            login_fingerprint=login_fingerprint(raw_key, settings.key_pepper),
+            masked_value=mask_api_key(raw_key),
+            status="unowned",
+            current_owner_id=None,
+            present_in_cpa=True,
+            created_at_ms=1,
+        )
+        session.add(key)
+        session.flush()
+        return key.id
+
+
 def login_user(client: TestClient, raw_key: str) -> dict:
     response = client.post("/auth/api-key/login", json={"api_key": raw_key})
     assert response.status_code == 200
     return response.json()
+
+
+def test_unowned_key_gets_scoped_read_only_session(settings, monkeypatch) -> None:
+    app = create_app(settings)
+    key_id = add_unowned_key(app, settings, "sk-cpa-unowned-read-only")
+    monkeypatch.setattr(app.state.service.cpa, "list_keys", lambda: ["sk-cpa-unowned-read-only"])
+    monkeypatch.setattr(app.state.service, "site_status", lambda *args: {"status": "ok"})
+    monkeypatch.setattr(app.state.service, "accounts_snapshot", lambda: {"accounts": [], "inspection": {}})
+    client = TestClient(app, base_url="https://billing.example")
+
+    login = login_user(client, "sk-cpa-unowned-read-only")
+    assert login["telegram_user_id"] is None
+    assert login["read_only"] is True
+    session = client.get("/api/session").json()
+    assert session["read_only"] is True
+    assert session["is_admin"] is False
+
+    observed = {}
+    original_history = app.state.service.request_history
+
+    def record_history(*args, **kwargs):
+        observed.update(kwargs)
+        return original_history(*args, **kwargs)
+
+    monkeypatch.setattr(app.state.service, "request_history", record_history)
+    assert client.get("/api/me/usage/filter-options").status_code == 200
+    assert client.get("/api/me/usage/events").status_code == 200
+    assert observed["all_users"] is True
+    assert observed["key_id"] == key_id
+    assert client.get("/api/site/status").status_code == 200
+    assert client.get("/api/site/accounts").status_code == 200
+
+    assert client.get("/api/dashboard").status_code == 403
+    assert client.get("/api/rankings").status_code == 403
+    assert client.get("/api/pricing").status_code == 403
+    assert client.get("/api/me/keys").status_code == 403
+    assert client.post("/api/site/accounts/refresh", json={"account_ids": []}).status_code == 403
+    assert client.get("/api/users/2/summary").status_code == 403
+
+    assert client.get("/", follow_redirects=False).headers["location"] == "/requests"
+    assert client.get("/pricing", follow_redirects=False).headers["location"] == "/requests"
+    assert client.get("/requests", follow_redirects=False).status_code == 200
+    assert client.get("/status", follow_redirects=False).status_code == 200
+    assert client.get("/accounts", follow_redirects=False).status_code == 200
+
+    with app.state.service.db.session() as session:
+        session.add(TelegramUser(telegram_user_id=2, registered_at_ms=1, last_seen_at_ms=1))
+        session.flush()
+        key = session.get(APIKey, key_id)
+        key.status = "active"
+        key.current_owner_id = 2
+    assert client.get("/api/session").status_code == 401
 
 
 def test_web_has_no_registration_and_hides_other_users_keys(settings, monkeypatch) -> None:

@@ -325,7 +325,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return WebAuth(
                 session=session,
                 user=user,
-                is_admin=bool(user.is_admin or user.telegram_user_id in settings.admin_user_ids),
+                is_admin=bool(user and (user.is_admin or user.telegram_user_id in settings.admin_user_ids)),
                 via_management_token=False,
             )
         admin_session = service.get_admin_session(request.cookies.get(ADMIN_COOKIE))
@@ -337,6 +337,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         auth = resolve_web_auth(request)
         if auth is None:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="用户会话已失效")
+        return auth
+
+    def is_read_only_guest(auth: WebAuth) -> bool:
+        return auth.user is None and not auth.via_management_token
+
+    def full_user_current(request: Request) -> WebAuth:
+        auth = current(request)
+        if is_read_only_guest(auth):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="未绑定 API Key 仅允许查看历史请求、全站状态和上游账号。")
         return auth
 
     def page_current(request: Request) -> WebAuth | None:
@@ -451,11 +460,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if authenticated is None:
             limiter.failure(limiter_key)
             await asyncio.sleep(0.35)
-            raise HTTPException(status_code=401, detail="API Key 无效、已撤销或尚未通过 Telegram 注册。")
+            raise HTTPException(status_code=401, detail="API Key 无效、已撤销或当前未在 CPA 中启用。")
         limiter.success(limiter_key)
         user, key = authenticated
-        token, csrf = service.create_session(user.telegram_user_id, key.id)
-        response = JSONResponse({"ok": True, "telegram_user_id": user.telegram_user_id, "csrf_token": csrf})
+        token, csrf = service.create_session(None if user is None else user.telegram_user_id, key.id)
+        response = JSONResponse({
+            "ok": True,
+            "telegram_user_id": None if user is None else user.telegram_user_id,
+            "read_only": user is None,
+            "csrf_token": csrf,
+        })
         set_user_cookie(response, token)
         response.delete_cookie(ADMIN_COOKIE, path="/")
         response.delete_cookie("billing_session", path="/")
@@ -507,10 +521,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         user = auth.user
         return {
             "telegram_user_id": None if user is None else user.telegram_user_id,
-            "name": "管理员" if user is None else service._user_name(user, user.telegram_user_id),
+            "name": "管理员" if auth.via_management_token else "未绑定 API Key" if user is None else service._user_name(user, user.telegram_user_id),
             "is_admin": auth.is_admin,
             "login_key_id": None if user is None else auth.session.api_key_id,
             "management_session": auth.via_management_token,
+            "read_only": is_read_only_guest(auth),
             "csrf_token": auth.session.csrf_token,
         }
 
@@ -519,17 +534,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {"is_admin": True, "csrf_token": auth.session.csrf_token}
 
     @app.get("/api/dashboard")
-    def api_dashboard(cycle: str | None = Query(None), _: tuple[Any, Any] = Depends(current)) -> dict[str, Any]:
+    def api_dashboard(cycle: str | None = Query(None), _: WebAuth = Depends(full_user_current)) -> dict[str, Any]:
         return service.dashboard(cycle)
 
     @app.get("/api/users")
-    def api_users(cycle: str | None = Query(None), _: tuple[Any, Any] = Depends(current)) -> dict[str, Any]:
+    def api_users(cycle: str | None = Query(None), _: WebAuth = Depends(full_user_current)) -> dict[str, Any]:
         data = service.dashboard(cycle)
         return {"cycle": data["cycle"], "users": data["rows"]}
 
     @app.get("/api/users/{user_id}/summary")
     def api_user(user_id: int, cycle: str | None = Query(None),
-                 _: tuple[Any, Any] = Depends(current)) -> dict[str, Any]:
+                 _: WebAuth = Depends(full_user_current)) -> dict[str, Any]:
         return service.user_summary(user_id, cycle)
 
     @app.get("/api/me/keys")
@@ -575,8 +590,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/me/usage/filter-options")
     def api_request_options(auth: WebAuth = Depends(current)) -> dict[str, Any]:
-        if auth.user is None:
+        if auth.via_management_token:
             return service.request_filter_options(None, all_users=True)
+        if auth.user is None:
+            return service.request_filter_options(None, all_users=True, key_id=auth.session.api_key_id)
         return service.request_filter_options(auth.user.telegram_user_id)
 
     @app.get("/api/me/usage/events")
@@ -609,6 +626,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         page_size: int = Query(50, ge=1, le=100),
         auth: WebAuth = Depends(current),
     ) -> dict[str, Any]:
+        guest = is_read_only_guest(auth)
         all_users = auth.user is None
         return service.request_history(
             None if all_users else auth.user.telegram_user_id,
@@ -622,7 +640,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             tier=tier,
             provider=provider,
             status=request_status,
-            key_id=key_id,
+            key_id=auth.session.api_key_id if guest else key_id,
             failure_code=failure_code,
             min_tokens=min_tokens,
             max_tokens=max_tokens,
@@ -714,16 +732,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         cycle: str | None = Query(None),
         hours: int | None = Query(None, ge=1),
         sort: str = Query("cost"),
-        _: tuple[Any, Any] = Depends(current),
+        _: WebAuth = Depends(full_user_current),
     ) -> dict[str, Any]:
         return service.ranking_snapshot(range_name, start, end, cycle, sort, hours)
 
     @app.get("/api/pricing")
-    def api_pricing(cycle: str | None = Query(None), _: tuple[Any, Any] = Depends(current)) -> dict[str, Any]:
+    def api_pricing(cycle: str | None = Query(None), _: WebAuth = Depends(full_user_current)) -> dict[str, Any]:
         return service.pricing_snapshot(cycle)
 
     @app.get("/api/site/pulse")
-    async def api_site_pulse(_: tuple[Any, Any] = Depends(current)) -> dict[str, Any]:
+    async def api_site_pulse(_: WebAuth = Depends(current)) -> dict[str, Any]:
         return await asyncio.to_thread(service.site_pulse)
 
     @app.get("/api/site/status")
@@ -733,17 +751,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         end: str | None = Query(None),
         cycle: str | None = Query(None),
         hours: int | None = Query(None, ge=1),
-        _: tuple[Any, Any] = Depends(current),
+        _: WebAuth = Depends(current),
     ) -> dict[str, Any]:
         return await asyncio.to_thread(service.site_status, range_name, start, end, cycle, hours)
 
     @app.get("/api/site/accounts")
-    async def api_accounts(_: tuple[Any, Any] = Depends(current)) -> dict[str, Any]:
+    async def api_accounts(_: WebAuth = Depends(current)) -> dict[str, Any]:
         return await asyncio.to_thread(service.accounts_snapshot)
 
     @app.post("/api/site/accounts/refresh")
     async def api_refresh_accounts(payload: AccountRefreshPayload, request: Request,
                                    auth: WebAuth = Depends(current)) -> dict[str, Any]:
+        if is_read_only_guest(auth):
+            raise HTTPException(status_code=403, detail="未绑定 API Key 只能查看上游账号，不能刷新额度。")
         verify_csrf(request, auth)
         quota_refresh_limiter.check_and_mark(str(auth.user.telegram_user_id if auth.user else "admin-token"))
         return await asyncio.to_thread(service.refresh_account_quotas, payload.account_ids)
@@ -1052,10 +1072,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if auth is None:
                 return RedirectResponse("/login", status_code=303)
             if not auth.is_admin:
-                return RedirectResponse("/", status_code=303)
+                return RedirectResponse("/requests" if is_read_only_guest(auth) else "/", status_code=303)
             return spa_response()
-        if page_current(request) is None:
+        auth = page_current(request)
+        if auth is None:
             return RedirectResponse("/login", status_code=303)
+        if is_read_only_guest(auth) and full_path not in {"requests", "status", "accounts"}:
+            return RedirectResponse("/requests", status_code=303)
         return spa_response()
 
     return app

@@ -356,7 +356,7 @@ class ReconciliationRun(Base):
 class WebSession(Base):
     __tablename__ = "web_sessions"
     session_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
-    telegram_user_id: Mapped[int] = mapped_column(ForeignKey("telegram_users.telegram_user_id"))
+    telegram_user_id: Mapped[int | None] = mapped_column(ForeignKey("telegram_users.telegram_user_id"))
     api_key_id: Mapped[int] = mapped_column(ForeignKey("api_keys.id"))
     csrf_token: Mapped[str] = mapped_column(String(64))
     created_at_ms: Mapped[int] = mapped_column(BigInteger)

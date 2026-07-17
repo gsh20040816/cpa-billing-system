@@ -24,7 +24,7 @@ async function submit() {
       : await api('/auth/admin/login', { body: { management_token: managementToken.value } })
     setCsrf(result.csrf_token)
     setCsrf(result.csrf_token, true)
-    await router.replace('/')
+    await router.replace(result.read_only ? '/requests' : '/')
   } catch (exc) {
     error.value = exc.message
   } finally {

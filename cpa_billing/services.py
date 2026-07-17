@@ -1496,22 +1496,34 @@ class BillingService:
                 "multiplier": None if multiplier_ppm is None else format(Decimal(multiplier_ppm) / Decimal(1_000_000), "f"),
             }
 
-    def authenticate_key(self, raw_key: str) -> tuple[TelegramUser, APIKey] | None:
+    def authenticate_key(self, raw_key: str) -> tuple[TelegramUser | None, APIKey] | None:
         fingerprint = login_fingerprint(raw_key, self.settings.key_pepper)
         with self.db.session() as session:
-            key = session.scalar(select(APIKey).where(APIKey.login_fingerprint == fingerprint, APIKey.status == "active"))
-            if key is None or key.current_owner_id is None:
+            key = session.scalar(select(APIKey).where(
+                APIKey.login_fingerprint == fingerprint,
+                APIKey.status.in_(("active", "unowned")),
+            ))
+            if key is None:
                 return None
-            user = session.get(TelegramUser, key.current_owner_id)
-            if user is None or user.registered_at_ms is None:
+            key_id = key.id
+            user_id = key.current_owner_id
+            user = None if user_id is None else session.get(TelegramUser, user_id)
+            if user_id is not None and (user is None or user.registered_at_ms is None):
                 return None
-            key_id, user_id = key.id, user.telegram_user_id
         if not self.cpa.key_is_active(raw_key):
             return None
         with self.db.session() as session:
-            return session.get(TelegramUser, user_id), session.get(APIKey, key_id)
+            key = session.get(APIKey, key_id)
+            if key is None or key.status not in {"active", "unowned"}:
+                return None
+            if key.current_owner_id is None:
+                return None, key
+            user = session.get(TelegramUser, key.current_owner_id)
+            if user is None or user.registered_at_ms is None:
+                return None
+            return user, key
 
-    def create_session(self, user_id: int, api_key_id: int) -> tuple[str, str]:
+    def create_session(self, user_id: int | None, api_key_id: int) -> tuple[str, str]:
         token, csrf = secure_token(), secure_token(18)
         with self.db.session() as session:
             session.execute(delete(WebSession).where(WebSession.expires_at_ms <= now_ms()))
@@ -1519,16 +1531,18 @@ class BillingService:
                                    csrf_token=csrf, created_at_ms=now_ms(), expires_at_ms=now_ms() + self.settings.session_ttl_seconds * 1000))
         return token, csrf
 
-    def get_session(self, token: str | None) -> tuple[WebSession, TelegramUser] | None:
+    def get_session(self, token: str | None) -> tuple[WebSession, TelegramUser | None] | None:
         if not token:
             return None
         with self.db.session() as session:
             row = session.get(WebSession, hash_token(token, self.settings.session_secret))
             if row is None or row.revoked_at_ms is not None or row.expires_at_ms <= now_ms():
                 return None
-            user = session.get(TelegramUser, row.telegram_user_id)
+            user = None if row.telegram_user_id is None else session.get(TelegramUser, row.telegram_user_id)
             key = session.get(APIKey, row.api_key_id)
-            if user is None or key is None or key.status != "active" or key.current_owner_id != user.telegram_user_id:
+            valid_guest = row.telegram_user_id is None and key is not None and key.current_owner_id is None and key.status in {"active", "unowned"}
+            valid_user = user is not None and key is not None and key.status == "active" and key.current_owner_id == user.telegram_user_id
+            if not valid_guest and not valid_user:
                 row.revoked_at_ms = now_ms()
                 return None
             return row, user
@@ -1616,7 +1630,7 @@ class BillingService:
 
     def request_key_action(self, user_id: int, raw_current_key: str, action: str, target_key_id: int | None) -> str:
         authenticated = self.authenticate_key(raw_current_key)
-        if authenticated is None or authenticated[0].telegram_user_id != user_id:
+        if authenticated is None or authenticated[0] is None or authenticated[0].telegram_user_id != user_id:
             raise BillingError("current API Key verification failed")
         if action not in {"add", "reset", "revoke"}:
             raise BillingError("unsupported key action")
@@ -1634,7 +1648,7 @@ class BillingService:
     def execute_web_key_action(self, user_id: int, raw_current_key: str, action: str,
                                target_key_id: int | None) -> dict[str, Any]:
         authenticated = self.authenticate_key(raw_current_key)
-        if authenticated is None or authenticated[0].telegram_user_id != user_id:
+        if authenticated is None or authenticated[0] is None or authenticated[0].telegram_user_id != user_id:
             raise BillingError("当前 API Key 验证失败")
         return self._execute_key_action(user_id, action, target_key_id, "web-user", str(user_id))
 
@@ -2403,9 +2417,12 @@ class BillingService:
                 } for key in keys],
             }
 
-    def request_filter_options(self, user_id: int | None, *, all_users: bool = False) -> dict[str, Any]:
+    def request_filter_options(self, user_id: int | None, *, all_users: bool = False,
+                               key_id: int | None = None) -> dict[str, Any]:
         if (user_id is None) != all_users:
             raise BillingError("请求查询范围无效")
+        if key_id is not None and key_id < 1:
+            raise BillingError("API Key 查询范围无效")
         event_scope = (
             RawUsageEvent.__table__
             .outerjoin(APIKey.__table__, APIKey.cpamp_hash == RawUsageEvent.api_key_hash)
@@ -2419,6 +2436,8 @@ class BillingService:
             ))
         )
         scope_filters = [] if all_users else [KeyOwnershipPeriod.telegram_user_id == user_id]
+        if key_id is not None:
+            scope_filters.append(APIKey.id == key_id)
         with self.db.session() as session:
             if not all_users and session.get(TelegramUser, user_id) is None:
                 raise BillingError("用户不存在")
