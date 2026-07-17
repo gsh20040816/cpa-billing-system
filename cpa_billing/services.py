@@ -20,7 +20,7 @@ from typing import Any, Iterator
 from zoneinfo import ZoneInfo
 
 import httpx
-from sqlalchemy import Integer, and_, case, cast, delete, func, not_, or_, select, update
+from sqlalchemy import Integer, and_, case, cast, delete, func, literal, not_, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
 from .config import Settings
@@ -1201,6 +1201,24 @@ class BillingService:
             if normalized:
                 return normalized
         return "default"
+
+    @staticmethod
+    def _raw_billing_service_tier_expression() -> Any:
+        requested = func.lower(func.trim(func.coalesce(RawUsageEvent.request_service_tier, "")))
+        response = func.lower(func.trim(func.coalesce(RawUsageEvent.response_service_tier, "")))
+        stored = func.lower(func.trim(func.coalesce(RawUsageEvent.service_tier, "")))
+        return case(
+            (requested.in_(("priority", "fast")), literal("priority")),
+            (response == "fast", literal("priority")),
+            (response != "", response),
+            (stored == "fast", literal("priority")),
+            (stored != "", stored),
+            else_=literal("default"),
+        )
+
+    @classmethod
+    def _effective_service_tier_expression(cls) -> Any:
+        return func.coalesce(RatedEvent.service_tier, cls._raw_billing_service_tier_expression())
 
     def _rate_event(self, behavior_model: str, price_model: str, rule: ModelPriceRule,
                     event: RawUsageEvent, tier: str) -> tuple[int, bool, dict[str, Any]]:
@@ -2453,9 +2471,10 @@ class BillingService:
                 for value in row
                 if value
             })
+            tier_expression = self._raw_billing_service_tier_expression()
             tiers = sorted({str(value or "default") for value in session.scalars(
-                select(RawUsageEvent.service_tier).select_from(event_scope)
-                .where(*scope_filters).distinct().order_by(RawUsageEvent.service_tier)
+                select(tier_expression).select_from(event_scope)
+                .where(*scope_filters).distinct().order_by(tier_expression)
             )})
             providers = [str(value) for value in session.scalars(
                 select(RawUsageEvent.provider).select_from(event_scope)
@@ -2612,11 +2631,8 @@ class BillingService:
                     RawUsageEvent.resolved_model.in_(selected_models),
                 ))
             if tier:
-                normalized_tier = tier.lower()
-                if normalized_tier == "default":
-                    filters.append(or_(RawUsageEvent.service_tier.is_(None), func.lower(RawUsageEvent.service_tier) == "default"))
-                else:
-                    filters.append(func.lower(RawUsageEvent.service_tier) == normalized_tier)
+                normalized_tier = self._normalize_service_tier(tier)
+                filters.append(self._effective_service_tier_expression() == (normalized_tier or "default"))
             if provider:
                 filters.append(RawUsageEvent.provider == provider)
             if status == "success":
@@ -2735,7 +2751,7 @@ class BillingService:
                     "requested_model": event.requested_model,
                     "resolved_model": event.resolved_model,
                     "reasoning_effort": event.reasoning_effort or None,
-                    "service_tier": rated.service_tier if rated else (event.service_tier or "default"),
+                    "service_tier": rated.service_tier if rated else self._billing_service_tier(event),
                     "key": key_payload,
                     "tokens": {
                         "input": event.input_tokens,

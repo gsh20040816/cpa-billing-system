@@ -137,6 +137,15 @@ def test_request_priority_provenance_overrides_default_response(service, setting
         assert events["explicit-priority"].service_tier == "priority"
         assert events["automatic"].service_tier == "default"
 
+    history_kwargs = {
+        "start": "1970-01-01T00:00:00Z",
+        "end": "1970-01-02T00:00:00Z",
+        "page_size": 10,
+    }
+    assert service.request_history(2, tier="priority", **history_kwargs)["pagination"]["total"] == 1
+    assert service.request_history(2, tier="default", **history_kwargs)["pagination"]["total"] == 1
+    assert set(service.request_filter_options(2)["tiers"]) == {"default", "priority"}
+
 
 def test_sync_retries_unresolved_dead_letters(service, settings) -> None:
     insert_event(settings, "first", 1000, event_hash="first")
