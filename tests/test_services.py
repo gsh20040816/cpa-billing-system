@@ -1403,6 +1403,71 @@ def test_site_status_supports_shared_ranges_and_cache_hit_rate(service, settings
     assert all_time["overview"]["summary"]["request_count"] == 1
 
 
+def test_site_status_aggregates_dimensions_and_response_percentiles(service, settings, monkeypatch) -> None:
+    current = int(time.time() * 1000)
+    insert_event(
+        settings,
+        "key-a",
+        current - 1_000,
+        event_hash="aggregate-one",
+        input_tokens=1_000,
+        output_tokens=100,
+        cached_tokens=100,
+        model="gpt-test",
+        account_snapshot="account-a",
+        auth_index="auth-a",
+        latency_ms=100,
+        ttft_ms=10,
+    )
+    insert_event(
+        settings,
+        "key-a",
+        current - 2_000,
+        event_hash="aggregate-two",
+        input_tokens=1_000,
+        output_tokens=100,
+        cached_tokens=100,
+        model="gpt-test",
+        account_snapshot="account-a",
+        auth_index="auth-a",
+        failed=True,
+        fail_status_code=503,
+        latency_ms=200,
+        ttft_ms=20,
+    )
+    insert_event(
+        settings,
+        "key-b",
+        current - 3_000,
+        event_hash="aggregate-three",
+        input_tokens=1_000,
+        output_tokens=100,
+        cached_tokens=100,
+        model="gpt-5.6-luna",
+        account_snapshot="account-b",
+        auth_index="auth-b",
+        latency_ms=300,
+        ttft_ms=30,
+    )
+    service.sync_cpamp()
+    service.rate_events()
+    monkeypatch.setattr(service.cpa, "auth_files", lambda: [])
+
+    status = service.site_status("60m")
+    realtime = status["realtime"]
+    assert status["overview"]["summary"]["request_count"] == 3
+    assert sum(item["requests"] for item in realtime["current_usage"]["models"]) == 3
+    assert sum(item["requests"] for item in realtime["current_usage"]["upstream_accounts"]) == 3
+    assert realtime["current_usage"]["api_keys"]["count"] == 2
+    assert sum(item["failure"] for item in realtime["request_level"]) == 1
+    assert sum(item["success"] for item in realtime["request_level"]) == 2
+    response = next(item for item in realtime["response_level"] if item["ttft_p50_ms"] is not None)
+    assert response["ttft_p50_ms"] == 20
+    assert response["ttft_p95_ms"] == 30
+    assert response["latency_p50_ms"] == 200
+    assert response["latency_p95_ms"] == 300
+
+
 def test_site_status_keeps_line_charts_inside_selected_range(service, settings, monkeypatch) -> None:
     current = int(time.time() * 1000)
     create_owner(service, "sample-key", 2, 0)

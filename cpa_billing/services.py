@@ -12,6 +12,7 @@ import time
 import uuid
 from collections import defaultdict
 from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
@@ -1174,10 +1175,24 @@ class BillingService:
         return None
 
     @staticmethod
-    def _compatible_cached_tokens(event: RawUsageEvent) -> int:
-        cached = max(int(event.cached_tokens or 0), int(event.cache_tokens or 0))
-        fine_grained = max(int(event.cache_read_tokens or 0), 0) + max(int(event.cache_creation_tokens or 0), 0)
+    def _compatible_cached_token_values(
+        cached_tokens: Any,
+        cache_tokens: Any,
+        cache_read_tokens: Any,
+        cache_creation_tokens: Any,
+    ) -> int:
+        cached = max(int(cached_tokens or 0), int(cache_tokens or 0))
+        fine_grained = max(int(cache_read_tokens or 0), 0) + max(int(cache_creation_tokens or 0), 0)
         return max(cached - fine_grained, 0)
+
+    @classmethod
+    def _compatible_cached_tokens(cls, event: RawUsageEvent) -> int:
+        return cls._compatible_cached_token_values(
+            event.cached_tokens,
+            event.cache_tokens,
+            event.cache_read_tokens,
+            event.cache_creation_tokens,
+        )
 
     @classmethod
     def _effective_cache_read_tokens(cls, event: RawUsageEvent) -> int:
@@ -3896,14 +3911,6 @@ class BillingService:
             "required_confirmations": required_confirmations,
         }
 
-    @staticmethod
-    def _percentile(values: list[int], percentile: float) -> int | None:
-        if not values:
-            return None
-        ordered = sorted(values)
-        index = max(0, min(len(ordered) - 1, math.ceil(percentile * len(ordered)) - 1))
-        return int(ordered[index])
-
     def _local_overview(self, version_id: int, start_ms: int, end_ms: int) -> dict[str, Any]:
         with self.db.session() as session:
             aggregate = session.execute(
@@ -3998,6 +4005,14 @@ class BillingService:
         rows.sort(key=lambda item: (Decimal(item["cost"].replace(",", "")), item["requests"]), reverse=True)
         return rows
 
+    @staticmethod
+    def _percentile(values: list[int], percentile: float) -> int | None:
+        if not values:
+            return None
+        ordered = sorted(values)
+        index = max(0, min(len(ordered) - 1, math.ceil(percentile * len(ordered)) - 1))
+        return int(ordered[index])
+
     def _local_realtime(self, version_id: int, start_ms: int, end_ms: int, range_name: str) -> dict[str, Any]:
         duration_ms = max(end_ms - start_ms, 60_000)
         duration_minutes = duration_ms / 60_000
@@ -4006,22 +4021,6 @@ class BillingService:
         else:
             bucket_ms = max(60_000, math.ceil(duration_ms / 120 / 60_000) * 60_000)
         bucket_count = max(1, math.ceil(duration_ms / bucket_ms))
-        with self.db.session() as session:
-            rows = session.execute(
-                select(RawUsageEvent, RatedEvent)
-                .outerjoin(
-                    RatedEvent,
-                    and_(
-                        RatedEvent.raw_event_id == RawUsageEvent.id,
-                        RatedEvent.pricing_version_id == version_id,
-                    ),
-                )
-                .where(
-                    RawUsageEvent.occurred_at_ms >= start_ms,
-                    RawUsageEvent.occurred_at_ms < end_ms,
-                )
-                .order_by(RawUsageEvent.occurred_at_ms)
-            ).all()
         buckets = [{
             "tokens": 0,
             "requests": 0,
@@ -4038,40 +4037,157 @@ class BillingService:
         model_efficiency: dict[str, dict[str, int]] = defaultdict(lambda: {"tokens": 0, "cost_nano": 0})
         accounts: dict[str, dict[str, int]] = defaultdict(lambda: {"requests": 0, "tokens": 0, "cost_nano": 0})
         providers: dict[str, dict[str, int]] = defaultdict(lambda: {"requests": 0, "tokens": 0, "cost_nano": 0})
-        key_hashes: set[str] = set()
-        key_requests = 0
-        key_tokens = 0
-        key_cost_nano = 0
-        for event, rated in rows:
-            index = min(bucket_count - 1, max(0, (event.occurred_at_ms - start_ms) // bucket_ms))
-            item = buckets[index]
-            item["tokens"] += int(event.total_tokens or 0)
-            item["requests"] += 1
-            item["failure" if event.failed else "success"] += 1
-            item["cached"] += self._compatible_cached_tokens(event) + int(event.cache_read_tokens or 0)
-            item["input_tokens"] += max(int(event.input_tokens or 0), 0)
-            item["cache_read_tokens"] += self._effective_cache_read_tokens(event)
-            if event.ttft_ms is not None:
-                item["ttft"].append(int(event.ttft_ms))
-            if event.latency_ms is not None:
-                item["latency"].append(int(event.latency_ms))
-            cost_nano = int(rated.rated_weight_nano_usd) if rated else 0
-            model = event.resolved_model or event.requested_model or event.model or "未知模型"
-            account = event.account_snapshot or "未标记账号"
-            provider = event.provider or "未知 Provider"
-            for target, label in ((models, model), (accounts, account), (providers, provider)):
-                target[label]["requests"] += 1
-                target[label]["tokens"] += int(event.total_tokens or 0)
-                target[label]["cost_nano"] += cost_nano
-            model_efficiency[model]["tokens"] += max(int(event.input_tokens or 0), 0) + max(int(event.output_tokens or 0), 0)
-            model_efficiency[model]["cost_nano"] += cost_nano
-            item["model_efficiency"][model]["tokens"] += max(int(event.input_tokens or 0), 0) + max(int(event.output_tokens or 0), 0)
-            item["model_efficiency"][model]["cost_nano"] += cost_nano
-            if event.api_key_hash:
-                key_hashes.add(event.api_key_hash)
-            key_requests += 1
-            key_tokens += int(event.total_tokens or 0)
-            key_cost_nano += cost_nano
+        with self.db.session() as session:
+            source = (
+                RawUsageEvent.__table__
+                .outerjoin(
+                    RatedEvent.__table__,
+                    and_(
+                        RatedEvent.raw_event_id == RawUsageEvent.id,
+                        RatedEvent.pricing_version_id == version_id,
+                    ),
+                )
+            )
+            filters = (
+                RawUsageEvent.occurred_at_ms >= start_ms,
+                RawUsageEvent.occurred_at_ms < end_ms,
+            )
+            bucket_expression = cast(
+                (RawUsageEvent.occurred_at_ms - literal(start_ms)) / literal(bucket_ms),
+                Integer,
+            )
+            total_tokens_expression = func.coalesce(RawUsageEvent.total_tokens, 0)
+            input_tokens_expression = func.coalesce(RawUsageEvent.input_tokens, 0)
+            output_tokens_expression = func.coalesce(RawUsageEvent.output_tokens, 0)
+            cache_read_expression = func.max(func.coalesce(RawUsageEvent.cache_read_tokens, 0), 0)
+            cache_creation_expression = func.max(func.coalesce(RawUsageEvent.cache_creation_tokens, 0), 0)
+            compatible_cached_expression = func.max(
+                func.max(
+                    func.coalesce(RawUsageEvent.cached_tokens, 0),
+                    func.coalesce(RawUsageEvent.cache_tokens, 0),
+                )
+                - cache_read_expression
+                - cache_creation_expression,
+                0,
+            )
+            effective_cache_read_expression = compatible_cached_expression + cache_read_expression
+            cost_expression = func.coalesce(RatedEvent.rated_weight_nano_usd, 0)
+            model_expression = func.coalesce(
+                func.nullif(RawUsageEvent.resolved_model, ""),
+                func.nullif(RawUsageEvent.requested_model, ""),
+                func.nullif(RawUsageEvent.model, ""),
+                literal("未知模型"),
+            )
+
+            # Keep the history scan in SQLite and aggregate all low-cardinality dimensions in one pass.
+            account_expression = func.coalesce(
+                func.nullif(RawUsageEvent.account_snapshot, ""),
+                literal("未标记账号"),
+            )
+            provider_expression = func.coalesce(
+                func.nullif(RawUsageEvent.provider, ""),
+                literal("未知 Provider"),
+            )
+            aggregate_rows = session.execute(
+                select(
+                    bucket_expression,
+                    model_expression,
+                    account_expression,
+                    provider_expression,
+                    func.count(RawUsageEvent.id),
+                    func.sum(total_tokens_expression),
+                    func.sum(case((RawUsageEvent.failed.is_(True), 1), else_=0)),
+                    func.sum(effective_cache_read_expression),
+                    func.sum(input_tokens_expression),
+                    func.sum(input_tokens_expression + output_tokens_expression),
+                    func.sum(cost_expression),
+                )
+                .select_from(source)
+                .where(*filters)
+                .group_by(bucket_expression, model_expression, account_expression, provider_expression)
+            )
+            for (
+                index,
+                model,
+                account,
+                provider,
+                requests,
+                tokens,
+                failures,
+                cached,
+                input_tokens,
+                efficiency_tokens,
+                cost_nano,
+            ) in aggregate_rows:
+                index = min(bucket_count - 1, max(0, int(index)))
+                model = str(model)
+                account = str(account)
+                provider = str(provider)
+                requests = int(requests or 0)
+                tokens = int(tokens or 0)
+                failures = int(failures or 0)
+                cached = int(cached or 0)
+                input_tokens = int(input_tokens or 0)
+                efficiency_tokens = int(efficiency_tokens or 0)
+                cost_nano = int(cost_nano or 0)
+
+                item = buckets[index]
+                item["requests"] += requests
+                item["tokens"] += tokens
+                item["failure"] += failures
+                item["success"] += requests - failures
+                item["cached"] += cached
+                item["input_tokens"] += input_tokens
+                item["cache_read_tokens"] += cached
+                for target, label in ((models, model), (accounts, account), (providers, provider)):
+                    target[label]["requests"] += requests
+                    target[label]["tokens"] += tokens
+                    target[label]["cost_nano"] += cost_nano
+                model_efficiency[model]["tokens"] += efficiency_tokens
+                model_efficiency[model]["cost_nano"] += cost_nano
+                item["model_efficiency"][model]["tokens"] += efficiency_tokens
+                item["model_efficiency"][model]["cost_nano"] += cost_nano
+
+            # SQLite has no portable percentile aggregate; fetch only the two response columns needed here.
+            response_rows = session.execute(
+                select(
+                    bucket_expression,
+                    RawUsageEvent.ttft_ms,
+                    RawUsageEvent.latency_ms,
+                )
+                .select_from(source)
+                .where(
+                    *filters,
+                    or_(RawUsageEvent.ttft_ms.is_not(None), RawUsageEvent.latency_ms.is_not(None)),
+                )
+            )
+            for index, ttft_ms, latency_ms in response_rows:
+                index = min(bucket_count - 1, max(0, int(index)))
+                if ttft_ms is not None:
+                    buckets[index]["ttft"].append(int(ttft_ms))
+                if latency_ms is not None:
+                    buckets[index]["latency"].append(int(latency_ms))
+
+            key_summary = session.execute(
+                select(
+                    func.count(func.distinct(case(
+                        (
+                            and_(RawUsageEvent.api_key_hash.is_not(None), RawUsageEvent.api_key_hash != ""),
+                            RawUsageEvent.api_key_hash,
+                        ),
+                        else_=None,
+                    ))),
+                    func.count(RawUsageEvent.id),
+                    func.sum(total_tokens_expression),
+                    func.sum(cost_expression),
+                )
+                .select_from(source)
+                .where(*filters)
+            ).one()
+        key_hashes_count = int(key_summary[0] or 0)
+        key_requests = int(key_summary[1] or 0)
+        key_tokens = int(key_summary[2] or 0)
+        key_cost_nano = int(key_summary[3] or 0)
         token_velocity = []
         response_level = []
         request_level = []
@@ -4135,7 +4251,7 @@ class BillingService:
             "current_usage": {
                 "models": self._usage_rows(models),
                 "api_keys": {
-                    "count": len(key_hashes),
+                    "count": key_hashes_count,
                     "requests": key_requests,
                     "tokens": key_tokens,
                     "cost": format_usd_nano(key_cost_nano),
@@ -4265,34 +4381,41 @@ class BillingService:
                 if range_start_ms is None:
                     range_start_ms = max(0, range_end_ms - 60_000)
             version_id = selected_cycle.pricing_version_id if selected_cycle else self._active_pricing_id(session)
-        overview = self._local_overview(version_id, range_start_ms, range_end_ms)
-        realtime = self._local_realtime(version_id, range_start_ms, range_end_ms, range_name)
-        errors: list[str] = []
-        try:
-            cpa = self.cpa.health()
-        except (httpx.HTTPError, BillingError):
-            cpa = {"reachable": False, "error": "CPA 管理接口不可用"}
-            errors.append("cpa")
-        try:
-            reconciliation = self.reconciliation()
-        except (sqlite3.Error, BillingError):
-            reconciliation = {"ok": False, "error": "CPAMP 对账不可用"}
-            errors.append("reconciliation")
-        try:
-            accounts = self.accounts_snapshot()
-            account_status = {
-                "available": True,
-                "inspection": accounts["inspection"],
-                "accounts": [{
-                    "id": item["id"],
-                    "name": item["name"],
-                    "status": item["quota_status"],
-                    "quota_count": len(item["quota"]),
-                } for item in accounts["accounts"]],
-            }
-        except (httpx.HTTPError, BillingDependencyError, BillingError):
-            account_status = {"available": False, "error": "CPA 上游账号额度不可用"}
-            errors.append("accounts")
+        with ThreadPoolExecutor(max_workers=4, thread_name_prefix="site-status") as executor:
+            cpa_future = executor.submit(self.cpa.health)
+            reconciliation_future = executor.submit(self.reconciliation)
+            accounts_future = executor.submit(self.accounts_snapshot)
+            usage_future = executor.submit(self.usage_summary)
+
+            overview = self._local_overview(version_id, range_start_ms, range_end_ms)
+            realtime = self._local_realtime(version_id, range_start_ms, range_end_ms, range_name)
+            errors: list[str] = []
+            try:
+                cpa = cpa_future.result()
+            except (httpx.HTTPError, BillingError):
+                cpa = {"reachable": False, "error": "CPA 管理接口不可用"}
+                errors.append("cpa")
+            try:
+                reconciliation = reconciliation_future.result()
+            except (sqlite3.Error, BillingError):
+                reconciliation = {"ok": False, "error": "CPAMP 对账不可用"}
+                errors.append("reconciliation")
+            try:
+                accounts = accounts_future.result()
+                account_status = {
+                    "available": True,
+                    "inspection": accounts["inspection"],
+                    "accounts": [{
+                        "id": item["id"],
+                        "name": item["name"],
+                        "status": item["quota_status"],
+                        "quota_count": len(item["quota"]),
+                    } for item in accounts["accounts"]],
+                }
+            except (httpx.HTTPError, BillingDependencyError, BillingError):
+                account_status = {"available": False, "error": "CPA 上游账号额度不可用"}
+                errors.append("accounts")
+            usage = usage_future.result()
         return {
             "generated_at": self._iso_timestamp(now_ms()),
             "degraded": bool(errors),
@@ -4308,7 +4431,7 @@ class BillingService:
             "accounts": account_status,
             "billing": {
                 "sync": self._local_sync_status(),
-                "usage": self.usage_summary(),
+                "usage": usage,
                 "reconciliation": reconciliation,
             },
         }
@@ -4676,11 +4799,27 @@ class BillingService:
         with self.db.session() as session:
             version_id = self._active_pricing_id(session)
             join_condition = and_(RatedEvent.raw_event_id == RawUsageEvent.id, RatedEvent.pricing_version_id == version_id)
-            total = session.execute(select(func.count(RawUsageEvent.id), func.sum(RawUsageEvent.total_tokens), func.sum(RatedEvent.rated_weight_nano_usd)).select_from(RawUsageEvent).outerjoin(RatedEvent, join_condition)).one()
             cutoff = now_ms() - 86_400_000
-            recent = session.execute(select(func.count(RawUsageEvent.id), func.sum(RawUsageEvent.total_tokens), func.sum(RatedEvent.rated_weight_nano_usd)).select_from(RawUsageEvent).outerjoin(RatedEvent, join_condition).where(RawUsageEvent.occurred_at_ms >= cutoff)).one()
-            return {"total_requests": int(total[0] or 0), "total_tokens": int(total[1] or 0), "total_cost": format_usd_nano(int(total[2] or 0)),
-                    "recent_requests": int(recent[0] or 0), "recent_tokens": int(recent[1] or 0), "recent_cost": format_usd_nano(int(recent[2] or 0))}
+            row = session.execute(
+                select(
+                    func.count(RawUsageEvent.id),
+                    func.sum(RawUsageEvent.total_tokens),
+                    func.sum(RatedEvent.rated_weight_nano_usd),
+                    func.sum(case((RawUsageEvent.occurred_at_ms >= cutoff, 1), else_=0)),
+                    func.sum(case((RawUsageEvent.occurred_at_ms >= cutoff, RawUsageEvent.total_tokens), else_=0)),
+                    func.sum(case((RawUsageEvent.occurred_at_ms >= cutoff, RatedEvent.rated_weight_nano_usd), else_=0)),
+                )
+                .select_from(RawUsageEvent)
+                .outerjoin(RatedEvent, join_condition)
+            ).one()
+            return {
+                "total_requests": int(row[0] or 0),
+                "total_tokens": int(row[1] or 0),
+                "total_cost": format_usd_nano(int(row[2] or 0)),
+                "recent_requests": int(row[3] or 0),
+                "recent_tokens": int(row[4] or 0),
+                "recent_cost": format_usd_nano(int(row[5] or 0)),
+            }
 
     def rankings(self, since_ms: int | None = None, until_ms: int | None = None,
                  pricing_version_id: int | None = None) -> list[dict[str, Any]]:
@@ -4956,13 +5095,27 @@ class BillingService:
             source_count = int(cpamp.execute("select count(*) from usage_events").fetchone()[0])
         with self.db.session() as session:
             version_id = self._active_pricing_id(session)
-            raw_count = session.scalar(select(func.count()).select_from(RawUsageEvent)) or 0
-            rated_count = session.scalar(select(func.count()).select_from(RatedEvent).where(RatedEvent.pricing_version_id == version_id)) or 0
+            counts = session.execute(
+                select(
+                    func.count(RawUsageEvent.id),
+                    func.count(RatedEvent.id),
+                    func.sum(case((and_(RatedEvent.id.is_not(None), RatedEvent.telegram_user_id.is_(None)), 1), else_=0)),
+                    func.sum(case((and_(RatedEvent.id.is_not(None), RatedEvent.pool_id.is_(None)), 1), else_=0)),
+                )
+                .select_from(RawUsageEvent)
+                .outerjoin(
+                    RatedEvent,
+                    and_(
+                        RatedEvent.raw_event_id == RawUsageEvent.id,
+                        RatedEvent.pricing_version_id == version_id,
+                    ),
+                )
+            ).one()
+            raw_count = int(counts[0] or 0)
+            rated_count = int(counts[1] or 0)
             dead = session.scalar(select(func.count()).select_from(DeadLetter).where(DeadLetter.resolved_at_ms.is_(None))) or 0
-            unowned = session.scalar(select(func.count()).select_from(RatedEvent).where(
-                RatedEvent.pricing_version_id == version_id, RatedEvent.telegram_user_id.is_(None))) or 0
-            unassigned = session.scalar(select(func.count()).select_from(RatedEvent).where(
-                RatedEvent.pricing_version_id == version_id, RatedEvent.pool_id.is_(None))) or 0
+            unowned = int(counts[2] or 0)
+            unassigned = int(counts[3] or 0)
             checkpoint_state = session.execute(select(
                 func.max(SyncCheckpoint.last_success_at_ms),
                 func.sum(case((SyncCheckpoint.last_error.is_not(None), 1), else_=0)),
