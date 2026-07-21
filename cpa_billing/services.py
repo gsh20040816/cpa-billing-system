@@ -4038,65 +4038,68 @@ class BillingService:
         accounts: dict[str, dict[str, int]] = defaultdict(lambda: {"requests": 0, "tokens": 0, "cost_nano": 0})
         providers: dict[str, dict[str, int]] = defaultdict(lambda: {"requests": 0, "tokens": 0, "cost_nano": 0})
         with self.db.session() as session:
+            raw_table = RawUsageEvent.__table__
+            rated_table = RatedEvent.__table__
+            connection = session.connection()
             source = (
-                RawUsageEvent.__table__
+                raw_table
                 .outerjoin(
-                    RatedEvent.__table__,
+                    rated_table,
                     and_(
-                        RatedEvent.raw_event_id == RawUsageEvent.id,
-                        RatedEvent.pricing_version_id == version_id,
+                        rated_table.c.raw_event_id == raw_table.c.id,
+                        rated_table.c.pricing_version_id == version_id,
                     ),
                 )
             )
             filters = (
-                RawUsageEvent.occurred_at_ms >= start_ms,
-                RawUsageEvent.occurred_at_ms < end_ms,
+                raw_table.c.occurred_at_ms >= start_ms,
+                raw_table.c.occurred_at_ms < end_ms,
             )
             bucket_expression = cast(
-                (RawUsageEvent.occurred_at_ms - literal(start_ms)) / literal(bucket_ms),
+                (raw_table.c.occurred_at_ms - literal(start_ms)) / literal(bucket_ms),
                 Integer,
             )
-            total_tokens_expression = func.coalesce(RawUsageEvent.total_tokens, 0)
-            input_tokens_expression = func.coalesce(RawUsageEvent.input_tokens, 0)
-            output_tokens_expression = func.coalesce(RawUsageEvent.output_tokens, 0)
-            cache_read_expression = func.max(func.coalesce(RawUsageEvent.cache_read_tokens, 0), 0)
-            cache_creation_expression = func.max(func.coalesce(RawUsageEvent.cache_creation_tokens, 0), 0)
+            total_tokens_expression = func.coalesce(raw_table.c.total_tokens, 0)
+            input_tokens_expression = func.coalesce(raw_table.c.input_tokens, 0)
+            output_tokens_expression = func.coalesce(raw_table.c.output_tokens, 0)
+            cache_read_expression = func.max(func.coalesce(raw_table.c.cache_read_tokens, 0), 0)
+            cache_creation_expression = func.max(func.coalesce(raw_table.c.cache_creation_tokens, 0), 0)
             compatible_cached_expression = func.max(
                 func.max(
-                    func.coalesce(RawUsageEvent.cached_tokens, 0),
-                    func.coalesce(RawUsageEvent.cache_tokens, 0),
+                    func.coalesce(raw_table.c.cached_tokens, 0),
+                    func.coalesce(raw_table.c.cache_tokens, 0),
                 )
                 - cache_read_expression
                 - cache_creation_expression,
                 0,
             )
             effective_cache_read_expression = compatible_cached_expression + cache_read_expression
-            cost_expression = func.coalesce(RatedEvent.rated_weight_nano_usd, 0)
+            cost_expression = func.coalesce(rated_table.c.rated_weight_nano_usd, 0)
             model_expression = func.coalesce(
-                func.nullif(RawUsageEvent.resolved_model, ""),
-                func.nullif(RawUsageEvent.requested_model, ""),
-                func.nullif(RawUsageEvent.model, ""),
+                func.nullif(raw_table.c.resolved_model, ""),
+                func.nullif(raw_table.c.requested_model, ""),
+                func.nullif(raw_table.c.model, ""),
                 literal("未知模型"),
             )
 
             # Keep the history scan in SQLite and aggregate all low-cardinality dimensions in one pass.
             account_expression = func.coalesce(
-                func.nullif(RawUsageEvent.account_snapshot, ""),
+                func.nullif(raw_table.c.account_snapshot, ""),
                 literal("未标记账号"),
             )
             provider_expression = func.coalesce(
-                func.nullif(RawUsageEvent.provider, ""),
+                func.nullif(raw_table.c.provider, ""),
                 literal("未知 Provider"),
             )
-            aggregate_rows = session.execute(
+            aggregate_rows = connection.execute(
                 select(
                     bucket_expression,
                     model_expression,
                     account_expression,
                     provider_expression,
-                    func.count(RawUsageEvent.id),
+                    func.count(raw_table.c.id),
                     func.sum(total_tokens_expression),
-                    func.sum(case((RawUsageEvent.failed.is_(True), 1), else_=0)),
+                    func.sum(case((raw_table.c.failed.is_(True), 1), else_=0)),
                     func.sum(effective_cache_read_expression),
                     func.sum(input_tokens_expression),
                     func.sum(input_tokens_expression + output_tokens_expression),
@@ -4149,16 +4152,16 @@ class BillingService:
                 item["model_efficiency"][model]["cost_nano"] += cost_nano
 
             # SQLite has no portable percentile aggregate; fetch only the two response columns needed here.
-            response_rows = session.execute(
+            response_rows = connection.execute(
                 select(
                     bucket_expression,
-                    RawUsageEvent.ttft_ms,
-                    RawUsageEvent.latency_ms,
+                    raw_table.c.ttft_ms,
+                    raw_table.c.latency_ms,
                 )
                 .select_from(source)
                 .where(
                     *filters,
-                    or_(RawUsageEvent.ttft_ms.is_not(None), RawUsageEvent.latency_ms.is_not(None)),
+                    or_(raw_table.c.ttft_ms.is_not(None), raw_table.c.latency_ms.is_not(None)),
                 )
             )
             for index, ttft_ms, latency_ms in response_rows:
@@ -4168,16 +4171,16 @@ class BillingService:
                 if latency_ms is not None:
                     buckets[index]["latency"].append(int(latency_ms))
 
-            key_summary = session.execute(
+            key_summary = connection.execute(
                 select(
                     func.count(func.distinct(case(
                         (
-                            and_(RawUsageEvent.api_key_hash.is_not(None), RawUsageEvent.api_key_hash != ""),
-                            RawUsageEvent.api_key_hash,
+                            and_(raw_table.c.api_key_hash.is_not(None), raw_table.c.api_key_hash != ""),
+                            raw_table.c.api_key_hash,
                         ),
                         else_=None,
                     ))),
-                    func.count(RawUsageEvent.id),
+                    func.count(raw_table.c.id),
                     func.sum(total_tokens_expression),
                     func.sum(cost_expression),
                 )
