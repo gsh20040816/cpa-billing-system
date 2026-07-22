@@ -944,6 +944,29 @@ def test_cpa_accounts_are_sanitized_and_refresh_uses_public_account_ids(service,
     assert refresh["accepted"] == 1
 
 
+def test_cpa_reset_credit_connector_429_is_cooled(service, monkeypatch) -> None:
+    calls = []
+
+    def api_call(*args, **kwargs):
+        calls.append((args, kwargs))
+        return {
+            "status_code": 429,
+            "body": json.dumps({
+                "detail": {
+                    "type": "connector_rate_limit",
+                    "message": "Connector rate limit exceeded",
+                },
+            }),
+        }
+
+    monkeypatch.setattr(service.cpa, "api_call", api_call)
+    with pytest.raises(BillingError, match="连接器限流.*60 秒"):
+        service.cpa.codex_reset_credits("auth-index", "account-id")
+    with pytest.raises(BillingError, match="连接器限流.*60 秒"):
+        service.cpa.codex_reset_credits("auth-index", "account-id", force=True)
+    assert len(calls) == 1
+
+
 def test_upstream_quota_reset_requires_three_confirmations_without_cpa_exhaustion(service, monkeypatch) -> None:
     files = [{
         "id": "codex-account",

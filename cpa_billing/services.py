@@ -86,6 +86,9 @@ DEFAULT_TIERS = [
 
 LOGGER = logging.getLogger(__name__)
 
+RESET_CREDIT_SUCCESS_CACHE_SECONDS = 300
+RESET_CREDIT_RATE_LIMIT_COOLDOWN_SECONDS = 60
+
 QUOTA_MODEL_ALIASES = {
     "codex_bengalfox": "gpt-5.3-codex-spark",
 }
@@ -116,6 +119,8 @@ class CPAClient:
         self.base_url = settings.cpa_base_url
         self.key = settings.cpa_management_key
         self.lock_path = settings.database_path.parent / "cpa-api-keys.lock"
+        self._reset_credit_cache: dict[tuple[str, str | None], tuple[float, dict[str, Any] | None, str | None]] = {}
+        self._reset_credit_cache_lock = threading.Lock()
 
     def _request(self, method: str, path: str, **kwargs: Any) -> Any:
         headers = dict(kwargs.pop("headers", {}))
@@ -237,7 +242,34 @@ class CPAClient:
             })
         return headers
 
-    def codex_reset_credits(self, auth_index: str, account_id: str | None = None) -> dict[str, Any]:
+    @staticmethod
+    def _copy_reset_credit_payload(payload: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "available_count": payload.get("available_count"),
+            "credits": [dict(item) for item in payload.get("credits", []) if isinstance(item, dict)],
+        }
+
+    def codex_reset_credits(
+        self,
+        auth_index: str,
+        account_id: str | None = None,
+        *,
+        force: bool = False,
+    ) -> dict[str, Any]:
+        cache_key = (str(auth_index), str(account_id) if account_id else None)
+        now = time.monotonic()
+        with self._reset_credit_cache_lock:
+            cached = self._reset_credit_cache.get(cache_key)
+            if cached is not None:
+                expires_at, cached_payload, cached_error = cached
+                if expires_at > now:
+                    if cached_error:
+                        raise BillingError(cached_error)
+                    if not force and cached_payload is not None:
+                        return self._copy_reset_credit_payload(cached_payload)
+                else:
+                    self._reset_credit_cache.pop(cache_key, None)
+
         result = self.api_call(
             auth_index,
             "GET",
@@ -248,6 +280,18 @@ class CPAClient:
         body = result.get("body")
         payload = json.loads(body) if isinstance(body, str) and body.strip() else body
         if status_code < 200 or status_code >= 300:
+            if status_code == 429:
+                error = (
+                    "CPA 主动重置次数读取被上游连接器限流（HTTP 429），"
+                    f"将在 {RESET_CREDIT_RATE_LIMIT_COOLDOWN_SECONDS} 秒后重试"
+                )
+                with self._reset_credit_cache_lock:
+                    self._reset_credit_cache[cache_key] = (
+                        time.monotonic() + RESET_CREDIT_RATE_LIMIT_COOLDOWN_SECONDS,
+                        None,
+                        error,
+                    )
+                raise BillingError(error)
             raise BillingError(f"主动重置次数接口返回 HTTP {status_code}")
         if not isinstance(payload, dict):
             raise BillingError("主动重置次数响应不是 JSON 对象")
@@ -273,7 +317,14 @@ class CPAClient:
             available_count = int(available_count) if available_count is not None else len(credits)
         except (TypeError, ValueError):
             available_count = len(credits)
-        return {"available_count": available_count, "credits": credits}
+        normalized = {"available_count": available_count, "credits": credits}
+        with self._reset_credit_cache_lock:
+            self._reset_credit_cache[cache_key] = (
+                time.monotonic() + RESET_CREDIT_SUCCESS_CACHE_SECONDS,
+                normalized,
+                None,
+            )
+        return self._copy_reset_credit_payload(normalized)
 
     def consume_codex_reset_credit(self, auth_index: str, account_id: str | None = None) -> dict[str, Any]:
         result = self.api_call(
@@ -295,6 +346,8 @@ class CPAClient:
             windows_reset = int(windows_reset)
         except (TypeError, ValueError):
             raise BillingError("上游主动重置响应缺少 windows_reset") from None
+        with self._reset_credit_cache_lock:
+            self._reset_credit_cache.pop((str(auth_index), str(account_id) if account_id else None), None)
         return {"code": "reset", "windows_reset": windows_reset}
 
 
@@ -3730,7 +3783,7 @@ class BillingService:
             headers["Chatgpt-Account-Id"] = str(account_id)
         return headers
 
-    def _cpa_accounts_raw(self) -> dict[str, Any]:
+    def _cpa_accounts_raw(self, *, force: bool = False) -> dict[str, Any]:
         files = self.cpa.auth_files()
         quota_items: list[dict[str, Any]] = []
         refreshed_at = self._iso_timestamp(now_ms())
@@ -3762,13 +3815,17 @@ class BillingService:
                 reset_credits = self.cpa.codex_reset_credits(
                     auth_index,
                     str(account_token_id) if account_token_id else None,
+                    force=force,
                 )
                 reset_credit_metadata.update({
                     "reset_credits_available": reset_credits["available_count"],
                     "reset_credits": reset_credits["credits"],
                 })
             except (BillingError, httpx.HTTPError, json.JSONDecodeError) as exc:
-                reset_credit_metadata["reset_credits_error"] = f"主动重置次数读取失败：{type(exc).__name__}"
+                if isinstance(exc, BillingError) and str(exc).strip():
+                    reset_credit_metadata["reset_credits_error"] = str(exc)
+                else:
+                    reset_credit_metadata["reset_credits_error"] = f"主动重置次数读取失败：{type(exc).__name__}"
             try:
                 result = self.cpa.api_call(
                     auth_index,
@@ -3823,9 +3880,9 @@ class BillingService:
                 })
         return {"files": files, "quota": {"items": quota_items}}
 
-    def accounts_snapshot(self) -> dict[str, Any]:
+    def accounts_snapshot(self, *, force: bool = False) -> dict[str, Any]:
         try:
-            raw = self._cpa_accounts_raw()
+            raw = self._cpa_accounts_raw(force=force)
         except (httpx.HTTPError, BillingError) as exc:
             raise BillingDependencyError("CPA 上游账号服务不可用") from exc
         accounts, account_by_auth, auth_by_account = self._sanitize_accounts(raw)
@@ -3833,7 +3890,7 @@ class BillingService:
         return {"accounts": accounts, "inspection": self._account_inspection(accounts)}
 
     def refresh_account_quotas(self, account_ids: list[str]) -> dict[str, Any]:
-        snapshot = self.accounts_snapshot()
+        snapshot = self.accounts_snapshot(force=True)
         refreshable_ids = {item["id"] for item in snapshot["accounts"] if item["can_refresh"]}
         selected_ids = set(account_ids or refreshable_ids)
         unknown = sorted(selected_ids - refreshable_ids)
@@ -3863,7 +3920,7 @@ class BillingService:
     ) -> dict[str, Any]:
         if not reason.strip():
             raise BillingError("重置上游 Codex 额度必须填写原因")
-        snapshot = self.accounts_snapshot()
+        snapshot = self.accounts_snapshot(force=True)
         target_snapshot = next((item for item in snapshot["accounts"] if item.get("id") == account_id), None)
         if target_snapshot is None:
             raise BillingError("上游账号不存在或已失效")
