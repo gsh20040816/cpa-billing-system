@@ -21,7 +21,7 @@ from typing import Any, Iterator
 from zoneinfo import ZoneInfo
 
 import httpx
-from sqlalchemy import Integer, and_, case, cast, delete, func, literal, not_, or_, select, update
+from sqlalchemy import Integer, and_, case, cast, delete, func, literal, not_, or_, select, union, update
 from sqlalchemy.exc import IntegrityError
 
 from .config import Settings
@@ -2509,10 +2509,11 @@ class BillingService:
             raise BillingError("请求查询范围无效")
         if key_id is not None and key_id < 1:
             raise BillingError("API Key 查询范围无效")
-        event_scope = (
-            RawUsageEvent.__table__
-            .outerjoin(APIKey.__table__, APIKey.cpamp_hash == RawUsageEvent.api_key_hash)
-            .outerjoin(KeyOwnershipPeriod.__table__, and_(
+        event_scope = RawUsageEvent.__table__.outerjoin(
+            APIKey.__table__, APIKey.cpamp_hash == RawUsageEvent.api_key_hash
+        )
+        if not all_users:
+            event_scope = event_scope.outerjoin(KeyOwnershipPeriod.__table__, and_(
                 KeyOwnershipPeriod.api_key_id == APIKey.id,
                 KeyOwnershipPeriod.valid_from_ms <= RawUsageEvent.occurred_at_ms,
                 or_(
@@ -2520,43 +2521,46 @@ class BillingService:
                     KeyOwnershipPeriod.valid_to_ms > RawUsageEvent.occurred_at_ms,
                 ),
             ))
-        )
         scope_filters = [] if all_users else [KeyOwnershipPeriod.telegram_user_id == user_id]
         if key_id is not None:
             scope_filters.append(APIKey.id == key_id)
+        raw_property_scope = all_users and key_id is None
+        property_scope = RawUsageEvent.__table__ if raw_property_scope else event_scope
+        property_filters = [] if raw_property_scope else scope_filters
         with self.db.session() as session:
             if not all_users and session.get(TelegramUser, user_id) is None:
                 raise BillingError("用户不存在")
-            models = sorted({
-                str(value)
-                for row in session.execute(
-                    select(
-                        RawUsageEvent.model,
-                        RawUsageEvent.requested_model,
-                        RawUsageEvent.resolved_model,
-                    ).select_from(event_scope).where(*scope_filters)
+            model_values = union(*(
+                select(column.label("model"))
+                .select_from(property_scope)
+                .where(*property_filters, column.is_not(None))
+                for column in (
+                    RawUsageEvent.model,
+                    RawUsageEvent.requested_model,
+                    RawUsageEvent.resolved_model,
                 )
-                for value in row
-                if value
-            })
+            )).subquery()
+            models = [str(value) for value in session.scalars(
+                select(model_values.c.model).order_by(model_values.c.model)
+            )]
             tier_expression = self._raw_billing_service_tier_expression()
             tiers = sorted({str(value or "default") for value in session.scalars(
-                select(tier_expression).select_from(event_scope)
-                .where(*scope_filters).distinct().order_by(tier_expression)
+                select(tier_expression).select_from(property_scope)
+                .where(*property_filters).distinct().order_by(tier_expression)
             )})
             providers = [str(value) for value in session.scalars(
-                select(RawUsageEvent.provider).select_from(event_scope)
-                .where(*scope_filters).where(RawUsageEvent.provider.is_not(None))
+                select(RawUsageEvent.provider).select_from(property_scope)
+                .where(*property_filters).where(RawUsageEvent.provider.is_not(None))
                 .distinct().order_by(RawUsageEvent.provider)
             )]
             failure_codes = [int(value) for value in session.scalars(
-                select(RawUsageEvent.fail_status_code).select_from(event_scope)
-                .where(*scope_filters).where(RawUsageEvent.fail_status_code.is_not(None))
+                select(RawUsageEvent.fail_status_code).select_from(property_scope)
+                .where(*property_filters).where(RawUsageEvent.fail_status_code.is_not(None))
                 .distinct().order_by(RawUsageEvent.fail_status_code)
             )]
             bounds = session.execute(
                 select(func.min(RawUsageEvent.occurred_at_ms), func.max(RawUsageEvent.occurred_at_ms))
-                .select_from(event_scope).where(*scope_filters)
+                .select_from(property_scope).where(*property_filters)
             ).one()
             key_rows = session.execute(
                 select(APIKey.id, APIKey.masked_value, APIKey.display_name, APIKey.status)

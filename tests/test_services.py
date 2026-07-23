@@ -686,12 +686,25 @@ def test_admin_request_history_includes_all_users_and_unowned_events(service, se
     insert_event(settings, cpamp_key_hash("key-two"), 1000, event_hash="admin-owned-two")
     insert_event(settings, cpamp_key_hash("key-three"), 2000, event_hash="admin-owned-three")
     insert_event(settings, cpamp_key_hash("missing-key"), 3000, event_hash="admin-unowned")
+    db = sqlite3.connect(settings.cpamp_database_path)
+    db.execute(
+        "update usage_events set requested_model=?, resolved_model=? where event_hash=?",
+        ("gpt-requested", "gpt-resolved", "admin-owned-two"),
+    )
+    db.execute(
+        "update usage_events set requested_model=? where event_hash=?",
+        ("gpt-unowned-requested", "admin-unowned"),
+    )
+    db.commit()
+    db.close()
     service.sync_cpamp()
     assert service.rate_events() == 3
 
     own = service.request_history(2)
     assert own["pagination"]["total"] == 1
-    assert len(service.request_filter_options(2)["keys"]) == 1
+    own_options = service.request_filter_options(2)
+    assert len(own_options["keys"]) == 1
+    assert own_options["models"] == ["gpt-requested", "gpt-resolved", "gpt-test"]
 
     history = service.request_history(None, all_users=True, sort="time_asc")
     assert history["pagination"]["total"] == 3
@@ -702,7 +715,7 @@ def test_admin_request_history_includes_all_users_and_unowned_events(service, se
 
     options = service.request_filter_options(None, all_users=True)
     assert len(options["keys"]) == 2
-    assert options["models"] == ["gpt-test"]
+    assert options["models"] == ["gpt-requested", "gpt-resolved", "gpt-test", "gpt-unowned-requested"]
 
 
 def test_usage_ranges_share_today_cycle_and_integer_hours_semantics(service) -> None:

@@ -213,6 +213,13 @@ class RatedEvent(Base):
     __tablename__ = "rated_events"
     __table_args__ = (
         UniqueConstraint("raw_event_id", "pricing_version_id"),
+        Index(
+            "idx_rated_version_time_owner_pool",
+            "pricing_version_id",
+            "occurred_at_ms",
+            "telegram_user_id",
+            "pool_id",
+        ),
         Index("idx_rated_cycle", "occurred_at_ms", "pool_id", "telegram_user_id"),
         Index("idx_rated_user_time", "telegram_user_id", "occurred_at_ms"),
     )
