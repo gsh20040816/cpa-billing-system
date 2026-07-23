@@ -1,6 +1,7 @@
 services:
   billing-server:
-    build: .
+    image: ${BILLING_IMAGE:-ghcr.io/gsh20040816/cpa-billing-system:latest}
+    pull_policy: always
     restart: unless-stopped
     command: ["serve", "--host", "0.0.0.0", "--port", "18417"]
     env_file: [".env"]
@@ -11,7 +12,8 @@ services:
       - /root/sub2api-tg:/legacy-sub2:ro
     networks: [cpa-network]
   billing-worker:
-    build: .
+    image: ${BILLING_IMAGE:-ghcr.io/gsh20040816/cpa-billing-system:latest}
+    pull_policy: always
     restart: unless-stopped
     command: ["sync"]
     env_file: [".env"]
@@ -20,7 +22,8 @@ services:
       - ../cpa-manager-plus:/cpamp:ro
     networks: [cpa-network]
   billing-bot:
-    build: .
+    image: ${BILLING_IMAGE:-ghcr.io/gsh20040816/cpa-billing-system:latest}
+    pull_policy: always
     restart: unless-stopped
     command: ["bot"]
     env_file: [".env"]

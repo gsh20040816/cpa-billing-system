@@ -43,4 +43,23 @@ Apply database migrations before starting a new application version:
 alembic upgrade head
 ```
 
+## Docker deployment
+
+Pushes to `main` publish `ghcr.io/gsh20040816/cpa-billing-system:latest`. Version tags matching `v*` also publish a matching image tag, and every published image receives an immutable `sha-<commit>` tag. Pull requests build the image without publishing it.
+
+The Compose services pull the published image instead of building it on the server. To deploy the newest `main` image:
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
+Set `BILLING_IMAGE` in `.env` to deploy a version or commit-specific tag instead of `latest`:
+
+```dotenv
+BILLING_IMAGE=ghcr.io/gsh20040816/cpa-billing-system:sha-0123456
+```
+
+If the GHCR package is private, log in once on the deployment server with a token that has `read:packages` permission before running Compose.
+
 The service never consumes the CPA usage queue. CPAMP is mounted read-only and mirrored by monotonically increasing `usage_events.id`.
