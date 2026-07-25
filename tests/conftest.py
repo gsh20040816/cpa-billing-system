@@ -67,5 +67,6 @@ def service(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> BillingServi
     monkeypatch.setattr(result.cpa, "list_keys", lambda: [])
     monkeypatch.setattr(result.cpa, "add_key", lambda _: None)
     monkeypatch.setattr(result.cpa, "remove_key_hash", lambda _: None)
+    monkeypatch.setattr(result.cpa, "upstream_channels", lambda: result.cpa.auth_files())
     result.bootstrap()
     return result

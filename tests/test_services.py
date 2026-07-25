@@ -39,7 +39,7 @@ from cpa_billing.models import (
     TelegramUser,
 )
 from cpa_billing.security import cpamp_key_hash
-from cpa_billing.services import BillingError, BillingService
+from cpa_billing.services import BillingError, BillingService, CPAClient
 
 
 def insert_event(settings, key_hash: str, timestamp_ms: int, *, event_hash: str = "e1", input_tokens: int = 1000,
@@ -68,6 +68,60 @@ def create_owner(service, raw_key: str, user_id: int, start_ms: int) -> None:
                      current_owner_id=user_id, created_at_ms=start_ms)
         session.add(key); session.flush()
         session.add(KeyOwnershipPeriod(api_key_id=key.id, telegram_user_id=user_id, valid_from_ms=start_ms, source="test", created_at_ms=start_ms))
+
+
+def test_cpa_upstream_channels_include_api_key_management_sections(settings, monkeypatch) -> None:
+    client = CPAClient(settings)
+    responses = {
+        "/v0/management/auth-files": {"files": [{
+            "id": "oauth-account", "auth_index": "oauth-auth", "account_type": "oauth",
+        }]},
+        "/v0/management/gemini-api-key": {"gemini-api-key": []},
+        "/v0/management/interactions-api-key": {"interactions-api-key": []},
+        "/v0/management/claude-api-key": {"claude-api-key": []},
+        "/v0/management/vertex-api-key": {"vertex-api-key": []},
+        "/v0/management/codex-api-key": {"codex-api-key": [{
+            "api-key": "sk-production-secret-value", "auth-index": "codex-auth",
+        }]},
+        "/v0/management/xai-api-key": {"xai-api-key": []},
+        "/v0/management/openai-compatibility": {"openai-compatibility": [{
+            "name": "Paid relay",
+            "api-key-entries": [{"api-key": "sk-relay-secret-value", "auth-index": "relay-auth"}],
+        }]},
+    }
+    monkeypatch.setattr(client, "_request", lambda method, path: responses[path])
+
+    channels = client.upstream_channels()
+
+    assert [(item["id"], item["account_type"], item["auth_index"]) for item in channels] == [
+        ("oauth-account", "oauth", "oauth-auth"),
+        ("codex-api-key:codex-auth", "api_key", "codex-auth"),
+        ("openai-compatibility:relay-auth", "api_key", "relay-auth"),
+    ]
+    assert "sk-production-secret-value" not in repr(channels)
+    assert "sk-relay-secret-value" not in repr(channels)
+
+
+def test_api_key_upstream_channel_is_visible_without_oauth_quota_probe(service, monkeypatch) -> None:
+    monkeypatch.setattr(service.cpa, "upstream_channels", lambda: [{
+        "id": "codex-api-key:paid-auth",
+        "auth_index": "paid-auth",
+        "account_type": "api_key",
+        "type": "codex-api-key",
+        "provider": "codex",
+        "label": "Codex API key sk-paid...1234",
+        "disabled": False,
+    }])
+    monkeypatch.setattr(service.cpa, "api_call", lambda *args, **kwargs: pytest.fail("API key channel must not use OAuth quota API"))
+    monkeypatch.setattr(service.cpa, "codex_reset_credits", lambda *args, **kwargs: pytest.fail("API key channel must not query OAuth reset credits"))
+
+    snapshot = service.accounts_snapshot()
+
+    assert len(snapshot["accounts"]) == 1
+    account = snapshot["accounts"][0]
+    assert account["id"] == "codex-api-key:paid-auth"
+    assert account["auth_type"] == "api_key"
+    assert account["can_refresh"] is False
 
 
 def test_sync_is_incremental_and_idempotent(service, settings) -> None:
@@ -629,6 +683,7 @@ def test_request_history_uses_historical_ownership_and_keeps_unpriced_events(ser
     history = service.request_history(2, page_size=10)
     assert history["pagination"]["total"] == 2
     assert {item["request_id"] for item in history["items"]} == {"request-owned", "request-unpriced"}
+    assert {item["channel"]["name"] for item in history["items"]} == {"account"}
     assert history["summary"]["unpriced"] == 1
     unpriced = next(item for item in history["items"] if item["pricing_status"] == "unpriced")
     assert unpriced["cost"] is None
@@ -1414,6 +1469,10 @@ def test_upstream_oauth_fixed_cost_and_api_key_usage_are_combined(service, setti
     assert dashboard["totals"]["dynamic_cost"] == f"{expected_dynamic_cents / 100:,.2f}"
     assert dashboard["totals"]["metered_amount"] == "0.00"
     assert sum(row["amount_cents"] for row in dashboard["rows"] if not row["unowned"]) == 1000 + expected_dynamic_cents
+    api_history = service.request_history(3)["items"]
+    assert api_history[0]["channel"] == {"name": "Paid API", "auth_type": "api_key"}
+    oauth_history = service.request_history(2)["items"]
+    assert oauth_history[0]["channel"] == {"name": "Team OAuth", "auth_type": "oauth"}
     with service.db.session() as session:
         snapshots = list(session.scalars(select(CycleUpstreamCost)))
     assert {(item.account_id, item.auth_type) for item in snapshots} == {

@@ -159,6 +159,28 @@ function isUpstreamApiKey(account) {
   return ['api_key', 'api-key', 'apikey', 'key'].includes(String(account.auth_type || '').toLowerCase())
 }
 
+function accountCycleCosts(account) {
+  return openCycles.value.map((cycle) => {
+    const cost = (cycle.upstream_costs || []).find((item) => item.account_id === account.id)
+    if (!cost) return { cycle: cycle.name, value: '未配置' }
+    return {
+      cycle: cycle.name,
+      value: isUpstreamApiKey(account) ? `${cost.rate} ¥/USD` : money(cost.fixed_cost, '¥'),
+    }
+  })
+}
+
+function openAccountCost(account) {
+  const cycle = openCycles.value.find((item) => (
+    item.upstream_costs || []
+  ).some((cost) => cost.account_id === account.id)) || openCycles.value[0]
+  if (!cycle) {
+    notify('当前没有可配置的开放账期', 'warning')
+    return
+  }
+  openCycleConfig(cycle)
+}
+
 function initializeUpstreamCosts(target, existing = [], accounts = upstreamAccounts.value) {
   target.upstream_costs = {}
   accounts.forEach((account) => {
@@ -561,8 +583,8 @@ const autoRefresh = useAutoRefresh((silent) => load(silent), { interval: 30_000 
             <div class="section-band__head"><div><h2>上游账号</h2><p>额度与窗口来自 CPA 上游读取，用量与费用来自本地账本</p></div></div>
             <div class="section-band__body section-band__body--flush">
               <v-table density="compact">
-                <thead><tr><th>账号</th><th>类型</th><th>计划</th><th class="text-right">请求</th><th class="text-right">Tokens</th><th class="text-right">费用</th><th>额度</th><th class="text-right">操作</th></tr></thead>
-                <tbody><tr v-for="item in data?.accounts?.accounts || []" :key="item.id"><td>{{ item.name }}</td><td>{{ item.type }}</td><td>{{ item.plan_type }}</td><td class="text-right mono">{{ number(item.usage.requests) }}</td><td class="text-right mono">{{ number(item.usage.total_tokens) }}</td><td class="text-right mono">{{ money(item.usage.cost) }}</td><td><div v-for="quota in item.quota || []" :key="quota.key"><div>{{ quota.label }}</div><div class="data-muted text-caption">恢复 {{ dateTime(quota.reset_at) }}</div></div><div v-for="credit in item.reset_credits || []" :key="credit.id" class="data-muted text-caption">主动重置过期 {{ dateTime(credit.expires_at) }}</div><span v-if="!item.quota?.length && !item.reset_credits?.length" class="data-muted">-</span></td><td class="text-right"><v-btn v-if="item.can_refresh && item.reset_credits?.length" size="small" variant="text" color="warning" @click="openResetQuota(item)"><RefreshCw :size="15" class="mr-1" />重置上游额度</v-btn><span v-else-if="item.can_refresh" class="data-muted">无可用主动重置次数</span><span v-else class="data-muted">不可用</span></td></tr></tbody>
+                <thead><tr><th>账号</th><th>类型</th><th>计划</th><th class="text-right">请求</th><th class="text-right">Tokens</th><th class="text-right">费用</th><th>开放账期成本</th><th>额度</th><th class="text-right">操作</th></tr></thead>
+                <tbody><tr v-for="item in data?.accounts?.accounts || []" :key="item.id"><td>{{ item.name }}</td><td><v-chip size="small" variant="tonal">{{ isUpstreamApiKey(item) ? 'API key' : 'OAuth' }}</v-chip></td><td>{{ item.plan_type || '-' }}</td><td class="text-right mono">{{ number(item.usage.requests) }}</td><td class="text-right mono">{{ number(item.usage.total_tokens) }}</td><td class="text-right mono">{{ money(item.usage.cost) }}</td><td><div v-for="cost in accountCycleCosts(item)" :key="cost.cycle"><span class="data-muted text-caption">{{ cost.cycle }}</span> <strong class="mono">{{ cost.value }}</strong></div><span v-if="!openCycles.length" class="data-muted">无开放账期</span></td><td><div v-for="quota in item.quota || []" :key="quota.key"><div>{{ quota.label }}</div><div class="data-muted text-caption">恢复 {{ dateTime(quota.reset_at) }}</div></div><div v-for="credit in item.reset_credits || []" :key="credit.id" class="data-muted text-caption">主动重置过期 {{ dateTime(credit.expires_at) }}</div><span v-if="!item.quota?.length && !item.reset_credits?.length" class="data-muted">-</span></td><td class="text-right admin-actions"><v-btn size="small" variant="text" :disabled="!openCycles.length" @click="openAccountCost(item)"><Edit3 :size="15" class="mr-1" />{{ isUpstreamApiKey(item) ? '配置费率' : '配置成本' }}</v-btn><v-btn v-if="item.can_refresh && item.reset_credits?.length" size="small" variant="text" color="warning" @click="openResetQuota(item)"><RefreshCw :size="15" class="mr-1" />重置上游额度</v-btn><span v-else-if="item.can_refresh" class="data-muted">无可用主动重置次数</span></td></tr></tbody>
               </v-table>
             </div>
           </section>

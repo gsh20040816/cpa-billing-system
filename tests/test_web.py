@@ -421,7 +421,7 @@ def test_admin_creates_cycle_with_upstream_channel_costs(settings, monkeypatch) 
         "accounts": accounts,
         "inspection": {},
     })
-    monkeypatch.setattr(app.state.service.cpa, "auth_files", lambda: [{
+    monkeypatch.setattr(app.state.service.cpa, "upstream_channels", lambda: [{
         "id": "oauth-account",
         "auth_index": "oauth-auth",
         "account_type": "oauth",

@@ -34,6 +34,7 @@ const event = {
   reasoning_effort: 'high',
   service_tier: 'default',
   key: { id: 1, masked: 'sk-cpa-m..._vM4', name: null },
+  channel: { name: 'Paid Codex API', auth_type: 'api_key' },
   owner: { telegram_user_id: 2, name: '@u2' },
   tokens: { input: 66331, cache_read: 65024, cache_creation: 0, output: 799, reasoning: 516, total: 67130 },
   failed: false,
@@ -49,7 +50,7 @@ const event = {
 const VDataTableStub = {
   props: ['items', 'headers'],
   emits: ['click:row'],
-  template: '<div><div class="header-list">{{ headers.map((header) => header.title).join(\' · \') }}</div><div v-for="item in items" :key="item.id" class="request-list-row"><slot name="item.reasoning_effort" :item="item" /><slot name="item.cache_read" :item="item" /></div><button class="request-row" @click="$emit(\'click:row\', $event, { item: items[0] })">打开请求</button></div>',
+  template: '<div><div class="header-list">{{ headers.map((header) => header.title).join(\' · \') }}</div><div v-for="item in items" :key="item.id" class="request-list-row"><slot name="item.channel" :item="item" /><slot name="item.reasoning_effort" :item="item" /><slot name="item.cache_read" :item="item" /></div><button class="request-row" @click="$emit(\'click:row\', $event, { item: items[0] })">打开请求</button></div>',
 }
 
 const VDialogStub = {
@@ -87,6 +88,8 @@ describe('RequestsView', () => {
 
     expect(wrapper.find('.request-list-row').text()).toContain('high')
     expect(wrapper.find('.request-list-row').text()).toContain('65,024')
+    expect(wrapper.find('.request-list-row').text()).toContain('Paid Codex API')
+    expect(wrapper.find('.request-list-row').text()).toContain('API key')
     const row = wrapper.find('.request-row')
     expect(row.exists()).toBe(true)
     await row.trigger('click')
@@ -98,6 +101,8 @@ describe('RequestsView', () => {
     expect(pageText).toContain('缓存创建')
     expect(pageText).toContain('推理强度')
     expect(pageText).toContain('high')
+    expect(pageText).toContain('上游渠道')
+    expect(pageText).toContain('Paid Codex API')
     expect(pageText).not.toContain('Cached')
     expect(pageText).not.toContain('Cache read')
     wrapper.unmount()

@@ -68,6 +68,7 @@ const headers = computed(() => [
   { title: '时间', key: 'occurred_at', minWidth: 168 },
   { title: 'Key', key: 'key', minWidth: 145 },
   ...(globalScope.value ? [{ title: '历史归属', key: 'owner', minWidth: 145 }] : []),
+  { title: '上游渠道', key: 'channel', minWidth: 170 },
   { title: '模型', key: 'model', minWidth: 150 },
   { title: 'Tier', key: 'service_tier', width: 92 },
   { title: '推理强度', key: 'reasoning_effort', width: 108 },
@@ -281,6 +282,10 @@ onBeforeUnmount(filterReload.cancel)
             <template #item.owner="{ item }">
               <v-chip :color="item.owner ? 'secondary' : 'warning'" variant="tonal">{{ ownerLabel(item.owner) }}</v-chip>
             </template>
+            <template #item.channel="{ item }">
+              <div>{{ item.channel?.name || '未记录' }}</div>
+              <div v-if="item.channel?.auth_type" class="data-muted text-caption">{{ item.channel.auth_type === 'api_key' ? 'API key' : 'OAuth' }}</div>
+            </template>
             <template #item.model="{ item }">
               <div>{{ item.resolved_model || item.model }}</div>
               <div v-if="item.requested_model && item.requested_model !== item.resolved_model" class="data-muted text-caption">请求 {{ item.requested_model }}</div>
@@ -315,6 +320,7 @@ onBeforeUnmount(filterReload.cancel)
             <div><span>时间</span><strong>{{ dateTime(detail.occurred_at) }}</strong></div>
             <div><span>API Key</span><strong class="mono">{{ detail.key.name || detail.key.masked }}</strong></div>
             <div v-if="globalScope"><span>历史归属</span><strong>{{ ownerLabel(detail.owner) }}</strong></div>
+            <div><span>上游渠道</span><strong>{{ detail.channel?.name || '未记录' }}</strong><small v-if="detail.channel?.auth_type" class="data-muted">{{ detail.channel.auth_type === 'api_key' ? 'API key' : 'OAuth' }}</small></div>
             <div><span>模型</span><strong>{{ detail.resolved_model || detail.model }}</strong></div>
             <div><span>Tier</span><strong>{{ detail.service_tier }}</strong></div>
             <div><span>推理强度</span><strong class="mono">{{ detail.reasoning_effort || '-' }}</strong></div>
@@ -342,5 +348,6 @@ onBeforeUnmount(filterReload.cancel)
 .detail-grid > div { min-width: 0; padding: 12px; background: #fff; }
 .detail-grid span { display: block; color: #68716e; font-size: 0.72rem; margin-bottom: 5px; }
 .detail-grid strong { display: block; overflow-wrap: anywhere; }
+.detail-grid small { display: block; margin-top: 4px; }
 @media (max-width: 700px) { .detail-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 </style>

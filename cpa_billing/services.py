@@ -203,6 +203,68 @@ class CPAClient:
             raise BillingError("CPA auth-files response is invalid")
         return [item for item in files if isinstance(item, dict)]
 
+    def upstream_channels(self) -> list[dict[str, Any]]:
+        channels = list(self.auth_files())
+        direct_sections = (
+            ("gemini-api-key", "Gemini"),
+            ("interactions-api-key", "Gemini Interactions"),
+            ("claude-api-key", "Claude"),
+            ("vertex-api-key", "Vertex"),
+            ("codex-api-key", "Codex"),
+            ("xai-api-key", "xAI"),
+        )
+        for section, label in direct_sections:
+            data = self._request("GET", f"/v0/management/{section}")
+            entries = data.get(section) if isinstance(data, dict) else None
+            if not isinstance(entries, list):
+                raise BillingError(f"CPA {section} response is invalid")
+            for position, entry in enumerate(entries, 1):
+                if not isinstance(entry, dict):
+                    continue
+                auth_index = str(entry.get("auth-index") or entry.get("auth_index") or "").strip()
+                if not auth_index:
+                    continue
+                raw_key = str(entry.get("api-key") or entry.get("api_key") or "").strip()
+                channels.append({
+                    "id": f"{section}:{auth_index}",
+                    "auth_index": auth_index,
+                    "account_type": "api_key",
+                    "type": section,
+                    "provider": section.removesuffix("-api-key"),
+                    "label": f"{label} API key {mask_api_key(raw_key) if raw_key else f'#{position}'}",
+                    "disabled": bool(entry.get("disabled")),
+                })
+
+        section = "openai-compatibility"
+        data = self._request("GET", f"/v0/management/{section}")
+        providers = data.get(section) if isinstance(data, dict) else None
+        if not isinstance(providers, list):
+            raise BillingError(f"CPA {section} response is invalid")
+        for provider in providers:
+            if not isinstance(provider, dict):
+                continue
+            provider_name = str(provider.get("name") or "OpenAI-compatible").strip()
+            entries = provider.get("api-key-entries")
+            if not isinstance(entries, list):
+                continue
+            for position, entry in enumerate(entries, 1):
+                if not isinstance(entry, dict):
+                    continue
+                auth_index = str(entry.get("auth-index") or entry.get("auth_index") or "").strip()
+                if not auth_index:
+                    continue
+                raw_key = str(entry.get("api-key") or entry.get("api_key") or "").strip()
+                channels.append({
+                    "id": f"{section}:{auth_index}",
+                    "auth_index": auth_index,
+                    "account_type": "api_key",
+                    "type": section,
+                    "provider": provider_name,
+                    "label": f"{provider_name} API key {mask_api_key(raw_key) if raw_key else f'#{position}'}",
+                    "disabled": bool(provider.get("disabled") or entry.get("disabled")),
+                })
+        return channels
+
     def api_call(
         self,
         auth_index: str,
@@ -2951,6 +3013,16 @@ class BillingService:
                 .offset((page - 1) * page_size)
                 .limit(page_size)
             ).all()
+            auth_indexes = {str(event.auth_index) for event, _, _, _ in rows if event.auth_index}
+            channel_snapshots: dict[str, list[tuple[int, int, CycleUpstreamCost]]] = defaultdict(list)
+            if auth_indexes:
+                for upstream, cycle_start, cycle_end in session.execute(
+                    select(CycleUpstreamCost, BillingCycle.start_at_ms, BillingCycle.end_at_ms)
+                    .join(BillingCycle, BillingCycle.id == CycleUpstreamCost.cycle_id)
+                    .where(CycleUpstreamCost.auth_index.in_(auth_indexes))
+                    .order_by(BillingCycle.start_at_ms.desc(), BillingCycle.id.desc())
+                ):
+                    channel_snapshots[upstream.auth_index].append((cycle_start, cycle_end, upstream))
             items = []
             for event, rated, key, owner in rows:
                 generation_ms = None
@@ -2966,6 +3038,15 @@ class BillingService:
                     "masked": key.masked_value if key else mask_hash(event.api_key_hash or ""),
                     "name": key.display_name if key else None,
                 }
+                channel_snapshot = next((
+                    upstream
+                    for start_at_ms, end_at_ms, upstream in channel_snapshots.get(str(event.auth_index or ""), [])
+                    if start_at_ms <= event.occurred_at_ms < end_at_ms
+                ), None)
+                channel_name = (
+                    channel_snapshot.account_name if channel_snapshot is not None
+                    else event.account_snapshot or event.source_label
+                )
                 item = {
                     "id": event.id,
                     "request_id": event.request_id,
@@ -2978,6 +3059,10 @@ class BillingService:
                     "reasoning_effort": event.reasoning_effort or None,
                     "service_tier": rated.service_tier if rated else self._billing_service_tier(event),
                     "key": key_payload,
+                    "channel": {
+                        "name": channel_name or "未记录",
+                        "auth_type": channel_snapshot.auth_type if channel_snapshot is not None else None,
+                    },
                     "tokens": {
                         "input": event.input_tokens,
                         "cache_read": self._effective_cache_read_tokens(event),
@@ -3854,7 +3939,7 @@ class BillingService:
                 "name": identity.get("label") or identity.get("name") or identity.get("account") or identity.get("email") or f"上游账号 {account_id}",
                 "type": identity.get("type"),
                 "provider": identity.get("provider") or identity.get("type"),
-                "auth_type": identity.get("account_type") or "oauth",
+                "auth_type": self._upstream_auth_type(identity),
                 "plan_type": plan_type,
                 "disabled": bool(identity.get("disabled") or identity.get("unavailable")),
                 "active_start": id_token.get("chatgpt_subscription_active_start"),
@@ -3903,7 +3988,8 @@ class BillingService:
                 "reset_credits_available": quota_item.get("reset_credits_available") if quota_item.get("reset_credits_available") is not None else credits,
                 "reset_credits": quota_item.get("reset_credits") or [],
                 "reset_credits_error": quota_item.get("reset_credits_error"),
-                "can_refresh": bool(auth_index) and provider == "codex" and not bool(identity.get("disabled") or identity.get("unavailable")),
+                "can_refresh": self._upstream_auth_type(identity) == "oauth" and bool(auth_index)
+                and provider == "codex" and not bool(identity.get("disabled") or identity.get("unavailable")),
             })
         accounts.sort(key=lambda item: (item["disabled"], str(item["name"]).casefold()))
         return accounts, account_by_auth, auth_by_account
@@ -3970,7 +4056,7 @@ class BillingService:
         return headers
 
     def _cpa_accounts_raw(self, *, force: bool = False) -> dict[str, Any]:
-        files = self.cpa.auth_files()
+        files = self.cpa.upstream_channels()
         quota_items: list[dict[str, Any]] = []
         refreshed_at = self._iso_timestamp(now_ms())
         for item in files:
@@ -3979,6 +4065,16 @@ class BillingService:
                 continue
             account_id = str(item.get("id") or "").strip()
             if not account_id:
+                continue
+            auth_type = str(item.get("account_type") or item.get("auth_type") or "oauth").strip().lower()
+            if auth_type.replace("-", "_") in {"api_key", "apikey", "key"}:
+                quota_items.append({
+                    "account_id": account_id,
+                    "auth_index": auth_index,
+                    "status": "unsupported",
+                    "refreshed_at": None,
+                    "quota": {},
+                })
                 continue
             provider = self._cpa_account_provider(item)
             if provider != "codex":
@@ -5545,7 +5641,7 @@ class BillingService:
         if not configs:
             raise BillingError("至少需要配置一个上游账号成本")
         try:
-            files = self.cpa.auth_files()
+            files = self.cpa.upstream_channels()
         except (httpx.HTTPError, BillingError) as exc:
             raise BillingDependencyError("CPA 上游账号服务不可用，无法冻结账期成本配置") from exc
         by_id = {str(item.get("id") or ""): item for item in files if isinstance(item, dict)}

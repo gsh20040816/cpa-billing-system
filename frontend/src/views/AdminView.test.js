@@ -372,4 +372,66 @@ describe('AdminView manual usage', () => {
     snapshot.accounts = previousAccounts
     snapshot.admin.gradients = previousGradients
   })
+
+  it('shows and edits an upstream API key rate from the management account section', async () => {
+    const previousAccounts = snapshot.accounts
+    const previousCycles = snapshot.admin.cycles
+    const previousGradients = snapshot.admin.gradients
+    snapshot.accounts = { accounts: [{
+      id: 'codex-api-key:auth-1', name: 'Codex API key sk-paid...1234',
+      auth_type: 'api_key', type: 'codex-api-key', usage: {}, can_refresh: false,
+    }] }
+    snapshot.admin.cycles = [{
+      id: 3,
+      name: 'current-cycle',
+      status: 'open',
+      gradient_rule_id: 9,
+      upstream_costs: [{
+        account_id: 'codex-api-key:auth-1', account_name: 'Codex API key sk-paid...1234',
+        auth_type: 'api_key', fixed_cost: null, rate: '7.000000',
+      }],
+    }]
+    snapshot.admin.gradients = [{ id: 9, name: 'default', active: true }]
+    const wrapper = mount(AdminView, {
+      attachTo: document.body,
+      global: { plugins: [vuetify] },
+    })
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('current-cycle')
+    expect(wrapper.text()).toContain('7.000000 ¥/USD')
+    const configureButton = wrapper.findAllComponents({ name: 'VBtn' })
+      .find((item) => item.text().includes('配置费率'))
+    await configureButton.trigger('click')
+    await flushPromises()
+
+    const dialog = wrapper.findAllComponents({ name: 'VDialog' })
+      .find((item) => item.props('modelValue') === true)
+    const rate = dialog.findAllComponents({ name: 'VTextField' })
+      .find((item) => item.props('label') === 'Codex API key sk-paid...1234')
+    const reason = dialog.findAllComponents({ name: 'VTextarea' })
+      .find((item) => item.props('label') === '修改原因')
+    expect(rate.props('modelValue')).toBe('7.000000')
+    await rate.setValue('8.25')
+    await reason.setValue('更新上游 API key 费率')
+    await dialog.findAllComponents({ name: 'VBtn' })
+      .find((item) => item.text().includes('保存配置')).trigger('click')
+    await flushPromises()
+
+    expect(api).toHaveBeenCalledWith('/api/admin/cycles/current-cycle/configuration', {
+      admin: true,
+      body: {
+        gradient_rule_id: 9,
+        reason: '更新上游 API key 费率',
+        upstream_costs: [{
+          account_id: 'codex-api-key:auth-1', fixed_cost: null, rate: '8.25',
+        }],
+      },
+      method: 'PUT',
+    })
+    wrapper.unmount()
+    snapshot.accounts = previousAccounts
+    snapshot.admin.cycles = previousCycles
+    snapshot.admin.gradients = previousGradients
+  })
 })

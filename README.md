@@ -4,6 +4,8 @@ CPAMP-backed monthly cost allocation, global Telegram-user dashboard, API-Key lo
 
 New billing cycles snapshot CPA's active upstream authentication channels. Each OAuth account contributes a fixed CNY cost for the cycle; each upstream API-key channel contributes its rated USD usage multiplied by its configured CNY/USD rate. These channel costs are combined per resource pool, reduced first by charges from unbound downstream keys that have a configured multiplier, and then allocated with the cycle's existing gradient rule. Legacy cycles retain their original pool-fixed-cost snapshot until an administrator explicitly migrates an open cycle.
 
+Upstream discovery combines CPA OAuth auth files with its API-key management sections (Codex, Claude, Gemini, Vertex, xAI, interactions, and OpenAI-compatible providers). Administrators configure the resulting fixed costs and CNY/USD rates from the upstream-account section of the management page; raw upstream credentials are never returned to the browser or stored in billing snapshots.
+
 ## Web authentication
 
 - `/login` accepts only API Keys registered through the Telegram bot. These sessions never receive administrator permissions.
