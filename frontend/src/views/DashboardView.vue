@@ -39,7 +39,10 @@ const metrics = computed(() => {
     { label: '实际等效成本', value: money(totals.actual), mono: true },
     { label: '梯度计费用量', value: money(totals.billed), mono: true },
     { label: data.value?.billing_model === 'upstream_channels' ? 'OAuth 固定成本' : '资源池固定成本', value: money(totals.fixed_cost, '¥'), mono: true },
-    { label: data.value?.billing_model === 'upstream_channels' ? 'API key 动态成本' : '按量 Key 应付', value: money(totals.metered_amount, '¥'), mono: true },
+    ...(data.value?.billing_model === 'upstream_channels'
+      ? [{ label: '上游 API key 动态成本', value: money(totals.dynamic_cost, '¥'), mono: true }]
+      : []),
+    { label: '未绑定 Key 计费', value: money(totals.metered_amount, '¥'), mono: true },
     { label: '成员分摊', value: money(totals.member_amount, '¥'), mono: true },
     { label: '全局费率', value: yuanPerDollar(totals.global_rate), hint: '成员分摊 / 梯度计费用量', mono: true },
   ]
@@ -123,22 +126,23 @@ watch(cycle, (value, previous) => {
 
       <section class="section-band">
         <div class="section-band__head">
-          <div><h2>资源池结算进度</h2><p>{{ data?.billing_model === 'upstream_channels' ? 'OAuth 固定成本与 API key 动态成本汇入资源池，再分摊给 Telegram 用户' : '固定成本先扣除未绑定按量 Key，再分摊给 Telegram 用户' }}</p></div>
+          <div><h2>资源池结算进度</h2><p>{{ data?.billing_model === 'upstream_channels' ? 'OAuth 固定成本与上游 API key 动态成本汇入资源池，先扣除未绑定 Key 计费，再分摊余额' : '固定成本先扣除未绑定按量 Key，再分摊给 Telegram 用户' }}</p></div>
           <strong class="mono">合计 {{ money(data?.totals?.amount, '¥') }}</strong>
         </div>
         <div class="section-band__body section-band__body--flush">
           <v-table density="compact">
-            <thead><tr><th>资源池</th><th class="text-right">{{ data?.billing_model === 'upstream_channels' ? 'OAuth 固定成本' : '固定成本' }}</th><th class="text-right">{{ data?.billing_model === 'upstream_channels' ? 'API key 动态成本' : '按量抵扣' }}</th><th class="text-right">{{ data?.billing_model === 'upstream_channels' ? '待分摊成本' : '成员剩余成本' }}</th><th class="text-right">成员已分摊</th><th v-if="data?.billing_model !== 'upstream_channels'" class="text-right">超额按量收入</th></tr></thead>
+            <thead><tr><th>资源池</th><th class="text-right">{{ data?.billing_model === 'upstream_channels' ? 'OAuth 固定成本' : '固定成本' }}</th><th v-if="data?.billing_model === 'upstream_channels'" class="text-right">上游 API key 动态成本</th><th class="text-right">未绑定 Key 抵扣</th><th class="text-right">成员剩余成本</th><th class="text-right">成员已分摊</th><th class="text-right">超额按量收入</th></tr></thead>
             <tbody>
               <tr v-for="pool in data?.pool_totals || []" :key="pool.pool_id">
                 <td>{{ pool.pool }}</td>
                 <td class="text-right mono">{{ money(pool.fixed_cost, '¥') }}</td>
+                <td v-if="data?.billing_model === 'upstream_channels'" class="text-right mono">{{ money(pool.dynamic_cost, '¥') }}</td>
                 <td class="text-right mono">{{ money(pool.metered_amount, '¥') }}</td>
                 <td class="text-right mono">{{ money(pool.residual_cost, '¥') }}</td>
                 <td class="text-right mono">{{ money(pool.member_amount, '¥') }}</td>
-                <td v-if="data?.billing_model !== 'upstream_channels'" class="text-right mono">{{ money((Number(pool.surplus_cents || 0) / 100).toFixed(2), '¥') }}</td>
+                <td class="text-right mono">{{ money((Number(pool.surplus_cents || 0) / 100).toFixed(2), '¥') }}</td>
               </tr>
-              <tr v-if="!data?.pool_totals?.length"><td colspan="6" class="text-center data-muted pa-5">当前账期尚未配置资源池成本</td></tr>
+              <tr v-if="!data?.pool_totals?.length"><td :colspan="data?.billing_model === 'upstream_channels' ? 7 : 6" class="text-center data-muted pa-5">当前账期尚未配置资源池成本</td></tr>
             </tbody>
           </v-table>
         </div>

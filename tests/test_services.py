@@ -1269,9 +1269,90 @@ def test_unowned_metered_key_reduces_member_pool_cost(service, settings) -> None
     assert dashboard["totals"]["metered_amount"] == "7.00"
     assert dashboard["totals"]["member_amount"] == "3.00"
     assert dashboard["totals"]["amount"] == "10.00"
+
     assert dashboard["totals"]["global_rate"] == "3.000000"
     assert owned["user_rate"] == "3.000000"
     assert unowned["user_rate"] is None
+
+
+def test_unowned_metered_key_reduces_upstream_channel_cost(service, settings, monkeypatch) -> None:
+    create_owner(service, "owned-upstream-key", 2, 0)
+    with service.db.session() as session:
+        session.add(APIKey(
+            cpamp_hash=cpamp_key_hash("unowned-upstream-key"),
+            login_fingerprint=None,
+            masked_value="sk-cpa-****upstream",
+            status="unowned",
+            current_owner_id=None,
+            present_in_cpa=True,
+            created_at_ms=0,
+        ))
+        session.flush()
+        metered_id = session.scalar(select(APIKey.id).where(
+            APIKey.cpamp_hash == cpamp_key_hash("unowned-upstream-key")
+        ))
+    service.update_unowned_key_profile(metered_id, "external-team", "7", "set RMB per USD multiplier")
+    insert_event(
+        settings,
+        cpamp_key_hash("owned-upstream-key"),
+        1000,
+        event_hash="owned-upstream-usage",
+        input_tokens=1_000_000,
+        cached_tokens=0,
+        output_tokens=0,
+        auth_index="oauth-auth",
+    )
+    insert_event(
+        settings,
+        cpamp_key_hash("unowned-upstream-key"),
+        1001,
+        event_hash="unowned-upstream-usage",
+        input_tokens=1_000_000,
+        cached_tokens=0,
+        output_tokens=0,
+        auth_index="oauth-auth",
+    )
+    service.sync_cpamp()
+    service.rate_events()
+    monkeypatch.setattr(service.cpa, "auth_files", lambda: [{
+        "id": "oauth-account",
+        "auth_index": "oauth-auth",
+        "account_type": "oauth",
+        "name": "Team OAuth",
+    }])
+    service.create_cycle(
+        "upstream-with-unowned",
+        "1970-01-01T08:00",
+        "1970-01-02T08:00",
+        0,
+        upstream_costs=[
+            {"account_id": "oauth-account", "fixed_cost_cents": 1000, "rate_ppm": None},
+        ],
+    )
+
+    dashboard = service.dashboard("upstream-with-unowned")
+    owned = next(row for row in dashboard["rows"] if row["telegram_user_id"] == 2)
+    unowned = next(row for row in dashboard["rows"] if row["unowned"])
+    assert len(dashboard["metered_keys"]) == 1
+    assert owned["amount"] == "3.00"
+    assert unowned["amount"] == "7.00"
+    assert dashboard["totals"]["fixed_cost"] == "10.00"
+    assert dashboard["totals"]["dynamic_cost"] == "0.00"
+    assert dashboard["totals"]["metered_amount"] == "7.00"
+    assert dashboard["totals"]["member_amount"] == "3.00"
+    assert dashboard["totals"]["amount"] == "10.00"
+
+    service.close_cycle("upstream-with-unowned", 1, False)
+    closed = service.dashboard("upstream-with-unowned")
+    closed_owned = next(row for row in closed["rows"] if row["telegram_user_id"] == 2)
+    closed_unowned = next(row for row in closed["rows"] if row["unowned"])
+    assert len(closed["metered_keys"]) == 1
+    assert closed_owned["amount"] == "3.00"
+    assert closed_unowned["amount"] == "7.00"
+    assert closed["totals"]["fixed_cost"] == "10.00"
+    assert closed["totals"]["metered_amount"] == "7.00"
+    assert closed["totals"]["member_amount"] == "3.00"
+    assert closed["totals"]["amount"] == "10.00"
 
 
 def test_upstream_oauth_fixed_cost_and_api_key_usage_are_combined(service, settings, monkeypatch) -> None:
@@ -1330,7 +1411,8 @@ def test_upstream_oauth_fixed_cost_and_api_key_usage_are_combined(service, setti
     assert dashboard["billing_model"] == "upstream_channels"
     assert api_cost["amount_cents"] == expected_dynamic_cents
     assert dashboard["totals"]["fixed_cost"] == "10.00"
-    assert dashboard["totals"]["metered_amount"] == f"{expected_dynamic_cents / 100:,.2f}"
+    assert dashboard["totals"]["dynamic_cost"] == f"{expected_dynamic_cents / 100:,.2f}"
+    assert dashboard["totals"]["metered_amount"] == "0.00"
     assert sum(row["amount_cents"] for row in dashboard["rows"] if not row["unowned"]) == 1000 + expected_dynamic_cents
     with service.db.session() as session:
         snapshots = list(session.scalars(select(CycleUpstreamCost)))

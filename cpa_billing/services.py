@@ -2114,38 +2114,38 @@ class BillingService:
                     "actual_nano_usd": total_actual,
                     "amount_cents": amount,
                 })
-        else:
-            for pool_id, key_hash, requests, tokens, actual in unowned_usage:
-                key = key_by_hash.get(str(key_hash or ""))
-                if key is None or key.billing_multiplier_ppm is None:
-                    continue
-                amount = _metered_amount_cents(int(actual or 0), int(key.billing_multiplier_ppm))
-                item = {
-                    "pool_id": int(pool_id),
-                    "pool": pools.get(int(pool_id), str(pool_id)),
-                    "key_id": key.id,
-                    "masked": key.masked_value,
-                    "name": key.display_name,
-                    "requests": int(requests or 0),
-                    "tokens": int(tokens or 0),
-                    "actual_nano_usd": int(actual or 0),
-                    "multiplier_ppm": int(key.billing_multiplier_ppm),
-                    "amount_cents": amount,
-                }
-                metered_by_pool[int(pool_id)].append(item)
-                metered_keys.append(item)
+        for pool_id, key_hash, requests, tokens, actual in unowned_usage:
+            key = key_by_hash.get(str(key_hash or ""))
+            if key is None or key.billing_multiplier_ppm is None:
+                continue
+            amount = _metered_amount_cents(int(actual or 0), int(key.billing_multiplier_ppm))
+            item = {
+                "pool_id": int(pool_id),
+                "pool": pools.get(int(pool_id), str(pool_id)),
+                "key_id": key.id,
+                "masked": key.masked_value,
+                "name": key.display_name,
+                "requests": int(requests or 0),
+                "tokens": int(tokens or 0),
+                "actual_nano_usd": int(actual or 0),
+                "multiplier_ppm": int(key.billing_multiplier_ppm),
+                "amount_cents": amount,
+            }
+            metered_by_pool[int(pool_id)].append(item)
+            metered_keys.append(item)
 
         user_lines: dict[int, list[tuple[int, int, int, int]]] = defaultdict(list)
         pool_totals: list[dict[str, Any]] = []
         for pool_id in sorted(costs.keys() | pool_users.keys() | metered_by_pool.keys()):
             if upstream_rows:
                 fixed = upstream_fixed_by_pool.get(pool_id, 0)
-                metered = upstream_dynamic_by_pool.get(pool_id, 0)
-                residual = int(costs.get(pool_id, 0))
+                dynamic = upstream_dynamic_by_pool.get(pool_id, 0)
             else:
                 fixed = int(costs.get(pool_id, 0))
-                metered = sum(item["amount_cents"] for item in metered_by_pool.get(pool_id, []))
-                residual = max(0, fixed - metered)
+                dynamic = 0
+            metered = sum(item["amount_cents"] for item in metered_by_pool.get(pool_id, []))
+            total_cost = int(costs.get(pool_id, 0))
+            residual = max(0, total_cost - metered)
             users = pool_users.get(pool_id, {})
             billed = {uid: tiered_weight(weight, tiers) for uid, weight in users.items()}
             if strict and residual and not any(weight > 0 for weight in billed.values()):
@@ -2158,10 +2158,11 @@ class BillingService:
                 "pool_id": pool_id,
                 "pool": pools.get(pool_id, str(pool_id)),
                 "fixed_cost_cents": fixed,
+                "dynamic_cost_cents": dynamic,
                 "metered_amount_cents": metered,
                 "residual_cost_cents": residual,
                 "member_amount_cents": member_amount,
-                "surplus_cents": 0 if upstream_rows else max(0, metered - fixed),
+                "surplus_cents": max(0, metered - total_cost),
                 "unallocated_cents": max(0, residual - member_amount),
             })
         adjustments: dict[int, int] = defaultdict(int)
@@ -2271,7 +2272,8 @@ class BillingService:
                         "billing_model": None,
                         "totals": {"requests": 0, "tokens": 0, "actual": "0.0000",
                                    "request_actual": "0.0000", "manual_actual": "0.0000", "billed": "0.0000",
-                                   "member_amount": "0.00", "metered_amount": "0.00", "amount": "0.00",
+                                   "fixed_cost": "0.00", "dynamic_cost": "0.00", "member_amount": "0.00",
+                                   "metered_amount": "0.00", "amount": "0.00",
                                    "global_rate": None}}
 
             period = (
@@ -2366,22 +2368,36 @@ class BillingService:
                             .group_by(StatementLine.pool_id)
                         )
                     }
+                    metered_by_pool_closed = {
+                        pool_id: sum(item["amount_cents"] for item in metered_keys if item["pool_id"] == pool_id)
+                        for pool_id in {item["pool_id"] for item in metered_keys}
+                    }
+                    obligation_by_pool = {
+                        pool_id: member_by_pool.get(pool_id, 0) + metered_by_pool_closed.get(pool_id, 0)
+                        for pool_id in member_by_pool.keys() | metered_by_pool_closed.keys()
+                    }
                     fixed_total = sum(int(item.fixed_cost_cents or 0) for item in upstream_rows)
                     dynamic_total = sum(
                         int(item.amount_cents or 0) for item in upstream_rows if item.auth_type == "api_key"
                     )
-                    fixed_allocated = largest_remainder(fixed_total, member_by_pool)
-                    dynamic_allocated = largest_remainder(dynamic_total, member_by_pool)
+                    fixed_allocated = largest_remainder(fixed_total, obligation_by_pool)
+                    dynamic_allocated = largest_remainder(dynamic_total, obligation_by_pool)
                     pool_totals = [{
                         "pool_id": pool_id,
                         "pool": pool_map.get(pool_id, str(pool_id)),
                         "fixed_cost_cents": fixed_allocated.get(pool_id, 0),
-                        "metered_amount_cents": dynamic_allocated.get(pool_id, 0),
-                        "residual_cost_cents": amount,
-                        "member_amount_cents": amount,
-                        "surplus_cents": 0,
+                        "dynamic_cost_cents": dynamic_allocated.get(pool_id, 0),
+                        "metered_amount_cents": metered_by_pool_closed.get(pool_id, 0),
+                        "residual_cost_cents": member_by_pool.get(pool_id, 0),
+                        "member_amount_cents": member_by_pool.get(pool_id, 0),
+                        "surplus_cents": max(
+                            0,
+                            metered_by_pool_closed.get(pool_id, 0)
+                            - fixed_allocated.get(pool_id, 0)
+                            - dynamic_allocated.get(pool_id, 0),
+                        ),
                         "unallocated_cents": 0,
-                    } for pool_id, amount in member_by_pool.items()]
+                    } for pool_id in obligation_by_pool]
                 for pool_id, fixed in ([] if upstream_rows else fixed_by_pool.items()):
                     metered = sum(item["amount_cents"] for item in metered_keys if item["pool_id"] == pool_id)
                     member = sum(line.amount_cents for line in session.scalars(
@@ -2392,7 +2408,8 @@ class BillingService:
                     ))
                     pool_totals.append({
                         "pool_id": pool_id, "pool": pool_map.get(pool_id, str(pool_id)),
-                        "fixed_cost_cents": int(fixed), "metered_amount_cents": metered,
+                        "fixed_cost_cents": int(fixed), "dynamic_cost_cents": 0,
+                        "metered_amount_cents": metered,
                         "residual_cost_cents": max(0, int(fixed) - metered), "member_amount_cents": member,
                         "surplus_cents": max(0, metered - int(fixed)), "unallocated_cents": 0,
                     })
@@ -2535,6 +2552,7 @@ class BillingService:
                 "pool_totals": [{
                     **item,
                     "fixed_cost": format_cents(item["fixed_cost_cents"]),
+                    "dynamic_cost": format_cents(item["dynamic_cost_cents"]),
                     "metered_amount": format_cents(item["metered_amount_cents"]),
                     "residual_cost": format_cents(item["residual_cost_cents"]),
                     "member_amount": format_cents(item["member_amount_cents"]),
@@ -2549,10 +2567,9 @@ class BillingService:
                     "manual_actual": format_usd_nano(sum(item["manual_actual_nano"] for item in rows)),
                     "billed": format_usd_nano(sum(value[1] for value in live_user.values())),
                     "member_amount": format_cents(member_amount_cents),
-                    "metered_amount": format_cents(dynamic_amount_cents if billing_model == "upstream_channels" else metered_amount_cents),
-                    "amount": format_cents(
-                        member_amount_cents if billing_model == "upstream_channels" else member_amount_cents + metered_amount_cents
-                    ),
+                    "metered_amount": format_cents(metered_amount_cents),
+                    "dynamic_cost": format_cents(dynamic_amount_cents),
+                    "amount": format_cents(member_amount_cents + metered_amount_cents),
                     "fixed_cost": format_cents(sum(item["fixed_cost_cents"] for item in pool_totals)),
                     "global_rate": format_yuan_per_usd(member_amount_cents, member_billed_nano_usd),
                 },
@@ -3317,8 +3334,8 @@ class BillingService:
                         "reasoning_is_output_subset": True,
                         "long_context_uses_total_input": True,
                         "unowned_keys_without_multiplier_are_billed": False,
-                        "unowned_metered_keys_use_cost_multiplier": not bool(upstream_costs),
-                        "metered_keys_reduce_pool_fixed_cost_before_allocation": not bool(upstream_costs),
+                        "unowned_metered_keys_use_cost_multiplier": True,
+                        "metered_keys_reduce_pool_fixed_cost_before_allocation": True,
                         "oauth_accounts_use_fixed_cost": bool(upstream_costs),
                         "upstream_api_keys_use_dynamic_rate": bool(upstream_costs),
                         "allocation_method": "largest_remainder",

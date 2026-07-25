@@ -37,7 +37,7 @@ describe('DashboardView rates', () => {
       models: [],
       totals: {
         requests: 2, tokens: 2000, actual: '2.0000', billed: '1.0000',
-        fixed_cost: '10.00', metered_amount: '7.00', member_amount: '3.00', amount: '10.00',
+        fixed_cost: '10.00', dynamic_cost: '0.00', metered_amount: '7.00', member_amount: '3.00', amount: '10.00',
         global_rate: '3.000000',
       },
     })

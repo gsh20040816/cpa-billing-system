@@ -167,6 +167,7 @@ watch(cycle, (value, previous) => { if (previous && value !== previous) autoRefr
           <div><span>未归属普通 Key</span><strong>不计费</strong></div>
           <div><span>上游 OAuth</span><strong>账号固定成本</strong></div>
           <div><span>上游 API key</span><strong>实际 USD × ¥/USD 费率</strong></div>
+          <div><span>未绑定 Telegram Key</span><strong>倍率计费后优先抵扣成本</strong></div>
           <div><span>分摊取整</span><strong>最大余数法</strong></div>
         </div>
       </section>
