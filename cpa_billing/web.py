@@ -127,6 +127,12 @@ class PoolCostPayload(BaseModel):
     fixed_cost: str
 
 
+class UpstreamCostPayload(BaseModel):
+    account_id: str = Field(min_length=1, max_length=200)
+    fixed_cost: str | None = Field(default=None, max_length=40)
+    rate: str | None = Field(default=None, max_length=40)
+
+
 class CyclePayload(BaseModel):
     name: str
     start: str
@@ -134,6 +140,7 @@ class CyclePayload(BaseModel):
     fixed_cost: str = "0"
     gradient_rule_id: int | None = Field(default=None, ge=1)
     pool_costs: list[PoolCostPayload] = Field(default_factory=list)
+    upstream_costs: list[UpstreamCostPayload] = Field(default_factory=list)
     waiver: str | None = Field(default=None, max_length=1000)
 
 
@@ -214,6 +221,7 @@ class ReasonPayload(BaseModel):
 class CycleConfigurationPayload(BaseModel):
     gradient_rule_id: int = Field(ge=1)
     pool_costs: list[PoolCostPayload] = Field(default_factory=list)
+    upstream_costs: list[UpstreamCostPayload] = Field(default_factory=list)
     reason: str = Field(min_length=1, max_length=1000)
 
 
@@ -244,6 +252,19 @@ def _money_to_cents(value: str) -> int:
     if amount != quantized:
         raise BillingError("固定成本最多保留两位小数")
     return int(quantized * 100)
+
+
+def _rate_to_ppm(value: str) -> int:
+    try:
+        rate = Decimal(value.strip())
+    except InvalidOperation as exc:
+        raise BillingError("人民币/USD 费率格式无效") from exc
+    if not rate.is_finite() or rate < 0 or rate > 1000:
+        raise BillingError("人民币/USD 费率必须在 0 到 1000 之间")
+    quantized = rate.quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
+    if rate != quantized:
+        raise BillingError("人民币/USD 费率最多保留六位小数")
+    return int(quantized * 1_000_000)
 
 
 def _manual_usage_to_nano(value: str) -> int:
@@ -822,6 +843,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "pool_id": item.pool_id,
             "fixed_cost_cents": _money_to_cents(item.fixed_cost),
         } for item in payload.pool_costs]
+        upstream_costs = [{
+            "account_id": item.account_id,
+            "fixed_cost_cents": None if item.fixed_cost is None else _money_to_cents(item.fixed_cost),
+            "rate_ppm": None if item.rate is None else _rate_to_ppm(item.rate),
+        } for item in payload.upstream_costs]
         service.create_cycle(
             payload.name,
             payload.start,
@@ -832,6 +858,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             pool_costs=pool_costs or None,
             operator_type="web-admin",
             operator_id="admin-token",
+            upstream_costs=upstream_costs or None,
         )
         return {"ok": True}
 
@@ -847,6 +874,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "fixed_cost_cents": _money_to_cents(item.fixed_cost),
             } for item in payload.pool_costs],
             payload.reason,
+            upstream_costs=[{
+                "account_id": item.account_id,
+                "fixed_cost_cents": None if item.fixed_cost is None else _money_to_cents(item.fixed_cost),
+                "rate_ppm": None if item.rate is None else _rate_to_ppm(item.rate),
+            } for item in payload.upstream_costs] or None,
         )
         return {"ok": True}
 

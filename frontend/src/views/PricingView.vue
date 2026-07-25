@@ -104,9 +104,21 @@ watch(cycle, (value, previous) => { if (previous && value !== previous) autoRefr
           </div>
         </section>
         <section class="section-band">
-          <div class="section-band__head"><div><h2>资源池固定成本</h2><p>{{ data?.billing?.cycle?.name || '未选择账期' }} · 各池独立扣除按量 Key 后分摊</p></div></div>
+          <div class="section-band__head"><div><h2>{{ data?.billing?.billing_model === 'upstream_channels' ? '上游渠道成本' : '资源池固定成本' }}</h2><p>{{ data?.billing?.cycle?.name || '未选择账期' }} · {{ data?.billing?.billing_model === 'upstream_channels' ? 'OAuth 固定成本 + API key 动态成本' : '旧成本模型' }}</p></div></div>
           <div class="section-band__body section-band__body--flush">
-            <v-table density="compact">
+            <v-table v-if="data?.billing?.billing_model === 'upstream_channels'" density="compact">
+              <thead><tr><th>上游账号</th><th>认证类型</th><th class="text-right">成本参数</th><th class="text-right">等效消耗 USD</th><th class="text-right">当前成本</th></tr></thead>
+              <tbody>
+                <tr v-for="item in data?.billing?.upstream_costs || []" :key="item.account_id">
+                  <td>{{ item.account_name }}</td>
+                  <td><v-chip size="small" variant="tonal">{{ item.auth_type === 'api_key' ? 'API key' : 'OAuth' }}</v-chip></td>
+                  <td class="text-right mono">{{ item.auth_type === 'api_key' ? `${item.rate} ¥/USD` : money(item.fixed_cost, '¥') }}</td>
+                  <td class="text-right mono">{{ money(item.actual) }}</td>
+                  <td class="text-right mono">{{ money(item.amount, '¥') }}</td>
+                </tr>
+              </tbody>
+            </v-table>
+            <v-table v-else density="compact">
               <thead><tr><th>资源池</th><th>账号范围</th><th>模型范围</th><th class="text-right">固定成本</th></tr></thead>
               <tbody>
                 <tr v-for="pool in data?.billing?.pools || []" :key="pool.id">
@@ -153,7 +165,8 @@ watch(cycle, (value, previous) => { if (previous && value !== previous) autoRefr
           <div><span>Reasoning tokens</span><strong>Output 子集</strong></div>
           <div><span>长上下文判定</span><strong>总 Input</strong></div>
           <div><span>未归属普通 Key</span><strong>不计费</strong></div>
-          <div><span>未归属按量 Key</span><strong>USD 成本 × 倍率</strong></div>
+          <div><span>上游 OAuth</span><strong>账号固定成本</strong></div>
+          <div><span>上游 API key</span><strong>实际 USD × ¥/USD 费率</strong></div>
           <div><span>分摊取整</span><strong>最大余数法</strong></div>
         </div>
       </section>

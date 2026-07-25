@@ -323,4 +323,53 @@ describe('AdminView manual usage', () => {
     wrapper.unmount()
     snapshot.accounts = previousAccounts
   })
+
+  it('creates a cycle with OAuth fixed cost and upstream API key rate', async () => {
+    const previousAccounts = snapshot.accounts
+    const previousGradients = snapshot.admin.gradients
+    snapshot.accounts = { accounts: [
+      { id: 'oauth-1', name: 'Team OAuth', auth_type: 'oauth', usage: {} },
+      { id: 'api-1', name: 'Paid API', auth_type: 'api_key', usage: {} },
+    ] }
+    snapshot.admin.gradients = [{ id: 9, name: 'default', active: true }]
+    const wrapper = mount(AdminView, {
+      attachTo: document.body,
+      global: { plugins: [vuetify] },
+    })
+    await flushPromises()
+
+    const cyclesTab = wrapper.findAllComponents({ name: 'VTab' })
+      .find((item) => item.text().trim() === '账期')
+    await cyclesTab.trigger('click')
+    await flushPromises()
+    await wrapper.findAllComponents({ name: 'VBtn' })
+      .find((item) => item.text().includes('创建账期')).trigger('click')
+    await flushPromises()
+    const dialog = wrapper.findAllComponents({ name: 'VDialog' })
+      .find((item) => item.props('modelValue') === true)
+    const fields = dialog.findAllComponents({ name: 'VTextField' })
+    await fields.find((item) => item.props('label') === '名称').setValue('new-cycle')
+    await fields.find((item) => item.props('label') === '开始时间').setValue('2026-07-01T00:00')
+    await fields.find((item) => item.props('label') === '结束时间').setValue('2026-08-01T00:00')
+    await fields.find((item) => item.props('label') === 'Team OAuth').setValue('20.00')
+    await fields.find((item) => item.props('label') === 'Paid API').setValue('7.123456')
+    await dialog.findAllComponents({ name: 'VBtn' })
+      .find((item) => item.text().trim() === '创建').trigger('click')
+    await flushPromises()
+
+    expect(api).toHaveBeenCalledWith('/api/admin/cycles', {
+      admin: true,
+      body: expect.objectContaining({
+        name: 'new-cycle',
+        upstream_costs: [
+          { account_id: 'oauth-1', fixed_cost: '20.00', rate: null },
+          { account_id: 'api-1', fixed_cost: null, rate: '7.123456' },
+        ],
+      }),
+      method: 'POST',
+    })
+    wrapper.unmount()
+    snapshot.accounts = previousAccounts
+    snapshot.admin.gradients = previousGradients
+  })
 })

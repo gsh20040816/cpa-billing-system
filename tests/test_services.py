@@ -22,6 +22,7 @@ from cpa_billing.models import (
     AuditLog,
     BillingCycle,
     CyclePoolCost,
+    CycleUpstreamCost,
     DeadLetter,
     GradientRule,
     GroupMembership,
@@ -1271,6 +1272,94 @@ def test_unowned_metered_key_reduces_member_pool_cost(service, settings) -> None
     assert dashboard["totals"]["global_rate"] == "3.000000"
     assert owned["user_rate"] == "3.000000"
     assert unowned["user_rate"] is None
+
+
+def test_upstream_oauth_fixed_cost_and_api_key_usage_are_combined(service, settings, monkeypatch) -> None:
+    create_owner(service, "oauth-user-key", 2, 0)
+    create_owner(service, "api-user-key", 3, 0)
+    insert_event(
+        settings,
+        cpamp_key_hash("oauth-user-key"),
+        1000,
+        event_hash="oauth-channel",
+        input_tokens=1_000_000,
+        output_tokens=0,
+        cached_tokens=0,
+        auth_index="oauth-auth",
+    )
+    insert_event(
+        settings,
+        cpamp_key_hash("api-user-key"),
+        2000,
+        event_hash="api-channel",
+        input_tokens=2_000_000,
+        output_tokens=0,
+        cached_tokens=0,
+        auth_index="api-auth",
+    )
+    service.sync_cpamp()
+    service.rate_events()
+    monkeypatch.setattr(service.cpa, "auth_files", lambda: [{
+        "id": "oauth-account",
+        "auth_index": "oauth-auth",
+        "account_type": "oauth",
+        "name": "Team OAuth",
+    }, {
+        "id": "api-account",
+        "auth_index": "api-auth",
+        "account_type": "api-key",
+        "name": "Paid API",
+    }])
+
+    service.create_cycle(
+        "upstream-costs",
+        "1970-01-01T08:00",
+        "1970-01-02T08:00",
+        0,
+        upstream_costs=[
+            {"account_id": "oauth-account", "fixed_cost_cents": 1000, "rate_ppm": None},
+            {"account_id": "api-account", "fixed_cost_cents": None, "rate_ppm": 7_000_000},
+        ],
+    )
+
+    dashboard = service.dashboard("upstream-costs")
+    api_cost = next(item for item in dashboard["upstream_costs"] if item["account_id"] == "api-account")
+    expected_dynamic_cents = (
+        api_cost["actual_nano_usd"] * 7_000_000 * 100 + NANO_USD * 1_000_000 // 2
+    ) // (NANO_USD * 1_000_000)
+    assert dashboard["billing_model"] == "upstream_channels"
+    assert api_cost["amount_cents"] == expected_dynamic_cents
+    assert dashboard["totals"]["fixed_cost"] == "10.00"
+    assert dashboard["totals"]["metered_amount"] == f"{expected_dynamic_cents / 100:,.2f}"
+    assert sum(row["amount_cents"] for row in dashboard["rows"] if not row["unowned"]) == 1000 + expected_dynamic_cents
+    with service.db.session() as session:
+        snapshots = list(session.scalars(select(CycleUpstreamCost)))
+    assert {(item.account_id, item.auth_type) for item in snapshots} == {
+        ("oauth-account", "oauth"),
+        ("api-account", "api_key"),
+    }
+    monkeypatch.setattr(service.cpa, "auth_files", lambda: [{
+        "id": "api-account",
+        "auth_index": "api-auth",
+        "account_type": "api-key",
+        "name": "Paid API",
+    }])
+    with service.db.session() as session:
+        cycle = session.scalar(select(BillingCycle).where(BillingCycle.name == "upstream-costs"))
+        gradient_id = cycle.gradient_rule_id
+    service.configure_cycle(
+        "upstream-costs",
+        gradient_id,
+        [],
+        "update retained account snapshot",
+        upstream_costs=[
+            {"account_id": "oauth-account", "fixed_cost_cents": 1200, "rate_ppm": None},
+            {"account_id": "api-account", "fixed_cost_cents": None, "rate_ppm": 8_000_000},
+        ],
+    )
+    configured = service.admin_snapshot()["cycles"][0]
+    assert {item["account_id"] for item in configured["upstream_costs"]} == {"oauth-account", "api-account"}
+    assert "oauth-auth" not in json.dumps(service.admin_snapshot())
 
 
 def test_cpa_key_sync_restores_owned_key_status(service, monkeypatch) -> None:

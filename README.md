@@ -2,6 +2,8 @@
 
 CPAMP-backed monthly cost allocation, global Telegram-user dashboard, API-Key login, and Telegram registration. The Web console uses Vue 3, Vuetify 3, and ECharts; FastAPI exposes JSON APIs and serves the compiled SPA.
 
+New billing cycles snapshot CPA's active upstream authentication channels. Each OAuth account contributes a fixed CNY cost for the cycle; each upstream API-key channel contributes its rated USD usage multiplied by its configured CNY/USD rate. These channel costs are combined per resource pool and allocated with the cycle's existing gradient rule. Legacy cycles retain their original pool-fixed-cost snapshot until an administrator explicitly migrates an open cycle.
+
 ## Web authentication
 
 - `/login` accepts only API Keys registered through the Telegram bot. These sessions never receive administrator permissions.

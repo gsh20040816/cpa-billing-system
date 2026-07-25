@@ -3,8 +3,9 @@ from __future__ import annotations
 import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 
-from cpa_billing.models import APIKey, KeyOwnershipPeriod, TelegramUser
+from cpa_billing.models import APIKey, CycleUpstreamCost, KeyOwnershipPeriod, TelegramUser
 from cpa_billing.security import cpamp_key_hash, login_fingerprint, mask_api_key
 from cpa_billing.web import LoginLimiter, create_app
 
@@ -403,6 +404,62 @@ def test_admin_billing_rule_and_key_profile_endpoints(settings, monkeypatch) -> 
     admin_snapshot = client.get("/api/admin/snapshot").json()["admin"]
     assert admin_snapshot["pricing_rules"]["active_version"]["name"] == "manual-web"
     assert next(item for item in admin_snapshot["pricing_rules"]["models"] if item["model"] == "gpt-test")["default"]["input"]["usd_per_million"] == "2"
+
+
+def test_admin_creates_cycle_with_upstream_channel_costs(settings, monkeypatch) -> None:
+    app = create_app(settings)
+    accounts = [{
+        "id": "oauth-account",
+        "name": "OAuth account",
+        "auth_type": "oauth",
+    }, {
+        "id": "api-account",
+        "name": "API account",
+        "auth_type": "api_key",
+    }]
+    monkeypatch.setattr(app.state.service, "accounts_snapshot", lambda: {
+        "accounts": accounts,
+        "inspection": {},
+    })
+    monkeypatch.setattr(app.state.service.cpa, "auth_files", lambda: [{
+        "id": "oauth-account",
+        "auth_index": "oauth-auth",
+        "account_type": "oauth",
+        "name": "OAuth account",
+    }, {
+        "id": "api-account",
+        "auth_index": "api-auth",
+        "account_type": "api_key",
+        "name": "API account",
+    }])
+    client = TestClient(app, base_url="https://billing.example")
+    login = client.post("/auth/admin/login", json={"management_token": settings.admin_token})
+    headers = {"X-CSRF-Token": login.json()["csrf_token"]}
+    gradient_id = client.get("/api/admin/snapshot").json()["admin"]["gradients"][0]["id"]
+
+    response = client.post(
+        "/api/admin/cycles",
+        headers=headers,
+        json={
+            "name": "upstream-web",
+            "start": "1970-01-01T08:00",
+            "end": "1970-01-02T08:00",
+            "gradient_rule_id": gradient_id,
+            "upstream_costs": [
+                {"account_id": "oauth-account", "fixed_cost": "12.34", "rate": None},
+                {"account_id": "api-account", "fixed_cost": None, "rate": "7.123456"},
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    with app.state.service.db.session() as session:
+        rows = list(session.scalars(select(CycleUpstreamCost).order_by(CycleUpstreamCost.account_id)))
+    assert [(row.account_id, row.fixed_cost_cents, row.rate_ppm) for row in rows] == [
+        ("api-account", None, 7_123_456),
+        ("oauth-account", 1234, None),
+    ]
+    assert "oauth-auth" not in client.get("/api/admin/snapshot").text
 
 
 def test_admin_can_add_exact_manual_usage_with_independent_auth_and_csrf(settings, monkeypatch) -> None:

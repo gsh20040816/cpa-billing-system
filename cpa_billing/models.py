@@ -271,6 +271,22 @@ class CyclePoolCost(Base):
     fixed_cost_cents: Mapped[int] = mapped_column(BigInteger)
 
 
+class CycleUpstreamCost(Base):
+    __tablename__ = "cycle_upstream_costs"
+    __table_args__ = (UniqueConstraint("cycle_id", "auth_index"),)
+    cycle_id: Mapped[int] = mapped_column(ForeignKey("billing_cycles.id"), primary_key=True)
+    account_id: Mapped[str] = mapped_column(String(200), primary_key=True)
+    auth_index: Mapped[str] = mapped_column(String(160))
+    account_name: Mapped[str] = mapped_column(String(200))
+    auth_type: Mapped[str] = mapped_column(String(20))
+    fixed_cost_cents: Mapped[int | None] = mapped_column(BigInteger)
+    rate_ppm: Mapped[int | None] = mapped_column(BigInteger)
+    request_count: Mapped[int | None] = mapped_column(BigInteger)
+    token_count: Mapped[int | None] = mapped_column(BigInteger)
+    actual_weight_nano_usd: Mapped[int | None] = mapped_column(BigInteger)
+    amount_cents: Mapped[int | None] = mapped_column(BigInteger)
+
+
 class Statement(Base):
     __tablename__ = "statements"
     __table_args__ = (UniqueConstraint("cycle_id", "telegram_user_id"),)

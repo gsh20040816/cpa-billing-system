@@ -19,10 +19,10 @@ const tab = ref('overview')
 const snackbar = reactive({ show: false, text: '', color: 'success' })
 
 const cycleDialog = reactive({
-  open: false, name: '', start: '', end: '', gradient_rule_id: null, pool_costs: {}, waiver: '',
+  open: false, name: '', start: '', end: '', gradient_rule_id: null, upstream_costs: {}, waiver: '',
 })
 const cycleConfigDialog = reactive({
-  open: false, cycle: null, gradient_rule_id: null, pool_costs: {}, reason: '',
+  open: false, cycle: null, gradient_rule_id: null, upstream_costs: {}, reason: '',
 })
 const closeDialog = reactive({ open: false, cycle: null, confirm_close: false, confirm_waiver: false })
 const adjustmentDialog = reactive({ open: false, cycle: '', telegram_user_id: '', amount_cents: '', reason: '' })
@@ -63,6 +63,21 @@ const reconciliation = computed(() => data.value?.reconciliation || {})
 const admin = computed(() => data.value?.admin || {})
 const activeGradients = computed(() => (admin.value.gradients || []).filter((item) => item.active))
 const activePools = computed(() => (admin.value.pools || []).filter((item) => item.active))
+const upstreamAccounts = computed(() => (data.value?.accounts?.accounts || []).filter((item) => !item.disabled))
+const cycleConfigAccounts = computed(() => {
+  const accounts = [...upstreamAccounts.value]
+  const known = new Set(accounts.map((item) => item.id))
+  for (const item of cycleConfigDialog.cycle?.upstream_costs || []) {
+    if (!known.has(item.account_id)) {
+      accounts.push({
+        id: item.account_id,
+        name: `${item.account_name}（账期快照）`,
+        auth_type: item.auth_type,
+      })
+    }
+  }
+  return accounts
+})
 const openCycles = computed(() => (admin.value.cycles || []).filter((item) => item.status !== 'closed'))
 const registeredUsers = computed(() => (admin.value.users || []).filter((item) => item.registered))
 const pricingModels = computed(() => {
@@ -140,18 +155,25 @@ async function resetQuota() {
   if (result) resetQuotaDialog.open = false
 }
 
-function initializePoolCosts(target, existing = []) {
-  target.pool_costs = {}
-  activePools.value.forEach((pool) => {
-    const current = existing.find((item) => item.pool_id === pool.id)
-    target.pool_costs[pool.id] = current?.fixed_cost || '0.00'
+function isUpstreamApiKey(account) {
+  return ['api_key', 'api-key', 'apikey', 'key'].includes(String(account.auth_type || '').toLowerCase())
+}
+
+function initializeUpstreamCosts(target, existing = [], accounts = upstreamAccounts.value) {
+  target.upstream_costs = {}
+  accounts.forEach((account) => {
+    const current = existing.find((item) => item.account_id === account.id)
+    target.upstream_costs[account.id] = isUpstreamApiKey(account)
+      ? (current?.rate || '0')
+      : (current?.fixed_cost || '0.00')
   })
 }
 
-function poolCostsPayload(target) {
-  return activePools.value.map((pool) => ({
-    pool_id: pool.id,
-    fixed_cost: String(target.pool_costs[pool.id] || '0'),
+function upstreamCostsPayload(target, accounts = upstreamAccounts.value) {
+  return accounts.map((account) => ({
+    account_id: account.id,
+    fixed_cost: isUpstreamApiKey(account) ? null : String(target.upstream_costs[account.id] || '0'),
+    rate: isUpstreamApiKey(account) ? String(target.upstream_costs[account.id] || '0') : null,
   }))
 }
 
@@ -164,7 +186,7 @@ function openCreateCycle() {
     gradient_rule_id: activeGradients.value[0]?.id || null,
     waiver: '',
   })
-  initializePoolCosts(cycleDialog)
+  initializeUpstreamCosts(cycleDialog)
 }
 
 async function createCycle() {
@@ -174,7 +196,7 @@ async function createCycle() {
     end: cycleDialog.end,
     fixed_cost: '0',
     gradient_rule_id: cycleDialog.gradient_rule_id,
-    pool_costs: poolCostsPayload(cycleDialog),
+    upstream_costs: upstreamCostsPayload(cycleDialog),
     waiver: cycleDialog.waiver || null,
   }, '账期已创建')
   if (result) cycleDialog.open = false
@@ -187,14 +209,14 @@ function openCycleConfig(cycle) {
     gradient_rule_id: cycle.gradient_rule_id,
     reason: '',
   })
-  initializePoolCosts(cycleConfigDialog, cycle.pool_costs || [])
+  initializeUpstreamCosts(cycleConfigDialog, cycle.upstream_costs || [], cycleConfigAccounts.value)
 }
 
 async function saveCycleConfig() {
   const cycle = cycleConfigDialog.cycle
   const result = await mutate(`/api/admin/cycles/${encodeURIComponent(cycle.name)}/configuration`, {
     gradient_rule_id: cycleConfigDialog.gradient_rule_id,
-    pool_costs: poolCostsPayload(cycleConfigDialog),
+    upstream_costs: upstreamCostsPayload(cycleConfigDialog, cycleConfigAccounts.value),
     reason: cycleConfigDialog.reason,
   }, '账期计费配置已更新', 'PUT')
   if (result) cycleConfigDialog.open = false
@@ -554,14 +576,22 @@ const autoRefresh = useAutoRefresh((silent) => load(silent), { interval: 30_000 
             </div>
             <div class="section-band__body section-band__body--flush">
               <v-table density="compact">
-                <thead><tr><th>名称</th><th>时间</th><th>价格版本</th><th>梯度规则</th><th>资源池成本</th><th>状态</th><th class="text-right">操作</th></tr></thead>
+                <thead><tr><th>名称</th><th>时间</th><th>价格版本</th><th>梯度规则</th><th>上游渠道成本</th><th>状态</th><th class="text-right">操作</th></tr></thead>
                 <tbody>
                   <tr v-for="item in admin.cycles || []" :key="item.name">
                     <td><div class="mono">{{ item.name }}</div><div v-if="item.waiver" class="data-muted text-caption admin-wrap">{{ item.waiver }}</div></td>
                     <td><div>{{ item.start }}</div><div class="data-muted text-caption">至 {{ item.end }}</div></td>
                     <td>{{ item.pricing_version || '-' }}</td>
                     <td>{{ item.gradient_rule || '-' }}</td>
-                    <td><div v-for="cost in item.pool_costs" :key="cost.pool_id">{{ cost.pool }} <span class="mono">{{ money(cost.fixed_cost, '¥') }}</span></div></td>
+                    <td>
+                      <template v-if="item.upstream_costs?.length">
+                        <div v-for="cost in item.upstream_costs" :key="cost.account_id">
+                          {{ cost.account_name }}
+                          <span class="mono">{{ cost.auth_type === 'api_key' ? `${cost.rate} ¥/USD` : money(cost.fixed_cost, '¥') }}</span>
+                        </div>
+                      </template>
+                      <div v-else v-for="cost in item.pool_costs" :key="cost.pool_id">{{ cost.pool }} <span class="mono">{{ money(cost.fixed_cost, '¥') }}</span></div>
+                    </td>
                     <td><v-chip :color="item.status === 'closed' ? 'default' : 'primary'" variant="tonal">{{ item.status }}</v-chip></td>
                     <td class="text-right admin-actions">
                       <template v-if="item.status !== 'closed'">
@@ -773,11 +803,11 @@ const autoRefresh = useAutoRefresh((silent) => load(silent), { interval: 30_000 
     </v-dialog>
 
     <v-dialog v-model="cycleDialog.open" max-width="760">
-      <v-card><v-card-title>创建账期</v-card-title><v-card-text><div class="dialog-grid"><v-text-field v-model="cycleDialog.name" label="名称" /><v-select v-model="cycleDialog.gradient_rule_id" :items="activeGradients" item-title="name" item-value="id" label="梯度规则" /><v-text-field v-model="cycleDialog.start" label="开始时间" type="datetime-local" /><v-text-field v-model="cycleDialog.end" label="结束时间" type="datetime-local" /><div class="dialog-wide pool-cost-editor"><div class="editor-label">资源池固定成本（人民币）</div><v-text-field v-for="pool in activePools" :key="pool.id" v-model="cycleDialog.pool_costs[pool.id]" :label="pool.name" type="number" min="0" step="0.01" prefix="¥" /></div><v-textarea v-model="cycleDialog.waiver" label="数据质量说明" rows="2" class="dialog-wide" /></div></v-card-text><v-card-actions><v-spacer /><v-btn variant="text" @click="cycleDialog.open = false">取消</v-btn><v-btn color="primary" :loading="mutating" @click="createCycle"><Save :size="16" class="mr-2" />创建</v-btn></v-card-actions></v-card>
+      <v-card><v-card-title>创建账期</v-card-title><v-card-text><div class="dialog-grid"><v-text-field v-model="cycleDialog.name" label="名称" /><v-select v-model="cycleDialog.gradient_rule_id" :items="activeGradients" item-title="name" item-value="id" label="梯度规则" /><v-text-field v-model="cycleDialog.start" label="开始时间" type="datetime-local" /><v-text-field v-model="cycleDialog.end" label="结束时间" type="datetime-local" /><div class="dialog-wide pool-cost-editor"><div class="editor-label">上游渠道成本</div><div class="data-muted text-caption mb-3">OAuth 按账号填写账期固定成本；API key 按渠道填写人民币 / USD 费率，实际消耗会动态加入成本。</div><v-alert v-if="!upstreamAccounts.length" type="warning" variant="tonal">CPA 当前未返回可配置的上游账号，不能创建新成本模型账期。</v-alert><v-text-field v-for="account in upstreamAccounts" :key="account.id" v-model="cycleDialog.upstream_costs[account.id]" :label="account.name" type="number" min="0" :step="isUpstreamApiKey(account) ? 0.000001 : 0.01" :prefix="isUpstreamApiKey(account) ? undefined : '¥'" :suffix="isUpstreamApiKey(account) ? '¥ / USD' : '固定 / 账期'" /></div><v-textarea v-model="cycleDialog.waiver" label="数据质量说明" rows="2" class="dialog-wide" /></div></v-card-text><v-card-actions><v-spacer /><v-btn variant="text" @click="cycleDialog.open = false">取消</v-btn><v-btn color="primary" :loading="mutating" :disabled="!upstreamAccounts.length" @click="createCycle"><Save :size="16" class="mr-2" />创建</v-btn></v-card-actions></v-card>
     </v-dialog>
 
     <v-dialog v-model="cycleConfigDialog.open" max-width="680">
-      <v-card><v-card-title>配置账期 {{ cycleConfigDialog.cycle?.name }}</v-card-title><v-card-text><v-select v-model="cycleConfigDialog.gradient_rule_id" :items="activeGradients" item-title="name" item-value="id" label="梯度规则" /><div class="pool-cost-editor mt-4"><div class="editor-label">资源池固定成本（人民币）</div><v-text-field v-for="pool in activePools" :key="pool.id" v-model="cycleConfigDialog.pool_costs[pool.id]" :label="pool.name" type="number" min="0" step="0.01" prefix="¥" /></div><v-textarea v-model="cycleConfigDialog.reason" label="修改原因" rows="2" class="mt-4" /></v-card-text><v-card-actions><v-spacer /><v-btn variant="text" @click="cycleConfigDialog.open = false">取消</v-btn><v-btn color="primary" :loading="mutating" @click="saveCycleConfig"><Save :size="16" class="mr-2" />保存配置</v-btn></v-card-actions></v-card>
+      <v-card><v-card-title>配置账期 {{ cycleConfigDialog.cycle?.name }}</v-card-title><v-card-text><v-select v-model="cycleConfigDialog.gradient_rule_id" :items="activeGradients" item-title="name" item-value="id" label="梯度规则" /><div class="pool-cost-editor mt-4"><div class="editor-label">上游渠道成本</div><div class="data-muted text-caption mb-3">保存后会冻结账号身份与费率快照，并重新计算开放账期。</div><v-alert v-if="cycleConfigDialog.cycle?.billing_model === 'legacy_pool_fixed'" type="info" variant="tonal" class="mb-3">该账期仍使用旧资源池固定成本；本次保存会迁移到上游渠道成本模型。</v-alert><v-text-field v-for="account in cycleConfigAccounts" :key="account.id" v-model="cycleConfigDialog.upstream_costs[account.id]" :label="account.name" type="number" min="0" :step="isUpstreamApiKey(account) ? 0.000001 : 0.01" :prefix="isUpstreamApiKey(account) ? undefined : '¥'" :suffix="isUpstreamApiKey(account) ? '¥ / USD' : '固定 / 账期'" /></div><v-textarea v-model="cycleConfigDialog.reason" label="修改原因" rows="2" class="mt-4" /></v-card-text><v-card-actions><v-spacer /><v-btn variant="text" @click="cycleConfigDialog.open = false">取消</v-btn><v-btn color="primary" :loading="mutating" :disabled="!cycleConfigAccounts.length" @click="saveCycleConfig"><Save :size="16" class="mr-2" />保存配置</v-btn></v-card-actions></v-card>
     </v-dialog>
 
     <v-dialog v-model="gradientDialog.open" max-width="820">

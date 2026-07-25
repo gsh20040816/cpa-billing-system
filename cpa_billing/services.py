@@ -44,6 +44,7 @@ from .models import (
     BillingCycle,
     CPAMPSource,
     CyclePoolCost,
+    CycleUpstreamCost,
     DeadLetter,
     GradientRule,
     GroupMembership,
@@ -427,9 +428,11 @@ def _metered_amount_cents(actual_nano_usd: int, multiplier_ppm: int) -> int:
 class CycleEstimate:
     user_lines: dict[int, list[tuple[int, int, int, int]]]
     metered_keys: list[dict[str, Any]]
+    upstream_costs: list[dict[str, Any]]
     pool_totals: list[dict[str, Any]]
     adjustments: dict[int, int]
     generated_at_ms: int
+    billing_model: str
 
 
 class BillingService:
@@ -2052,32 +2055,97 @@ class BillingService:
         tiers = parse_tiers(json.loads(cycle.tiers_json))
         metered_by_pool: dict[int, list[dict[str, Any]]] = defaultdict(list)
         metered_keys: list[dict[str, Any]] = []
-        for pool_id, key_hash, requests, tokens, actual in unowned_usage:
-            key = key_by_hash.get(str(key_hash or ""))
-            if key is None or key.billing_multiplier_ppm is None:
-                continue
-            amount = _metered_amount_cents(int(actual or 0), int(key.billing_multiplier_ppm))
-            item = {
-                "pool_id": int(pool_id),
-                "pool": pools.get(int(pool_id), str(pool_id)),
-                "key_id": key.id,
-                "masked": key.masked_value,
-                "name": key.display_name,
-                "requests": int(requests or 0),
-                "tokens": int(tokens or 0),
-                "actual_nano_usd": int(actual or 0),
-                "multiplier_ppm": int(key.billing_multiplier_ppm),
-                "amount_cents": amount,
-            }
-            metered_by_pool[int(pool_id)].append(item)
-            metered_keys.append(item)
+        upstream_rows = list(session.scalars(
+            select(CycleUpstreamCost).where(CycleUpstreamCost.cycle_id == cycle.id)
+        ))
+        upstream_costs: list[dict[str, Any]] = []
+        upstream_fixed_by_pool: dict[int, int] = defaultdict(int)
+        upstream_dynamic_by_pool: dict[int, int] = defaultdict(int)
+        if upstream_rows:
+            usage_by_auth: dict[str, dict[int, dict[str, int]]] = defaultdict(dict)
+            for auth_index, pool_id, requests, tokens, actual in session.execute(
+                select(
+                    RawUsageEvent.auth_index,
+                    RatedEvent.pool_id,
+                    func.count(RatedEvent.id),
+                    func.sum(RawUsageEvent.total_tokens),
+                    func.sum(RatedEvent.rated_weight_nano_usd),
+                )
+                .join(RawUsageEvent, RawUsageEvent.id == RatedEvent.raw_event_id)
+                .where(*period, RatedEvent.pool_id.is_not(None), RawUsageEvent.auth_index.is_not(None))
+                .group_by(RawUsageEvent.auth_index, RatedEvent.pool_id)
+            ):
+                usage_by_auth[str(auth_index)][int(pool_id)] = {
+                    "requests": int(requests or 0),
+                    "tokens": int(tokens or 0),
+                    "actual_nano_usd": int(actual or 0),
+                }
+
+            default_pool_id = next((pool_id for pool_id, name in pools.items() if name == "default-cpa"), None)
+            for row in upstream_rows:
+                by_pool = usage_by_auth.get(row.auth_index, {})
+                total_actual = sum(item["actual_nano_usd"] for item in by_pool.values())
+                total_requests = sum(item["requests"] for item in by_pool.values())
+                total_tokens = sum(item["tokens"] for item in by_pool.values())
+                if row.auth_type == "oauth":
+                    amount = int(row.fixed_cost_cents or 0)
+                    weights = {pool_id: item["actual_nano_usd"] for pool_id, item in by_pool.items()}
+                    if not any(weights.values()) and default_pool_id is not None:
+                        weights = {default_pool_id: 1}
+                    allocated = largest_remainder(amount, weights)
+                else:
+                    amount = _metered_amount_cents(total_actual, int(row.rate_ppm or 0))
+                    allocated = largest_remainder(
+                        amount,
+                        {pool_id: item["actual_nano_usd"] for pool_id, item in by_pool.items()},
+                    )
+                for pool_id, pool_amount in allocated.items():
+                    costs[pool_id] = costs.get(pool_id, 0) + pool_amount
+                    target = upstream_fixed_by_pool if row.auth_type == "oauth" else upstream_dynamic_by_pool
+                    target[pool_id] += pool_amount
+                upstream_costs.append({
+                    "account_id": row.account_id,
+                    "account_name": row.account_name,
+                    "auth_type": row.auth_type,
+                    "fixed_cost_cents": row.fixed_cost_cents,
+                    "rate_ppm": row.rate_ppm,
+                    "requests": total_requests,
+                    "tokens": total_tokens,
+                    "actual_nano_usd": total_actual,
+                    "amount_cents": amount,
+                })
+        else:
+            for pool_id, key_hash, requests, tokens, actual in unowned_usage:
+                key = key_by_hash.get(str(key_hash or ""))
+                if key is None or key.billing_multiplier_ppm is None:
+                    continue
+                amount = _metered_amount_cents(int(actual or 0), int(key.billing_multiplier_ppm))
+                item = {
+                    "pool_id": int(pool_id),
+                    "pool": pools.get(int(pool_id), str(pool_id)),
+                    "key_id": key.id,
+                    "masked": key.masked_value,
+                    "name": key.display_name,
+                    "requests": int(requests or 0),
+                    "tokens": int(tokens or 0),
+                    "actual_nano_usd": int(actual or 0),
+                    "multiplier_ppm": int(key.billing_multiplier_ppm),
+                    "amount_cents": amount,
+                }
+                metered_by_pool[int(pool_id)].append(item)
+                metered_keys.append(item)
 
         user_lines: dict[int, list[tuple[int, int, int, int]]] = defaultdict(list)
         pool_totals: list[dict[str, Any]] = []
         for pool_id in sorted(costs.keys() | pool_users.keys() | metered_by_pool.keys()):
-            fixed = int(costs.get(pool_id, 0))
-            metered = sum(item["amount_cents"] for item in metered_by_pool.get(pool_id, []))
-            residual = max(0, fixed - metered)
+            if upstream_rows:
+                fixed = upstream_fixed_by_pool.get(pool_id, 0)
+                metered = upstream_dynamic_by_pool.get(pool_id, 0)
+                residual = int(costs.get(pool_id, 0))
+            else:
+                fixed = int(costs.get(pool_id, 0))
+                metered = sum(item["amount_cents"] for item in metered_by_pool.get(pool_id, []))
+                residual = max(0, fixed - metered)
             users = pool_users.get(pool_id, {})
             billed = {uid: tiered_weight(weight, tiers) for uid, weight in users.items()}
             if strict and residual and not any(weight > 0 for weight in billed.values()):
@@ -2093,7 +2161,7 @@ class BillingService:
                 "metered_amount_cents": metered,
                 "residual_cost_cents": residual,
                 "member_amount_cents": member_amount,
-                "surplus_cents": max(0, metered - fixed),
+                "surplus_cents": 0 if upstream_rows else max(0, metered - fixed),
                 "unallocated_cents": max(0, residual - member_amount),
             })
         adjustments: dict[int, int] = defaultdict(int)
@@ -2102,9 +2170,11 @@ class BillingService:
         return CycleEstimate(
             user_lines=dict(user_lines),
             metered_keys=sorted(metered_keys, key=lambda item: (item["amount_cents"], item["actual_nano_usd"]), reverse=True),
+            upstream_costs=sorted(upstream_costs, key=lambda item: item["amount_cents"], reverse=True),
             pool_totals=pool_totals,
             adjustments=dict(adjustments),
             generated_at_ms=now_ms(),
+            billing_model="upstream_channels" if upstream_rows else "legacy_pool_fixed",
         )
 
     def _persist_cycle_estimate(self, session: Any, cycle: BillingCycle, estimate: CycleEstimate) -> None:
@@ -2112,6 +2182,13 @@ class BillingService:
         session.execute(delete(StatementLine).where(StatementLine.statement_id.in_(statement_ids)))
         session.execute(delete(Statement).where(Statement.cycle_id == cycle.id))
         session.execute(delete(MeteredKeyCharge).where(MeteredKeyCharge.cycle_id == cycle.id))
+        upstream_by_id = {item["account_id"]: item for item in estimate.upstream_costs}
+        for row in session.scalars(select(CycleUpstreamCost).where(CycleUpstreamCost.cycle_id == cycle.id)):
+            item = upstream_by_id.get(row.account_id)
+            row.request_count = None if item is None else item["requests"]
+            row.token_count = None if item is None else item["tokens"]
+            row.actual_weight_nano_usd = None if item is None else item["actual_nano_usd"]
+            row.amount_cents = None if item is None else item["amount_cents"]
         for user_id in estimate.user_lines.keys() | estimate.adjustments.keys():
             user_lines = estimate.user_lines.get(user_id, [])
             statement = Statement(
@@ -2190,7 +2267,8 @@ class BillingService:
             cycles = list(session.scalars(select(BillingCycle).order_by(BillingCycle.start_at_ms.desc())))
             if cycle is None:
                 return {"cycle": None, "cycles": [{"name": item.name, "status": item.status} for item in cycles],
-                        "rows": [], "models": [], "metered_keys": [], "pool_totals": [],
+                        "rows": [], "models": [], "metered_keys": [], "upstream_costs": [], "pool_totals": [],
+                        "billing_model": None,
                         "totals": {"requests": 0, "tokens": 0, "actual": "0.0000",
                                    "request_actual": "0.0000", "manual_actual": "0.0000", "billed": "0.0000",
                                    "member_amount": "0.00", "metered_amount": "0.00", "amount": "0.00",
@@ -2255,6 +2333,21 @@ class BillingService:
                     "multiplier_ppm": item.multiplier_ppm,
                     "amount_cents": item.amount_cents,
                 } for item in session.scalars(select(MeteredKeyCharge).where(MeteredKeyCharge.cycle_id == cycle.id))]
+                upstream_rows = list(session.scalars(
+                    select(CycleUpstreamCost).where(CycleUpstreamCost.cycle_id == cycle.id)
+                ))
+                billing_model = "upstream_channels" if upstream_rows else "legacy_pool_fixed"
+                upstream_costs = [{
+                    "account_id": item.account_id,
+                    "account_name": item.account_name,
+                    "auth_type": item.auth_type,
+                    "fixed_cost_cents": item.fixed_cost_cents,
+                    "rate_ppm": item.rate_ppm,
+                    "requests": int(item.request_count or 0),
+                    "tokens": int(item.token_count or 0),
+                    "actual_nano_usd": int(item.actual_weight_nano_usd or 0),
+                    "amount_cents": int(item.amount_cents or 0),
+                } for item in upstream_rows]
                 live_user = {
                     user_id: (statement.actual_weight_nano_usd, statement.billed_weight_nano_usd, statement.amount_cents)
                     for user_id, statement in statements.items()
@@ -2263,7 +2356,33 @@ class BillingService:
                     select(CyclePoolCost).where(CyclePoolCost.cycle_id == cycle.id)
                 )}
                 pool_totals = []
-                for pool_id, fixed in fixed_by_pool.items():
+                if upstream_rows:
+                    member_by_pool = {
+                        int(pool_id): int(amount or 0)
+                        for pool_id, amount in session.execute(
+                            select(StatementLine.pool_id, func.sum(StatementLine.amount_cents))
+                            .join(Statement, Statement.id == StatementLine.statement_id)
+                            .where(Statement.cycle_id == cycle.id)
+                            .group_by(StatementLine.pool_id)
+                        )
+                    }
+                    fixed_total = sum(int(item.fixed_cost_cents or 0) for item in upstream_rows)
+                    dynamic_total = sum(
+                        int(item.amount_cents or 0) for item in upstream_rows if item.auth_type == "api_key"
+                    )
+                    fixed_allocated = largest_remainder(fixed_total, member_by_pool)
+                    dynamic_allocated = largest_remainder(dynamic_total, member_by_pool)
+                    pool_totals = [{
+                        "pool_id": pool_id,
+                        "pool": pool_map.get(pool_id, str(pool_id)),
+                        "fixed_cost_cents": fixed_allocated.get(pool_id, 0),
+                        "metered_amount_cents": dynamic_allocated.get(pool_id, 0),
+                        "residual_cost_cents": amount,
+                        "member_amount_cents": amount,
+                        "surplus_cents": 0,
+                        "unallocated_cents": 0,
+                    } for pool_id, amount in member_by_pool.items()]
+                for pool_id, fixed in ([] if upstream_rows else fixed_by_pool.items()):
                     metered = sum(item["amount_cents"] for item in metered_keys if item["pool_id"] == pool_id)
                     member = sum(line.amount_cents for line in session.scalars(
                         select(StatementLine).join(Statement).where(
@@ -2292,8 +2411,10 @@ class BillingService:
                     live_user.setdefault(user_id, (0, 0, adjustment))
                 statements = {}
                 metered_keys = estimate.metered_keys
+                upstream_costs = estimate.upstream_costs
                 pool_totals = estimate.pool_totals
                 generated_at_ms = estimate.generated_at_ms
+                billing_model = estimate.billing_model
             key_counts = {owner_id: int(count or 0) for owner_id, count in session.execute(
                 select(APIKey.current_owner_id, func.count(APIKey.id))
                 .where(APIKey.status == "active", APIKey.current_owner_id.is_not(None))
@@ -2364,6 +2485,9 @@ class BillingService:
             ).all()
             member_amount_cents = sum(item["amount_cents"] for item in rows if not item["unowned"])
             metered_amount_cents = sum(item["amount_cents"] for item in metered_keys)
+            dynamic_amount_cents = sum(
+                item["amount_cents"] for item in upstream_costs if item["auth_type"] == "api_key"
+            )
             member_billed_nano_usd = sum(value[1] for value in live_user.values())
             unpriced_events = int(session.scalar(
                 select(func.count()).select_from(RawUsageEvent)
@@ -2398,6 +2522,16 @@ class BillingService:
                     "multiplier": format(Decimal(item["multiplier_ppm"]) / Decimal(1_000_000), "f"),
                     "amount": format_cents(item["amount_cents"]),
                 } for item in metered_keys],
+                "upstream_costs": [{
+                    **item,
+                    "actual": format_usd_nano(item["actual_nano_usd"]),
+                    "fixed_cost": None if item["fixed_cost_cents"] is None else format_cents(item["fixed_cost_cents"]),
+                    "rate": None if item["rate_ppm"] is None else format(
+                        Decimal(item["rate_ppm"]) / Decimal(1_000_000), "f"
+                    ),
+                    "amount": format_cents(item["amount_cents"]),
+                } for item in upstream_costs],
+                "billing_model": billing_model,
                 "pool_totals": [{
                     **item,
                     "fixed_cost": format_cents(item["fixed_cost_cents"]),
@@ -2415,8 +2549,10 @@ class BillingService:
                     "manual_actual": format_usd_nano(sum(item["manual_actual_nano"] for item in rows)),
                     "billed": format_usd_nano(sum(value[1] for value in live_user.values())),
                     "member_amount": format_cents(member_amount_cents),
-                    "metered_amount": format_cents(metered_amount_cents),
-                    "amount": format_cents(member_amount_cents + metered_amount_cents),
+                    "metered_amount": format_cents(dynamic_amount_cents if billing_model == "upstream_channels" else metered_amount_cents),
+                    "amount": format_cents(
+                        member_amount_cents if billing_model == "upstream_channels" else member_amount_cents + metered_amount_cents
+                    ),
                     "fixed_cost": format_cents(sum(item["fixed_cost_cents"] for item in pool_totals)),
                     "global_rate": format_yuan_per_usd(member_amount_cents, member_billed_nano_usd),
                 },
@@ -3084,10 +3220,27 @@ class BillingService:
                 select(PoolAssignmentRule).order_by(PoolAssignmentRule.priority, PoolAssignmentRule.id)
             ))
             costs = {}
+            upstream_costs: list[dict[str, Any]] = []
             if cycle:
                 costs = {row.pool_id: row.fixed_cost_cents for row in session.scalars(
                     select(CyclePoolCost).where(CyclePoolCost.cycle_id == cycle.id)
                 )}
+                configured_upstream = list(session.scalars(
+                    select(CycleUpstreamCost).where(CycleUpstreamCost.cycle_id == cycle.id)
+                ))
+                if configured_upstream:
+                    if cycle.status == "closed":
+                        upstream_costs = [{
+                            "account_id": item.account_id,
+                            "account_name": item.account_name,
+                            "auth_type": item.auth_type,
+                            "fixed_cost_cents": item.fixed_cost_cents,
+                            "rate_ppm": item.rate_ppm,
+                            "actual_nano_usd": int(item.actual_weight_nano_usd or 0),
+                            "amount_cents": int(item.amount_cents or 0),
+                        } for item in configured_upstream]
+                    else:
+                        upstream_costs = self._build_cycle_estimate(session, cycle, strict=False).upstream_costs
             tiers = json.loads(cycle.tiers_json) if cycle else DEFAULT_TIERS
             unpriced_filters: list[Any] = [RatedEvent.id.is_(None)]
             if cycle:
@@ -3136,6 +3289,16 @@ class BillingService:
                         "right_usd": None if item.get("right") is None else str(item["right"]),
                         "multiplier": str(item["multiplier"]),
                     } for item in tiers],
+                    "billing_model": "upstream_channels" if upstream_costs else "legacy_pool_fixed",
+                    "upstream_costs": [{
+                        **item,
+                        "fixed_cost": None if item["fixed_cost_cents"] is None else format_cents(item["fixed_cost_cents"]),
+                        "rate": None if item["rate_ppm"] is None else format(
+                            Decimal(item["rate_ppm"]) / Decimal(1_000_000), "f"
+                        ),
+                        "actual": format_usd_nano(item["actual_nano_usd"]),
+                        "amount": format_cents(item["amount_cents"]),
+                    } for item in upstream_costs],
                     "pools": [{
                         "id": pool.id,
                         "name": pool.name,
@@ -3154,8 +3317,10 @@ class BillingService:
                         "reasoning_is_output_subset": True,
                         "long_context_uses_total_input": True,
                         "unowned_keys_without_multiplier_are_billed": False,
-                        "unowned_metered_keys_use_cost_multiplier": True,
-                        "metered_keys_reduce_pool_fixed_cost_before_allocation": True,
+                        "unowned_metered_keys_use_cost_multiplier": not bool(upstream_costs),
+                        "metered_keys_reduce_pool_fixed_cost_before_allocation": not bool(upstream_costs),
+                        "oauth_accounts_use_fixed_cost": bool(upstream_costs),
+                        "upstream_api_keys_use_dynamic_rate": bool(upstream_costs),
                         "allocation_method": "largest_remainder",
                     },
                 },
@@ -4737,6 +4902,7 @@ class BillingService:
                 select(PoolAssignmentRule).order_by(PoolAssignmentRule.priority, PoolAssignmentRule.id)
             ))
             cycle_pool_costs: dict[int, list[dict[str, Any]]] = defaultdict(list)
+            cycle_upstream_costs: dict[int, list[dict[str, Any]]] = defaultdict(list)
             pool_map = {pool.id: pool for pool in pools}
             for item in session.scalars(select(CyclePoolCost).order_by(CyclePoolCost.cycle_id, CyclePoolCost.pool_id)):
                 cycle_pool_costs[item.cycle_id].append({
@@ -4748,6 +4914,22 @@ class BillingService:
             costs = {cycle_id: int(total or 0) for cycle_id, total in session.execute(
                 select(CyclePoolCost.cycle_id, func.sum(CyclePoolCost.fixed_cost_cents)).group_by(CyclePoolCost.cycle_id)
             )}
+            for item in session.scalars(select(CycleUpstreamCost).order_by(
+                CycleUpstreamCost.cycle_id, CycleUpstreamCost.account_name
+            )):
+                cycle_upstream_costs[item.cycle_id].append({
+                    "account_id": item.account_id,
+                    "account_name": item.account_name,
+                    "auth_type": item.auth_type,
+                    "fixed_cost_cents": item.fixed_cost_cents,
+                    "fixed_cost": None if item.fixed_cost_cents is None else format_cents(item.fixed_cost_cents),
+                    "rate_ppm": item.rate_ppm,
+                    "rate": None if item.rate_ppm is None else format(
+                        Decimal(item.rate_ppm) / Decimal(1_000_000), "f"
+                    ),
+                    "actual": None if item.actual_weight_nano_usd is None else format_usd_nano(item.actual_weight_nano_usd),
+                    "amount": None if item.amount_cents is None else format_cents(item.amount_cents),
+                })
             return {
                 "cycles": [{"id": cycle.id, "name": cycle.name, "start": self._format_timestamp(cycle.start_at_ms),
                             "end": self._format_timestamp(cycle.end_at_ms), "status": cycle.status,
@@ -4757,8 +4939,14 @@ class BillingService:
                             "gradient_rule_id": cycle.gradient_rule_id,
                             "gradient_rule": gradient_map[cycle.gradient_rule_id].name if cycle.gradient_rule_id in gradient_map else None,
                             "pool_costs": cycle_pool_costs.get(cycle.id, []),
-                            "fixed_cost_cents": costs.get(cycle.id, 0),
-                            "fixed_cost": format_cents(costs.get(cycle.id, 0))}
+                            "upstream_costs": cycle_upstream_costs.get(cycle.id, []),
+                            "billing_model": "upstream_channels" if cycle_upstream_costs.get(cycle.id) else "legacy_pool_fixed",
+                            "fixed_cost_cents": costs.get(cycle.id, 0) + sum(
+                                int(item["fixed_cost_cents"] or 0) for item in cycle_upstream_costs.get(cycle.id, [])
+                            ),
+                            "fixed_cost": format_cents(costs.get(cycle.id, 0) + sum(
+                                int(item["fixed_cost_cents"] or 0) for item in cycle_upstream_costs.get(cycle.id, [])
+                            ))}
                            for cycle in cycles],
                 "sync": [{"source": source.name, "last_event_id": checkpoint.last_event_id,
                           "last_event_at": self._format_timestamp(checkpoint.last_event_at_ms),
@@ -5322,10 +5510,114 @@ class BillingService:
                 reason=reason.strip(), created_at_ms=now_ms(),
             ))
 
+    @staticmethod
+    def _upstream_auth_type(item: dict[str, Any]) -> str:
+        value = str(item.get("account_type") or item.get("auth_type") or "oauth").strip().lower()
+        normalized = value.replace("-", "_").replace(" ", "_")
+        if normalized in {"api_key", "apikey", "key"}:
+            return "api_key"
+        if normalized in {"oauth", "oauth2"}:
+            return "oauth"
+        raise BillingError(f"不支持的 CPA 上游认证类型：{value or 'unknown'}")
+
+    def _resolve_upstream_costs(
+        self,
+        configs: list[dict[str, Any]],
+        existing: list[dict[str, Any]] | None = None,
+    ) -> list[dict[str, Any]]:
+        if not configs:
+            raise BillingError("至少需要配置一个上游账号成本")
+        try:
+            files = self.cpa.auth_files()
+        except (httpx.HTTPError, BillingError) as exc:
+            raise BillingDependencyError("CPA 上游账号服务不可用，无法冻结账期成本配置") from exc
+        by_id = {str(item.get("id") or ""): item for item in files if isinstance(item, dict)}
+        existing_ids: set[str] = set()
+        for item in existing or []:
+            account_id = str(item.get("id") or "")
+            if not account_id:
+                continue
+            existing_ids.add(account_id)
+            by_id.setdefault(account_id, item)
+        expected_ids = {
+            account_id for account_id, item in by_id.items()
+            if account_id and str(item.get("auth_index") or "").strip()
+            and not bool(item.get("disabled") or item.get("unavailable"))
+        }
+        configured_ids = {str(item.get("account_id") or "").strip() for item in configs}
+        missing = sorted(expected_ids - configured_ids)
+        if missing:
+            raise BillingError(f"以下有效上游账号尚未配置成本：{', '.join(missing)}")
+        resolved: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for config in configs:
+            account_id = str(config.get("account_id") or "").strip()
+            identity = by_id.get(account_id)
+            if not account_id or identity is None:
+                raise BillingError(f"CPA 上游账号不存在或已失效：{account_id or '-'}")
+            if account_id not in existing_ids and bool(identity.get("disabled") or identity.get("unavailable")):
+                raise BillingError(f"已停用的上游账号不能配置新账期成本：{account_id}")
+            if account_id in seen:
+                raise BillingError(f"上游账号成本重复配置：{account_id}")
+            seen.add(account_id)
+            auth_index = str(identity.get("auth_index") or "").strip()
+            if not auth_index:
+                raise BillingError(f"CPA 上游账号缺少 auth_index：{account_id}")
+            auth_type = self._upstream_auth_type(identity)
+            fixed_cost_cents = config.get("fixed_cost_cents")
+            rate_ppm = config.get("rate_ppm")
+            if auth_type == "oauth":
+                if rate_ppm is not None:
+                    raise BillingError(f"OAuth 账号不能配置 API key 费率：{account_id}")
+                if fixed_cost_cents is None or int(fixed_cost_cents) < 0:
+                    raise BillingError(f"OAuth 账号必须配置非负固定成本：{account_id}")
+                fixed_cost_cents, rate_ppm = int(fixed_cost_cents), None
+            else:
+                if fixed_cost_cents is not None:
+                    raise BillingError(f"API key 账号不能配置 OAuth 固定成本：{account_id}")
+                if rate_ppm is None or int(rate_ppm) < 0:
+                    raise BillingError(f"API key 账号必须配置非负人民币/USD 费率：{account_id}")
+                fixed_cost_cents, rate_ppm = None, int(rate_ppm)
+            resolved.append({
+                "account_id": account_id,
+                "auth_index": auth_index,
+                "account_name": str(
+                    identity.get("label") or identity.get("name") or identity.get("account")
+                    or identity.get("email") or f"上游账号 {account_id}"
+                )[:200],
+                "auth_type": auth_type,
+                "fixed_cost_cents": fixed_cost_cents,
+                "rate_ppm": rate_ppm,
+            })
+        return resolved
+
+    @staticmethod
+    def _audit_upstream_costs(items: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
+        if items is None:
+            return None
+        return [{key: value for key, value in item.items() if key != "auth_index"} for item in items]
+
     def configure_cycle(self, name: str, gradient_rule_id: int, pool_costs: list[dict[str, Any]],
-                        reason: str, operator_id: str = "admin-token") -> None:
+                        reason: str, operator_id: str = "admin-token",
+                        upstream_costs: list[dict[str, Any]] | None = None) -> None:
         if not reason.strip():
             raise BillingError("修改账期配置必须填写原因")
+        existing_upstream: list[dict[str, Any]] = []
+        if upstream_costs is not None:
+            with self.db.session() as session:
+                existing_cycle = session.scalar(select(BillingCycle).where(BillingCycle.name == name))
+                if existing_cycle is not None:
+                    existing_upstream = [{
+                        "id": item.account_id,
+                        "auth_index": item.auth_index,
+                        "account_type": item.auth_type,
+                        "name": item.account_name,
+                    } for item in session.scalars(select(CycleUpstreamCost).where(
+                        CycleUpstreamCost.cycle_id == existing_cycle.id
+                    ))]
+        resolved_upstream = None if upstream_costs is None else self._resolve_upstream_costs(
+            upstream_costs, existing_upstream
+        )
         normalized_costs: dict[int, int] = {}
         for item in pool_costs:
             pool_id = int(item.get("pool_id") or 0)
@@ -5350,23 +5642,34 @@ class BillingService:
             cycle.gradient_rule_id = rule.id
             cycle.tiers_json = rule.tiers_json
             session.execute(delete(CyclePoolCost).where(CyclePoolCost.cycle_id == cycle.id))
-            for pool_id, cents in normalized_costs.items():
-                session.add(CyclePoolCost(cycle_id=cycle.id, pool_id=pool_id, fixed_cost_cents=cents))
+            session.execute(delete(CycleUpstreamCost).where(CycleUpstreamCost.cycle_id == cycle.id))
+            if resolved_upstream is None:
+                for pool_id, cents in normalized_costs.items():
+                    session.add(CyclePoolCost(cycle_id=cycle.id, pool_id=pool_id, fixed_cost_cents=cents))
+            else:
+                for item in resolved_upstream:
+                    session.add(CycleUpstreamCost(cycle_id=cycle.id, **item))
             self._invalidate_cycle_previews(session, [cycle.id])
             session.add(AuditLog(
                 operator_type="web-admin", operator_id=operator_id, operation="cycle.configure",
                 target=cycle.name, before_json=json.dumps(before),
-                after_json=json.dumps({"gradient_rule_id": rule.id, "pool_costs": normalized_costs}),
+                after_json=json.dumps({
+                    "gradient_rule_id": rule.id,
+                    "pool_costs": normalized_costs if resolved_upstream is None else {},
+                    "upstream_costs": self._audit_upstream_costs(resolved_upstream),
+                }),
                 reason=reason.strip(), created_at_ms=now_ms(),
             ))
 
     def create_cycle(self, name: str, start: str, end: str, fixed_cost_cents: int, waiver: str | None = None,
                      gradient_rule_id: int | None = None, pool_costs: list[dict[str, Any]] | None = None,
-                     operator_type: str | None = None, operator_id: str | None = None) -> None:
+                     operator_type: str | None = None, operator_id: str | None = None,
+                     upstream_costs: list[dict[str, Any]] | None = None) -> None:
         if not re.fullmatch(r"[A-Za-z0-9._-]{1,80}", name):
             raise BillingError("cycle name must use letters, numbers, dot, underscore, or hyphen")
         if fixed_cost_cents < 0:
             raise BillingError("fixed cost cannot be negative")
+        resolved_upstream = None if upstream_costs is None else self._resolve_upstream_costs(upstream_costs)
         zone = ZoneInfo(self.settings.timezone)
         try:
             start_dt, end_dt = datetime.fromisoformat(start), datetime.fromisoformat(end)
@@ -5393,7 +5696,11 @@ class BillingService:
                                  tiers_json=gradient.tiers_json, data_quality_waiver=waiver, created_at_ms=now_ms())
             session.add(cycle)
             session.flush()
-            if pool_costs is None:
+            if resolved_upstream is not None:
+                normalized_costs = {}
+                for item in resolved_upstream:
+                    session.add(CycleUpstreamCost(cycle_id=cycle.id, **item))
+            elif pool_costs is None:
                 pool = session.scalar(select(ResourcePool).where(ResourcePool.name == "default-cpa"))
                 if pool is None:
                     raise BillingError("default pool is missing")
@@ -5408,5 +5715,6 @@ class BillingService:
                 session.add(AuditLog(operator_type=operator_type, operator_id=operator_id, operation="cycle.create", target=name,
                                      after_json=json.dumps({"start_at_ms": start_ms, "end_at_ms": end_ms,
                                                             "pool_costs": normalized_costs,
+                                                            "upstream_costs": self._audit_upstream_costs(resolved_upstream),
                                                             "gradient_rule_id": gradient.id,
                                                             "waiver": waiver}), created_at_ms=now_ms()))
