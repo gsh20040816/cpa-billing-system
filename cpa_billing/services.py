@@ -3043,10 +3043,18 @@ class BillingService:
                     for start_at_ms, end_at_ms, upstream in channel_snapshots.get(str(event.auth_index or ""), [])
                     if start_at_ms <= event.occurred_at_ms < end_at_ms
                 ), None)
-                channel_name = (
-                    channel_snapshot.account_name if channel_snapshot is not None
-                    else event.account_snapshot or event.source_label
-                )
+                source_label = str(event.source_label or "").strip()
+                source_is_api_key = source_label.startswith("m:")
+                channel_name = channel_snapshot.account_name if channel_snapshot is not None else event.account_snapshot
+                channel_auth_type = channel_snapshot.auth_type if channel_snapshot is not None else None
+                if not channel_name and source_label:
+                    channel_name = (
+                        f"{str(event.provider or '上游').title()} API key {source_label[2:]}"
+                        if source_is_api_key else source_label
+                    )
+                    channel_auth_type = "api_key" if source_is_api_key else None
+                elif channel_name and channel_snapshot is None and event.account_snapshot:
+                    channel_auth_type = "oauth"
                 item = {
                     "id": event.id,
                     "request_id": event.request_id,
@@ -3061,7 +3069,7 @@ class BillingService:
                     "key": key_payload,
                     "channel": {
                         "name": channel_name or "未记录",
-                        "auth_type": channel_snapshot.auth_type if channel_snapshot is not None else None,
+                        "auth_type": channel_auth_type,
                     },
                     "tokens": {
                         "input": event.input_tokens,
