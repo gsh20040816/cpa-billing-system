@@ -94,16 +94,42 @@ QUOTA_MODEL_ALIASES = {
     "codex_bengalfox": "gpt-5.3-codex-spark",
 }
 
-# CPAMP may append derived accounting columns to usage_events. Billing reads the
-# base event contract below, so additive derived columns must not halt syncing.
-CPAMP_DERIVED_SCHEMA_COLUMNS = (
-    "request_service_tier",
-    "response_service_tier",
-    "cache_input_mode",
-    "normalized_uncached_input_tokens",
-    "normalized_total_input_tokens",
-    "normalized_cache_read_tokens",
-    "normalized_cache_creation_tokens",
+# Fingerprint only the source fields that billing actually requires. CPAMP may
+# rebuild usage_events or append unrelated metadata without changing this read
+# contract; changes to a consumed field still stop the worker for review.
+CPAMP_USAGE_REQUIRED_COLUMNS = (
+    "id",
+    "event_hash",
+    "request_id",
+    "timestamp_ms",
+    "timestamp",
+    "provider",
+    "executor_type",
+    "model",
+    "requested_model",
+    "resolved_model",
+    "service_tier",
+    "api_key_hash",
+    "source_hash",
+    "source",
+    "account_snapshot",
+    "auth_index",
+    "input_tokens",
+    "output_tokens",
+    "reasoning_tokens",
+    "cached_tokens",
+    "cache_tokens",
+    "cache_read_tokens",
+    "cache_creation_tokens",
+    "total_tokens",
+    "failed",
+    "fail_status_code",
+    "latency_ms",
+    "ttft_ms",
+    "response_metadata_json",
+    "header_quota_used_percent",
+    "header_quota_recover_at_ms",
+    "header_quota_plan_type",
 )
 
 
@@ -573,18 +599,20 @@ class BillingService:
         return connection
 
     def _schema_fingerprint(self, connection: sqlite3.Connection) -> str:
-        row = connection.execute("select sql from sqlite_master where type='table' and name='usage_events'").fetchone()
-        if row is None:
+        exists = connection.execute(
+            "select 1 from sqlite_master where type='table' and name='usage_events'"
+        ).fetchone()
+        if exists is None:
             raise BillingError("CPAMP usage_events table is missing")
-        required = {"id", "event_hash", "timestamp_ms", "api_key_hash", "model", "input_tokens", "output_tokens"}
-        columns = {str(item[1]) for item in connection.execute("pragma table_info(usage_events)")}
-        missing = required - columns
+        columns = {
+            str(item[1]): str(item[2] or "").strip().upper()
+            for item in connection.execute("pragma table_info(usage_events)")
+        }
+        missing = set(CPAMP_USAGE_REQUIRED_COLUMNS) - columns.keys()
         if missing:
             raise BillingError("CPAMP schema missing columns: " + ", ".join(sorted(missing)))
-        schema_sql = str(row[0])
-        for column in CPAMP_DERIVED_SCHEMA_COLUMNS:
-            schema_sql = re.sub(rf",\s*{re.escape(column)}\s+[^,)]*", "", schema_sql)
-        return hashlib.sha256(schema_sql.encode()).hexdigest()
+        contract = [(name, columns[name]) for name in sorted(CPAMP_USAGE_REQUIRED_COLUMNS)]
+        return hashlib.sha256(json.dumps(contract, separators=(",", ":")).encode()).hexdigest()
 
     def _backfill_cpamp_reasoning_effort(
         self,
@@ -1318,8 +1346,7 @@ class BillingService:
 
     @staticmethod
     def _normalize_service_tier(value: str | None) -> str:
-        normalized = str(value or "").strip().lower()
-        return "priority" if normalized == "fast" else normalized
+        return str(value or "").strip().lower()
 
     @classmethod
     def _billing_service_tier(cls, event: RawUsageEvent) -> str:
@@ -1341,10 +1368,8 @@ class BillingService:
         response = func.lower(func.trim(func.coalesce(RawUsageEvent.response_service_tier, "")))
         stored = func.lower(func.trim(func.coalesce(RawUsageEvent.service_tier, "")))
         return case(
-            (requested.in_(("priority", "fast")), literal("priority")),
-            (response == "fast", literal("priority")),
+            (requested == "priority", literal("priority")),
             (response != "", response),
-            (stored == "fast", literal("priority")),
             (stored != "", stored),
             else_=literal("default"),
         )

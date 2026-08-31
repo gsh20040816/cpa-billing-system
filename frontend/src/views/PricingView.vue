@@ -17,7 +17,7 @@ const search = ref('')
 const tier = ref('default')
 const tiers = [
   { title: 'Default', value: 'default' },
-  { title: 'Priority / Fast', value: 'priority' },
+  { title: 'Priority', value: 'priority' },
   { title: 'Flex', value: 'flex' },
 ]
 

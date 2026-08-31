@@ -133,7 +133,7 @@ def test_sync_is_incremental_and_idempotent(service, settings) -> None:
         assert session.scalar(select(func.count()).select_from(RawUsageEvent)) == 1
 
 
-def test_sync_accepts_cpamp_derived_schema_columns(service, settings) -> None:
+def test_sync_accepts_unconsumed_cpamp_schema_changes(service, settings) -> None:
     insert_event(settings, "before-upgrade", 1000, event_hash="before-upgrade")
     assert service.sync_cpamp() == 1
 
@@ -146,6 +146,10 @@ def test_sync_accepts_cpamp_derived_schema_columns(service, settings) -> None:
         "normalized_total_input_tokens integer",
         "normalized_cache_read_tokens integer",
         "normalized_cache_creation_tokens integer",
+        "auth_account_id_snapshot text",
+        "client_ip text",
+        "x_forwarded_for text",
+        "user_agent text",
     ):
         db.execute(f"alter table usage_events add column {column}")
     db.commit()
@@ -155,6 +159,16 @@ def test_sync_accepts_cpamp_derived_schema_columns(service, settings) -> None:
     assert service.sync_cpamp() == 1
     with service.db.session() as session:
         assert session.scalar(select(func.count()).select_from(RawUsageEvent)) == 2
+
+
+def test_sync_rejects_missing_consumed_cpamp_column(service, settings) -> None:
+    db = sqlite3.connect(settings.cpamp_database_path)
+    db.execute("alter table usage_events rename column model to removed_model")
+    db.commit()
+    db.close()
+
+    with pytest.raises(BillingError, match="CPAMP schema missing columns: model"):
+        service.sync_cpamp()
 
 
 def test_request_priority_provenance_overrides_default_response(service, settings) -> None:
@@ -295,7 +309,7 @@ def test_priority_and_long_context_combine(service, settings) -> None:
         input_tokens=300000,
         cached_tokens=0,
         output_tokens=10,
-        tier="fast",
+        tier="priority",
         model="gpt-5.6-luna",
     )
     service.sync_cpamp(); service.rate_events()
@@ -307,6 +321,25 @@ def test_priority_and_long_context_combine(service, settings) -> None:
         assert detail["rates"][0] == 4000
 
 
+def test_fast_service_tier_is_preserved_from_cpamp(service, settings) -> None:
+    create_owner(service, "key", 2, 0)
+    insert_event(
+        settings,
+        cpamp_key_hash("key"),
+        1000,
+        input_tokens=100,
+        cached_tokens=0,
+        output_tokens=10,
+        tier="fast",
+        model="gpt-5.6-luna",
+    )
+    service.sync_cpamp(); service.rate_events()
+    with service.db.session() as session:
+        rated = session.scalar(select(RatedEvent))
+        assert rated.service_tier == "fast"
+        assert rated.rated_weight_nano_usd == 100 * 1000 + 10 * 6000
+
+
 def test_long_context_uses_the_active_price_rule_and_can_be_republished(service, settings) -> None:
     create_owner(service, "key", 2, 0)
     insert_event(
@@ -316,7 +349,7 @@ def test_long_context_uses_the_active_price_rule_and_can_be_republished(service,
         input_tokens=300000,
         cached_tokens=0,
         output_tokens=10,
-        tier="fast",
+        tier="priority",
         model="gpt-5.6-luna",
     )
     service.sync_cpamp()
