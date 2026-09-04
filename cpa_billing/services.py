@@ -54,6 +54,7 @@ from .models import (
     ModelPriceRule,
     MeteredKeyCharge,
     PoolAssignmentRule,
+    PricingRerateScope,
     PricingVersion,
     RatedEvent,
     RawUsageEvent,
@@ -972,6 +973,20 @@ class BillingService:
             .values(status="open")
         )
 
+    def _record_pricing_rerate_scope(
+        self,
+        session: Any,
+        version_id: int,
+        cycles: list[BillingCycle],
+    ) -> None:
+        ranges = sorted({(cycle.start_at_ms, cycle.end_at_ms) for cycle in cycles})
+        session.add(PricingRerateScope(
+            pricing_version_id=version_id,
+            ranges_json=json.dumps(ranges, separators=(",", ":")),
+            max_raw_event_id=session.scalar(select(func.max(RawUsageEvent.id))) or 0,
+            created_at_ms=now_ms(),
+        ))
+
     def sync_upstream_prices(
         self,
         name: str | None,
@@ -1010,6 +1025,7 @@ class BillingService:
                 for cycle in cycles:
                     cycle.pricing_version_id = version_id
                 self._invalidate_cycle_previews(session, cycle_ids)
+                self._record_pricing_rerate_scope(session, version_id, cycles)
                 session.add(AuditLog(
                     operator_type=operator_type,
                     operator_id=operator_id,
@@ -1175,6 +1191,7 @@ class BillingService:
             for cycle in cycles:
                 cycle.pricing_version_id = version.id
             self._invalidate_cycle_previews(session, cycle_ids)
+            self._record_pricing_rerate_scope(session, version.id, cycles)
             cycle_names = [cycle.name for cycle in cycles]
             session.add(AuditLog(
                 operator_type=operator_type,
@@ -1269,6 +1286,7 @@ class BillingService:
             for cycle in cycles:
                 cycle.pricing_version_id = version.id
             self._invalidate_cycle_previews(session, cycle_ids)
+            self._record_pricing_rerate_scope(session, version.id, cycles)
             session.add(AuditLog(
                 operator_type=operator_type,
                 operator_id=operator_id,
@@ -1455,6 +1473,7 @@ class BillingService:
         rated = 0
         with self.db.session() as session:
             selected_version_id = version_id or self._active_pricing_id(session)
+            rerate_scope = session.get(PricingRerateScope, selected_version_id)
             prices = {
                 rule.model: rule
                 for rule in session.scalars(
@@ -1476,6 +1495,26 @@ class BillingService:
                 filters.append(RawUsageEvent.occurred_at_ms >= start_ms)
             if end_ms is not None:
                 filters.append(RawUsageEvent.occurred_at_ms < end_ms)
+            if rerate_scope is not None:
+                try:
+                    ranges = json.loads(rerate_scope.ranges_json)
+                    range_filters = [
+                        and_(
+                            RawUsageEvent.occurred_at_ms >= int(start),
+                            RawUsageEvent.occurred_at_ms < int(end),
+                        )
+                        for start, end in ranges
+                    ]
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise BillingError(
+                        f"价格版本 {selected_version_id} 的重算范围无效"
+                    ) from exc
+                # The scope limits records that existed when prices changed. Rows
+                # imported later still need their first rating under the active version.
+                filters.append(or_(
+                    RawUsageEvent.id > rerate_scope.max_raw_event_id,
+                    *range_filters,
+                ))
             events = session.scalars(
                 select(RawUsageEvent).outerjoin(
                     RatedEvent,

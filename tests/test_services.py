@@ -29,6 +29,7 @@ from cpa_billing.models import (
     KeyOwnershipPeriod,
     ManualUsageAdjustment,
     MeteredKeyCharge,
+    PricingRerateScope,
     PricingVersion,
     RatedEvent,
     RawUsageEvent,
@@ -357,6 +358,7 @@ def test_long_context_uses_the_active_price_rule_and_can_be_republished(service,
     with service.db.session() as session:
         first = session.scalar(select(RatedEvent))
         assert first.long_context_applied is True
+    service.create_cycle("long-context-pricing", "1970-01-01T08:00", "1970-01-02T08:00", 0)
 
     updated = service.update_pricing_rule(
         "gpt-5.6-luna",
@@ -1578,11 +1580,12 @@ def test_cpa_key_sync_restores_owned_key_status(service, monkeypatch) -> None:
 
 def test_upstream_price_sync_rerates_open_cycles_only(service, settings, monkeypatch) -> None:
     create_owner(service, "key", 2, 0)
-    insert_event(settings, cpamp_key_hash("key"), 1000)
+    insert_event(settings, cpamp_key_hash("key"), 1000, event_hash="open-price-event")
+    insert_event(settings, cpamp_key_hash("key"), 86_401_000, event_hash="closed-price-event")
     service.sync_cpamp()
-    service.rate_events()
+    assert service.rate_events() == 2
     service.create_cycle("open-price", "1970-01-01T08:00", "1970-01-02T08:00", 1000)
-    service.create_cycle("closed-price", "1970-01-01T08:00", "1970-01-02T08:00", 1000)
+    service.create_cycle("closed-price", "1970-01-02T08:00", "1970-01-03T08:00", 1000)
     service.close_cycle("closed-price", 1, False)
     before_open = service.dashboard("open-price")["totals"]["actual"]
     before_closed = service.dashboard("closed-price")["totals"]["actual"]
@@ -1602,15 +1605,80 @@ def test_upstream_price_sync_rerates_open_cycles_only(service, settings, monkeyp
     result = service.sync_upstream_prices("synced-prices", "web-admin", "admin-token", "test refresh")
     assert result["rated_events"] == 0
     assert result["rating_status"] == "queued"
-    assert service.rate_events(limit=500) >= 1
+    assert service.rate_events(limit=500) == 1
+    assert service.rate_events(limit=500) == 0
     assert Decimal(service.dashboard("open-price")["totals"]["actual"].replace(",", "")) > Decimal(before_open.replace(",", ""))
     assert service.dashboard("closed-price")["totals"]["actual"] == before_closed
-    assert service.request_history(2)["items"][0]["cost"] == before_closed
     with service.db.session() as session:
         opened = session.scalar(select(BillingCycle).where(BillingCycle.name == "open-price"))
         closed = session.scalar(select(BillingCycle).where(BillingCycle.name == "closed-price"))
         assert session.get(PricingVersion, opened.pricing_version_id).name == "synced-prices"
         assert session.get(PricingVersion, closed.pricing_version_id).name == "cpamp-initial"
+        scope = session.get(PricingRerateScope, opened.pricing_version_id)
+        assert json.loads(scope.ranges_json) == [[0, 86_400_000]]
+        active_hashes = set(session.scalars(
+            select(RawUsageEvent.event_hash)
+            .join(RatedEvent, RatedEvent.raw_event_id == RawUsageEvent.id)
+            .where(RatedEvent.pricing_version_id == opened.pricing_version_id)
+        ))
+        assert active_hashes == {"open-price-event"}
+
+    insert_event(settings, cpamp_key_hash("key"), 172_801_000, event_hash="new-price-event")
+    assert service.sync_cpamp() == 1
+    assert service.rate_events(limit=500) == 1
+    with service.db.session() as session:
+        active = session.scalar(select(PricingVersion).where(PricingVersion.status == "active"))
+        active_hashes = set(session.scalars(
+            select(RawUsageEvent.event_hash)
+            .join(RatedEvent, RatedEvent.raw_event_id == RawUsageEvent.id)
+            .where(RatedEvent.pricing_version_id == active.id)
+        ))
+        assert active_hashes == {"open-price-event", "new-price-event"}
+
+
+def test_unscoped_pricing_version_continues_legacy_in_flight_rerate(service, settings) -> None:
+    insert_event(settings, "first", 1000, event_hash="legacy-rerate-first")
+    insert_event(settings, "second", 2000, event_hash="legacy-rerate-second")
+    assert service.sync_cpamp() == 2
+    assert service.rate_events() == 2
+
+    legacy_version_id = service.import_cpamp_prices("legacy-in-flight")
+    with service.db.session() as session:
+        assert session.get(PricingRerateScope, legacy_version_id) is None
+
+    assert service.rate_events(limit=1) == 1
+    assert service.rate_events(limit=1) == 1
+    assert service.rate_events(limit=1) == 0
+
+
+def test_upstream_price_sync_without_open_cycles_does_not_rerate_history(
+    service,
+    settings,
+    monkeypatch,
+) -> None:
+    insert_event(settings, "historical", 1000, event_hash="historical-price-event")
+    assert service.sync_cpamp() == 1
+    assert service.rate_events() == 1
+    monkeypatch.setattr(service.cpamp, "sync_model_prices", lambda models: {
+        "source": "test",
+        "sources": ["test"],
+        "imported": len(models),
+        "skipped": 0,
+        "unmatched": [],
+    })
+
+    service.sync_upstream_prices("no-open-cycles", "web-admin", "admin-token", "test refresh")
+
+    assert service.rate_events() == 0
+    with service.db.session() as session:
+        active = session.scalar(select(PricingVersion).where(PricingVersion.status == "active"))
+        scope = session.get(PricingRerateScope, active.id)
+        assert json.loads(scope.ranges_json) == []
+        assert session.scalar(
+            select(func.count()).select_from(RatedEvent).where(
+                RatedEvent.pricing_version_id == active.id
+            )
+        ) == 0
 
 
 def test_manual_price_update_creates_version_and_rerates_open_cycles_only(service, settings) -> None:
