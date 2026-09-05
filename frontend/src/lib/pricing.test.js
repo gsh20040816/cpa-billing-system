@@ -6,7 +6,7 @@ function rate(value) {
 }
 
 describe('pricing display helpers', () => {
-  it('shows the input-price fallback used for missing cache creation prices', () => {
+  it('preserves CPAMP zero prices for unconfigured cache creation', () => {
     const item = {
       default: { input: rate(5), cache_creation: rate(0) },
       priority: { input: rate(10), cache_creation: rate(0) },
@@ -14,9 +14,9 @@ describe('pricing display helpers', () => {
       configured: { input: true, output: true, cache_read: true, cache_creation: false },
     }
 
-    expect(effectiveRate(item, 'cache_creation').usd_per_million).toBe('5')
-    expect(effectiveRate(item, 'cache_creation', 'priority').usd_per_million).toBe('10')
-    expect(priceSourceText(item)).toBe('Cache creation 未提供，按 Input 价回退')
+    expect(effectiveRate(item, 'cache_creation').usd_per_million).toBe('0')
+    expect(effectiveRate(item, 'cache_creation', 'priority').usd_per_million).toBe('0')
+    expect(priceSourceText(item)).toBe('Cache creation 上游未配置，保留 CPAMP 价格表数值')
   })
 
   it('keeps complete upstream prices unchanged', () => {

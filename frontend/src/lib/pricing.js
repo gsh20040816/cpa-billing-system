@@ -13,15 +13,7 @@ function selectedRate(item, field, tier) {
 }
 
 export function effectiveRate(item, field, tier = 'default') {
-  const rate = selectedRate(item, field, tier)
-  if (
-    field === 'cache_creation'
-    && !item.configured?.cache_creation
-    && Number(rate?.usd_per_million || 0) === 0
-  ) {
-    return selectedRate(item, 'input', tier)
-  }
-  return rate
+  return selectedRate(item, field, tier)
 }
 
 export function priceSourceText(item) {
@@ -30,13 +22,5 @@ export function priceSourceText(item) {
     .map(([field]) => field)
   if (!missing.length) return '上游完整价格'
 
-  const parts = []
-  if (missing.includes('cache_creation')) {
-    parts.push('Cache creation 未提供，按 Input 价回退')
-  }
-  const remaining = missing.filter((field) => field !== 'cache_creation')
-  if (remaining.length) {
-    parts.push(`${remaining.map((field) => priceFieldNames[field]).join('、')} 使用兼容价`)
-  }
-  return parts.join('；')
+  return `${missing.map((field) => priceFieldNames[field]).join('、')} 上游未配置，保留 CPAMP 价格表数值`
 }

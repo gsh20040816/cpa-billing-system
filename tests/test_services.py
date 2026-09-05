@@ -29,6 +29,7 @@ from cpa_billing.models import (
     KeyOwnershipPeriod,
     ManualUsageAdjustment,
     MeteredKeyCharge,
+    ModelPriceRule,
     PricingRerateScope,
     PricingVersion,
     RatedEvent,
@@ -301,7 +302,20 @@ def test_explicit_cache_creation_is_not_charged_as_uncached_input(service, setti
         assert rated.rated_weight_nano_usd == 800 * 1000 + 200 * 1250 + 100 * 6000
 
 
-def test_priority_and_long_context_combine(service, settings) -> None:
+@pytest.fixture
+def manual_priority_long_rule(service):
+    with service.db.session() as session:
+        rule = session.scalar(select(ModelPriceRule).where(ModelPriceRule.model == "gpt-5.6-luna"))
+        rule.priority_input_nano_per_token = 2000
+        rule.priority_output_nano_per_token = 12000
+        rule.priority_cache_read_nano_per_token = 200
+        rule.priority_cache_creation_nano_per_token = 2500
+        rule.long_threshold_tokens = 272000
+        rule.long_input_multiplier_ppm = 2000000
+        rule.long_output_multiplier_ppm = 1500000
+
+
+def test_priority_and_long_context_combine(service, settings, manual_priority_long_rule) -> None:
     create_owner(service, "key", 2, 0)
     insert_event(
         settings,
@@ -341,7 +355,7 @@ def test_fast_service_tier_is_preserved_from_cpamp(service, settings) -> None:
         assert rated.rated_weight_nano_usd == 100 * 1000 + 10 * 6000
 
 
-def test_long_context_uses_the_active_price_rule_and_can_be_republished(service, settings) -> None:
+def test_long_context_uses_the_active_price_rule_and_can_be_republished(service, settings, manual_priority_long_rule) -> None:
     create_owner(service, "key", 2, 0)
     insert_event(
         settings,
@@ -1576,6 +1590,116 @@ def test_cpa_key_sync_restores_owned_key_status(service, monkeypatch) -> None:
         assert key.status == "active"
         assert key.present_in_cpa is True
         assert key.login_fingerprint is not None
+
+
+@pytest.mark.parametrize("model", ["gpt-test", "gpt-5.6-luna", "gpt-5.3-codex-spark"])
+def test_cpamp_prices_are_imported_and_charged_without_local_defaults(service, settings, model):
+    with sqlite3.connect(settings.cpamp_database_path) as db:
+        for field in ("prompt_configured", "completion_configured", "cache_read_configured", "cache_creation_configured"):
+            db.execute(f"alter table model_prices add column {field} integer not null default 0")
+        db.execute(
+            "update model_prices set prompt_per_1m=3, completion_per_1m=7, "
+            "cache_per_1m=99, cache_read_per_1m=0, cache_creation_per_1m=0 where model=?",
+            (model,),
+        )
+    version_id = service.import_cpamp_prices("direct-cpamp")
+    with service.db.session() as session:
+        rule = session.get(ModelPriceRule, (version_id, model))
+        assert (rule.input_nano_per_token, rule.output_nano_per_token,
+                rule.cache_read_nano_per_token, rule.cache_creation_nano_per_token) == (3000, 7000, 0, 0)
+        assert rule.input_configured is False
+        assert rule.cache_creation_configured is False
+        assert rule.priority_input_nano_per_token is None
+        assert rule.priority_output_nano_per_token is None
+        assert rule.priority_cache_read_nano_per_token is None
+        assert rule.priority_cache_creation_nano_per_token is None
+        assert rule.flex_input_nano_per_token is None
+        assert rule.flex_output_nano_per_token is None
+        assert rule.long_threshold_tokens is None
+        assert (rule.long_input_multiplier_ppm, rule.long_output_multiplier_ppm) == (1000000, 1000000)
+    insert_event(settings, "direct-price", 1000, model=model, tier="priority",
+                 input_tokens=300000, cached_tokens=0, cache_read_tokens=1000,
+                 cache_creation_tokens=2000, output_tokens=100)
+    service.sync_cpamp()
+    assert service.rate_events() == 1
+    with service.db.session() as session:
+        rated = session.scalar(select(RatedEvent))
+        assert rated.long_context_applied is False
+        assert rated.rated_weight_nano_usd == 297000 * 3000 + 100 * 7000
+    with sqlite3.connect(settings.cpamp_database_path) as db:
+        db.execute("update model_prices set prompt_per_1m=0, completion_per_1m=0 where model=?", (model,))
+    zero_id = service.import_cpamp_prices("zero-cpamp")
+    with service.db.session() as session:
+        rule = session.get(ModelPriceRule, (zero_id, model))
+        assert (rule.input_nano_per_token, rule.output_nano_per_token) == (0, 0)
+
+
+@pytest.fixture
+def cpamp_tier_prices(settings):
+    raw = {
+        "cost": {"input": 3, "output": 7, "cache_read": .3, "cache_write": .75,
+                 "tiers": [{"input": 6, "output": 21, "cache_read": .6, "cache_write": 1.5,
+                            "tier": {"type": "context", "size": 12345}}]},
+        "experimental": {"modes": {
+            "fast": {"cost": {"input": 9, "output": 14, "cache_read": .9, "cache_write": 2.25},
+                     "provider": {"body": {"service_tier": "priority"}}},
+            "flex": {"cost": {"input": 0, "output": 3.5},
+                     "provider": {"body": {"service_tier": "flex"}}},
+        }},
+    }
+    with sqlite3.connect(settings.cpamp_database_path) as db:
+        db.execute("update model_prices set prompt_per_1m=3, completion_per_1m=7, "
+                   "cache_read_per_1m=.3, cache_creation_per_1m=.75, source='models.dev', raw_json=? "
+                   "where model='gpt-test'", (json.dumps(raw),))
+    return raw
+
+
+@pytest.mark.parametrize("tier,short_rates,long_rates", [
+    ("default", [3000, 300, 750, 7000], [6000, 600, 1500, 21000]),
+    ("priority", [9000, 900, 2250, 14000], [18000, 1800, 4500, 42000]),
+    ("fast", [9000, 900, 2250, 14000], [18000, 1800, 4500, 42000]),
+    ("flex", [0, 300, 750, 3500], [0, 600, 1500, 10500]),
+])
+def test_cpamp_tiers_and_context_stack_without_model_hardcoding(
+    service, settings, cpamp_tier_prices, tier, short_rates, long_rates,
+):
+    service.import_cpamp_prices("upstream-tiers")
+    for tokens in (12345, 12346):
+        insert_event(settings, "tier-test", tokens, event_hash=str(tokens), tier=tier,
+                     input_tokens=tokens, cached_tokens=0, cache_read_tokens=100,
+                     cache_creation_tokens=200, output_tokens=10)
+    service.sync_cpamp()
+    assert service.rate_events() == 2
+    with service.db.session() as session:
+        rows = list(session.scalars(select(RatedEvent).order_by(RatedEvent.occurred_at_ms)))
+        for rated, tokens, rates in zip(rows, (12345, 12346), (short_rates, long_rates)):
+            assert json.loads(rated.calculation_json)["rates"] == rates
+            assert rated.long_context_applied is (tokens > 12345)
+            assert rated.rated_weight_nano_usd == (
+                (tokens - 300) * rates[0] + 100 * rates[1] + 200 * rates[2] + 10 * rates[3]
+            )
+
+
+@pytest.mark.parametrize("invalid", ["threshold", "cache_multiplier", "multiple", "negative", "missing_threshold"])
+def test_invalid_cpamp_tiers_do_not_replace_active_prices(service, settings, cpamp_tier_prices, invalid):
+    raw = cpamp_tier_prices
+    if invalid == "threshold":
+        raw["cost"]["tiers"][0]["tier"]["size"] = -1
+    elif invalid == "cache_multiplier":
+        raw["cost"]["tiers"][0]["cache_read"] = .9
+    elif invalid == "multiple":
+        raw["cost"]["tiers"] *= 2
+    elif invalid == "negative":
+        raw["experimental"]["modes"]["fast"]["cost"]["input"] = -1
+    else:
+        raw["cost"]["context_over_200k"] = raw["cost"].pop("tiers")[0]
+    with sqlite3.connect(settings.cpamp_database_path) as db:
+        db.execute("update model_prices set raw_json=? where model='gpt-test'", (json.dumps(raw),))
+    with pytest.raises(BillingError, match="CPAMP 模型 gpt-test 价格无效"):
+        service.import_cpamp_prices("invalid-tiers")
+    with service.db.session() as session:
+        assert session.scalar(select(PricingVersion).where(PricingVersion.status == "active")).name == "cpamp-initial"
+        assert session.scalar(select(PricingVersion).where(PricingVersion.name == "invalid-tiers")) is None
 
 
 def test_upstream_price_sync_rerates_open_cycles_only(service, settings, monkeypatch) -> None:

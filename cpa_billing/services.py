@@ -464,7 +464,10 @@ class CPAMPClient:
 
 
 def _nano_per_token(value: Any) -> int:
-    return int((Decimal(str(value or 0)) * Decimal(1000)).to_integral_value(rounding=ROUND_HALF_UP))
+    price = Decimal(str(value))
+    if not price.is_finite() or price < 0:
+        raise ValueError("price must be finite and nonnegative")
+    return int((price * Decimal(1000)).to_integral_value(rounding=ROUND_HALF_UP))
 
 
 def _ppm(value: Decimal) -> int:
@@ -480,32 +483,70 @@ def _model_family(value: str, family: str) -> bool:
     return slug == family or slug.startswith(family + "-")
 
 
-def _priority_multiplier_ppm(model: str) -> int:
-    for family, multiplier in (
-        ("gpt-5.6", 2_000_000),
-        ("gpt-5.5", 2_500_000),
-        ("gpt-5.4-mini", 2_000_000),
-        ("gpt-5.4", 2_000_000),
-        ("gpt-5.3-codex", 2_000_000),
-    ):
-        if _model_family(model, family):
-            return multiplier
-    return 1_000_000
-
-
-def _official_gpt56_rates(model: str) -> tuple[int, int, int, int] | None:
-    for family, prices in (
-        ("gpt-5.6-sol", (5, 30, 0.5, 6.25)),
-        ("gpt-5.6-terra", (2.5, 15, 0.25, 3.125)),
-        ("gpt-5.6-luna", (1, 6, 0.1, 1.25)),
-    ):
-        if _model_family(model, family):
-            return tuple(_nano_per_token(value) for value in prices)
-    return None
-
-
 def _scaled_rate(rate: int, multiplier_ppm: int) -> int:
     return (rate * multiplier_ppm + 500_000) // 1_000_000
+
+
+def _cpamp_tier_rules(row: sqlite3.Row) -> dict[str, Any]:
+    rules: dict[str, Any] = {
+        "long_threshold_tokens": None,
+        "long_input_multiplier_ppm": 1_000_000,
+        "long_output_multiplier_ppm": 1_000_000,
+    }
+    if row["source"] != "models.dev":
+        return rules
+    raw = json.loads(row["raw_json"])
+    fields = {"input": "prompt_per_1m", "output": "completion_per_1m",
+              "cache_read": "cache_read_per_1m", "cache_write": "cache_creation_per_1m"}
+    modes = raw.get("experimental", {}).get("modes", {})
+    seen = set()
+    for mode in modes.values():
+        tier = mode.get("provider", {}).get("body", {}).get("service_tier")
+        if tier not in {"priority", "flex"} or "cost" not in mode:
+            continue
+        if tier in seen:
+            raise ValueError(f"multiple prices for service tier {tier}")
+        seen.add(tier)
+        for field in fields:
+            if field not in mode["cost"]:
+                continue
+            if tier == "flex" and field in {"cache_read", "cache_write"}:
+                if _nano_per_token(mode["cost"][field]) != _nano_per_token(row[fields[field]]):
+                    raise ValueError("distinct Flex cache prices are not supported")
+                continue
+            target = "cache_creation" if field == "cache_write" else field
+            rules[f"{tier}_{target}_nano_per_token"] = _nano_per_token(mode["cost"][field])
+    cost = raw.get("cost", {})
+    tiers = cost.get("tiers", [])
+    if not tiers:
+        if "context_over_200k" in cost:
+            raise ValueError("long-context prices have no explicit context threshold")
+        return rules
+    if len(tiers) != 1 or tiers[0]["tier"]["type"] != "context":
+        raise ValueError("expected one context pricing tier")
+    context = tiers[0]
+    threshold = context["tier"]["size"]
+    if type(threshold) is not int or threshold <= 0:
+        raise ValueError("context threshold must be a positive integer")
+    rules["long_threshold_tokens"] = threshold
+    for field in ("input", "output"):
+        base = _nano_per_token(row[fields[field]])
+        price = _nano_per_token(context[field])
+        if base == 0:
+            raise ValueError(f"cannot derive context multiplier from zero {field} price")
+        multiplier = _ppm(Decimal(price) / Decimal(base))
+        if _scaled_rate(base, multiplier) != price:
+            raise ValueError(f"context {field} multiplier loses price precision")
+        rules[f"long_{field}_multiplier_ppm"] = multiplier
+    # The stored rule shares the input multiplier with both cache categories.
+    # Reject an upstream tier that cannot be represented exactly by this schema.
+    for field in ("cache_read", "cache_write"):
+        base = _nano_per_token(row[fields[field]])
+        expected = _scaled_rate(base, rules["long_input_multiplier_ppm"])
+        actual = _nano_per_token(context[field]) if field in context else base
+        if actual != expected:
+            raise ValueError(f"context {field} price does not share the input multiplier")
+    return rules
 
 
 def _metered_amount_cents(actual_nano_usd: int, multiplier_ppm: int) -> int:
@@ -913,26 +954,18 @@ class BillingService:
                 raw_text = str(row["raw_json"] or "")
                 keys = set(row.keys())
                 model = str(row["model"])
-                input_rate = _nano_per_token(row["prompt_per_1m"])
-                output_rate = _nano_per_token(row["completion_per_1m"])
-                cache_read_rate = _nano_per_token(row["cache_read_per_1m"] or row["cache_per_1m"])
-                cache_creation_rate = _nano_per_token(row["cache_creation_per_1m"])
+                try:
+                    input_rate = _nano_per_token(row["prompt_per_1m"])
+                    output_rate = _nano_per_token(row["completion_per_1m"])
+                    cache_read_rate = _nano_per_token(row["cache_read_per_1m"])
+                    cache_creation_rate = _nano_per_token(row["cache_creation_per_1m"])
+                    tier_rules = _cpamp_tier_rules(row)
+                except (ValueError, TypeError, KeyError, AttributeError, InvalidOperation) as exc:
+                    raise BillingError(f"CPAMP 模型 {model} 价格无效：{exc}") from exc
                 input_configured = bool(row["prompt_configured"]) if "prompt_configured" in keys else True
                 output_configured = bool(row["completion_configured"]) if "completion_configured" in keys else True
                 cache_read_configured = bool(row["cache_read_configured"]) if "cache_read_configured" in keys else cache_read_rate > 0
                 cache_creation_configured = bool(row["cache_creation_configured"]) if "cache_creation_configured" in keys else cache_creation_rate > 0
-                if _model_family(model, "gpt-5.6"):
-                    official = _official_gpt56_rates(model)
-                    if official is not None:
-                        if not input_configured and input_rate == 0:
-                            input_rate = official[0]
-                        if not output_configured and output_rate == 0:
-                            output_rate = official[1]
-                    if not cache_read_configured:
-                        cache_read_rate = _scaled_rate(input_rate, 100_000)
-                    if not cache_creation_configured:
-                        cache_creation_rate = _scaled_rate(input_rate, 1_250_000)
-                priority_multiplier = _priority_multiplier_ppm(model)
                 session.add(ModelPriceRule(
                     pricing_version_id=version.id,
                     model=model,
@@ -944,15 +977,7 @@ class BillingService:
                     output_configured=output_configured,
                     cache_read_configured=cache_read_configured,
                     cache_creation_configured=cache_creation_configured,
-                    priority_input_nano_per_token=_scaled_rate(input_rate, priority_multiplier) if priority_multiplier != 1_000_000 else None,
-                    priority_output_nano_per_token=_scaled_rate(output_rate, priority_multiplier) if priority_multiplier != 1_000_000 else None,
-                    priority_cache_read_nano_per_token=_scaled_rate(cache_read_rate, priority_multiplier) if priority_multiplier != 1_000_000 else None,
-                    priority_cache_creation_nano_per_token=_scaled_rate(cache_creation_rate, priority_multiplier) if priority_multiplier != 1_000_000 else None,
-                    flex_input_nano_per_token=None,
-                    flex_output_nano_per_token=None,
-                    long_threshold_tokens=272_000 if _model_family(model, "gpt-5.6") else None,
-                    long_input_multiplier_ppm=2_000_000 if _model_family(model, "gpt-5.6") else 1_000_000,
-                    long_output_multiplier_ppm=1_500_000 if _model_family(model, "gpt-5.6") else 1_000_000,
+                    **tier_rules,
                     raw_json=raw_text or None,
                 ))
             if operator_type and operator_id:
@@ -1402,16 +1427,18 @@ class BillingService:
         output_rate = rule.output_nano_per_token
         cache_read_rate = rule.cache_read_nano_per_token
         cache_creation_rate = rule.cache_creation_nano_per_token
-        if tier == "priority":
-            input_rate = rule.priority_input_nano_per_token or input_rate
-            output_rate = rule.priority_output_nano_per_token or output_rate
-            cache_read_rate = rule.priority_cache_read_nano_per_token or cache_read_rate
-            cache_creation_rate = rule.priority_cache_creation_nano_per_token or cache_creation_rate
+        if tier in {"priority", "fast"}:
+            input_rate = rule.priority_input_nano_per_token if rule.priority_input_nano_per_token is not None else input_rate
+            output_rate = rule.priority_output_nano_per_token if rule.priority_output_nano_per_token is not None else output_rate
+            cache_read_rate = rule.priority_cache_read_nano_per_token if rule.priority_cache_read_nano_per_token is not None else cache_read_rate
+            cache_creation_rate = rule.priority_cache_creation_nano_per_token if rule.priority_cache_creation_nano_per_token is not None else cache_creation_rate
+        elif tier == "flex":
+            input_rate = rule.flex_input_nano_per_token if rule.flex_input_nano_per_token is not None else input_rate
+            output_rate = rule.flex_output_nano_per_token if rule.flex_output_nano_per_token is not None else output_rate
 
         long_threshold = rule.long_threshold_tokens
         long_context = bool(
-            _model_family(behavior_model, "gpt-5.6")
-            and long_threshold is not None
+            long_threshold is not None
             and event.input_tokens > long_threshold
         )
         if long_context:
@@ -1427,29 +1454,14 @@ class BillingService:
         cache_creation = max(int(event.cache_creation_tokens or 0), 0)
         input_tokens = max(int(event.input_tokens or 0), 0)
         output_tokens = max(int(event.output_tokens or 0), 0)
-        if _model_family(behavior_model, "gpt-5.6"):
-            read_tokens = compatible_cached + cache_read
-            uncached = max(input_tokens - read_tokens - cache_creation, 0)
-            cost = (
-                uncached * input_rate
-                + read_tokens * cache_read_rate
-                + cache_creation * cache_creation_rate
-                + output_tokens * output_rate
-            )
-        elif cache_read or cache_creation:
-            read_tokens = compatible_cached + cache_read
-            uncached = max(input_tokens - read_tokens - cache_creation, 0)
-            effective_creation_rate = cache_creation_rate if rule.cache_creation_configured or cache_creation_rate > 0 else input_rate
-            cost = (
-                uncached * input_rate
-                + read_tokens * cache_read_rate
-                + cache_creation * effective_creation_rate
-                + output_tokens * output_rate
-            )
-            cache_creation_rate = effective_creation_rate
-        else:
-            uncached = max(input_tokens - compatible_cached, 0)
-            cost = uncached * input_rate + compatible_cached * cache_read_rate + output_tokens * output_rate
+        read_tokens = compatible_cached + cache_read
+        uncached = max(input_tokens - read_tokens - cache_creation, 0)
+        cost = (
+            uncached * input_rate
+            + read_tokens * cache_read_rate
+            + cache_creation * cache_creation_rate
+            + output_tokens * output_rate
+        )
         detail = {
             "behavior_model": behavior_model,
             "price_model": price_model,
@@ -3355,7 +3367,6 @@ class BillingService:
                 "cache_read": bool(rule.cache_read_configured),
                 "cache_creation": bool(rule.cache_creation_configured),
             },
-            "priority_multiplier_ppm": _priority_multiplier_ppm(rule.model),
             "long_context": {
                 "threshold_tokens": rule.long_threshold_tokens,
                 "input_multiplier_ppm": rule.long_input_multiplier_ppm,
