@@ -2927,18 +2927,7 @@ class BillingService:
                     custom_hours=custom_hours,
                 )
             active_version_id = self._active_pricing_id(session)
-            cycle_pricing_version = (
-                select(BillingCycle.pricing_version_id)
-                .where(
-                    BillingCycle.start_at_ms <= RawUsageEvent.occurred_at_ms,
-                    BillingCycle.end_at_ms > RawUsageEvent.occurred_at_ms,
-                )
-                .order_by(BillingCycle.start_at_ms.desc(), BillingCycle.id.desc())
-                .limit(1)
-                .correlate(RawUsageEvent)
-                .scalar_subquery()
-            )
-            effective_version_id = func.coalesce(cycle_pricing_version, active_version_id)
+            effective_version_id = self._event_pricing_version(active_version_id)
             generation_ms_expression = RawUsageEvent.latency_ms - RawUsageEvent.ttft_ms
             tps_expression = case(
                 (
@@ -3207,7 +3196,7 @@ class BillingService:
                 ))
                 .outerjoin(RatedEvent.__table__, and_(
                     RatedEvent.raw_event_id == RawUsageEvent.id,
-                    RatedEvent.pricing_version_id == version_id,
+                    RatedEvent.pricing_version_id == self._event_pricing_version(version_id),
                 ))
             )
             filters: list[Any] = []
@@ -3426,7 +3415,7 @@ class BillingService:
                 select(func.count()).select_from(RawUsageEvent)
                 .outerjoin(RatedEvent, and_(
                     RatedEvent.raw_event_id == RawUsageEvent.id,
-                    RatedEvent.pricing_version_id == version_id,
+                    RatedEvent.pricing_version_id == self._event_pricing_version(version_id),
                 ))
                 .where(*unpriced_filters)
             ) or 0)
@@ -3878,7 +3867,7 @@ class BillingService:
                 RatedEvent,
                 and_(
                     RatedEvent.raw_event_id == RawUsageEvent.id,
-                    RatedEvent.pricing_version_id == version_id,
+                    RatedEvent.pricing_version_id == self._event_pricing_version(version_id),
                 ),
             )
             .where(*filters)
@@ -4337,7 +4326,7 @@ class BillingService:
                     RatedEvent,
                     and_(
                         RatedEvent.raw_event_id == RawUsageEvent.id,
-                        RatedEvent.pricing_version_id == version_id,
+                        RatedEvent.pricing_version_id == self._event_pricing_version(version_id),
                     ),
                 )
                 .where(
@@ -4458,7 +4447,7 @@ class BillingService:
                     rated_table,
                     and_(
                         rated_table.c.raw_event_id == raw_table.c.id,
-                        rated_table.c.pricing_version_id == version_id,
+                        rated_table.c.pricing_version_id == self._event_pricing_version(version_id),
                     ),
                 )
             )
@@ -5232,10 +5221,26 @@ class BillingService:
                            for a in session.scalars(select(AuditLog).order_by(AuditLog.id.desc()).limit(50))],
             }
 
+    @staticmethod
+    def _event_pricing_version(default_version_id: int) -> Any:
+        # 跨账期查询必须读取各账期绑定的版本，已关闭账期不会随价格同步重算。
+        cycle_version = (
+            select(BillingCycle.pricing_version_id)
+            .where(
+                BillingCycle.start_at_ms <= RawUsageEvent.occurred_at_ms,
+                BillingCycle.end_at_ms > RawUsageEvent.occurred_at_ms,
+            )
+            .order_by(BillingCycle.start_at_ms.desc(), BillingCycle.id.desc())
+            .limit(1)
+            .correlate(RawUsageEvent)
+            .scalar_subquery()
+        )
+        return func.coalesce(cycle_version, default_version_id)
+
     def usage_summary(self) -> dict[str, Any]:
         with self.db.session() as session:
             version_id = self._active_pricing_id(session)
-            join_condition = and_(RatedEvent.raw_event_id == RawUsageEvent.id, RatedEvent.pricing_version_id == version_id)
+            join_condition = and_(RatedEvent.raw_event_id == RawUsageEvent.id, RatedEvent.pricing_version_id == self._event_pricing_version(version_id))
             cutoff = now_ms() - 86_400_000
             row = session.execute(
                 select(
@@ -5275,7 +5280,7 @@ class BillingService:
                 ))
                 .outerjoin(RatedEvent.__table__, and_(
                     RatedEvent.raw_event_id == RawUsageEvent.id,
-                    RatedEvent.pricing_version_id == version_id,
+                    RatedEvent.pricing_version_id == self._event_pricing_version(version_id),
                 ))
             )
             query = select(
@@ -5400,7 +5405,7 @@ class BillingService:
             rows = session.execute(select(RawUsageEvent.model, func.count(RawUsageEvent.id), func.sum(RawUsageEvent.total_tokens),
                                           func.sum(RatedEvent.rated_weight_nano_usd)).outerjoin(
                                               RatedEvent, and_(RatedEvent.raw_event_id == RawUsageEvent.id,
-                                                               RatedEvent.pricing_version_id == version_id))
+                                                               RatedEvent.pricing_version_id == self._event_pricing_version(version_id)))
                                    .group_by(RawUsageEvent.model).order_by(func.sum(RatedEvent.rated_weight_nano_usd).desc()).limit(limit)).all()
             return [{"model": model, "requests": int(requests or 0), "tokens": int(tokens or 0), "cost": format_usd_nano(int(cost or 0))}
                     for model, requests, tokens, cost in rows]
@@ -5411,7 +5416,7 @@ class BillingService:
             label = func.coalesce(func.nullif(RawUsageEvent.account_snapshot, ""), func.nullif(RawUsageEvent.source_label, ""), "-")
             rows = session.execute(select(label, func.count(RawUsageEvent.id), func.sum(RawUsageEvent.total_tokens), func.sum(RatedEvent.rated_weight_nano_usd))
                                    .outerjoin(RatedEvent, and_(RatedEvent.raw_event_id == RawUsageEvent.id,
-                                                              RatedEvent.pricing_version_id == version_id)).group_by(label)
+                                                              RatedEvent.pricing_version_id == self._event_pricing_version(version_id))).group_by(label)
                                    .order_by(func.sum(RatedEvent.rated_weight_nano_usd).desc()).limit(limit)).all()
             result = []
             for name, requests, tokens, cost in rows:
@@ -5544,7 +5549,7 @@ class BillingService:
                     RatedEvent,
                     and_(
                         RatedEvent.raw_event_id == RawUsageEvent.id,
-                        RatedEvent.pricing_version_id == version_id,
+                        RatedEvent.pricing_version_id == self._event_pricing_version(version_id),
                     ),
                 )
             ).one()

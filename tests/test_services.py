@@ -1605,10 +1605,30 @@ def test_upstream_price_sync_rerates_open_cycles_only(service, settings, monkeyp
     result = service.sync_upstream_prices("synced-prices", "web-admin", "admin-token", "test refresh")
     assert result["rated_events"] == 0
     assert result["rating_status"] == "queued"
+    assert service.request_history(2)["summary"]["unpriced"] == 1
+    assert service.reconciliation()["unpriced_events"] == 1
     assert service.rate_events(limit=500) == 1
     assert service.rate_events(limit=500) == 0
     assert Decimal(service.dashboard("open-price")["totals"]["actual"].replace(",", "")) > Decimal(before_open.replace(",", ""))
     assert service.dashboard("closed-price")["totals"]["actual"] == before_closed
+    history = service.request_history(2)["summary"]
+    assert history["unpriced"] == 0
+    assert service.reconciliation()["unpriced_events"] == 0
+    assert service.usage_summary()["total_cost"] == history["cost"]
+    with service.db.session() as session:
+        active_id = service._active_pricing_id(session)
+    overview = service._local_overview(active_id, 0, 172_800_000)
+    assert overview["summary"]["unpriced_events"] == 0
+    assert overview["summary"]["total_cost"] == history["cost"]
+    assert service.model_usage()[0]["cost"] == history["cost"]
+    assert service.account_usage()[0]["cost"] == history["cost"]
+    assert service.ranking_snapshot("all")["rows"][0]["cost"] == history["cost"]
+    realtime = service._local_realtime(active_id, 0, 172_800_000, "all")
+    assert realtime["current_usage"]["models"][0]["cost"] == history["cost"]
+    with service.db.session() as session:
+        account_usage = service._account_usage_aggregate(session, active_id, "auth")
+    assert account_usage["unpriced"] == 0
+    assert account_usage["cost"] == history["cost"]
     with service.db.session() as session:
         opened = session.scalar(select(BillingCycle).where(BillingCycle.name == "open-price"))
         closed = session.scalar(select(BillingCycle).where(BillingCycle.name == "closed-price"))
