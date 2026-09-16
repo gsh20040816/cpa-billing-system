@@ -328,6 +328,34 @@ describe('AdminView manual usage', () => {
     snapshot.accounts = previousAccounts
   })
 
+  it('does not offer Codex quota reset for xAI OAuth accounts', async () => {
+    const previousAccounts = snapshot.accounts
+    snapshot.accounts = {
+      accounts: [{
+        id: 'xai-account',
+        name: 'gsh@example.com',
+        type: 'xai',
+        auth_type: 'oauth',
+        can_refresh: true,
+        usage: { requests: 1, total_tokens: 100, cost: '1.0000' },
+        quota: [{ key: 'xai.credit_usage', label: 'OAuth 用量 · 周', used_percent: 13, reset_at: '2026-09-23T16:17:07+08:00' }],
+        reset_credits_available: null,
+        reset_credits: [],
+      }],
+    }
+    const wrapper = mount(AdminView, {
+      attachTo: document.body,
+      global: { plugins: [vuetify] },
+    })
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('OAuth 用量')
+    expect(wrapper.text()).not.toContain('重置上游额度')
+    expect(wrapper.text()).not.toContain('无可用主动重置次数')
+    wrapper.unmount()
+    snapshot.accounts = previousAccounts
+  })
+
   it('creates a cycle from configured upstream accounts', async () => {
     const previousAccounts = snapshot.accounts
     const previousGradients = snapshot.admin.gradients

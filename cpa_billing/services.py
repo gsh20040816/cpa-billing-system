@@ -96,6 +96,10 @@ LOGGER = logging.getLogger(__name__)
 
 RESET_CREDIT_SUCCESS_CACHE_SECONDS = 300
 RESET_CREDIT_RATE_LIMIT_COOLDOWN_SECONDS = 60
+CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+XAI_BILLING_CREDITS_URL = "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
+CODEX_OAUTH_PROVIDERS = {"codex"}
+XAI_OAUTH_PROVIDERS = {"xai", "grok"}
 
 QUOTA_MODEL_ALIASES = {
     "codex_bengalfox": "gpt-5.3-codex-spark",
@@ -3759,6 +3763,108 @@ class BillingService:
             }
 
     @staticmethod
+    def _xai_billing_quota_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
+        config = payload.get("config")
+        if not isinstance(config, dict):
+            return []
+        period = config.get("currentPeriod", config.get("current_period"))
+        if not isinstance(period, dict):
+            period = {}
+        if not any(
+            key in config
+            for key in (
+                "creditUsagePercent",
+                "credit_usage_percent",
+                "currentPeriod",
+                "current_period",
+                "productUsage",
+                "product_usage",
+            )
+        ):
+            return []
+
+        def period_seconds(start: Any, end: Any) -> int | None:
+            try:
+                start_at = datetime.fromisoformat(str(start).replace("Z", "+00:00"))
+                end_at = datetime.fromisoformat(str(end).replace("Z", "+00:00"))
+            except (TypeError, ValueError):
+                return None
+            delta = (end_at - start_at).total_seconds()
+            if delta <= 0:
+                return None
+            return int(round(delta))
+
+        start = period.get("start") or config.get("billingPeriodStart") or config.get("billing_period_start")
+        end = period.get("end") or config.get("billingPeriodEnd") or config.get("billing_period_end")
+        seconds = period_seconds(start, end)
+        period_type = str(period.get("type") or "").upper()
+        if seconds is None and "WEEKLY" in period_type:
+            seconds = 7 * 24 * 60 * 60
+        elif seconds is None and "MONTHLY" in period_type:
+            seconds = 30 * 24 * 60 * 60
+
+        def window_label(value: int | None) -> str:
+            if value == 7 * 24 * 60 * 60:
+                return "周"
+            if value is not None and 28 * 24 * 60 * 60 <= value <= 31 * 24 * 60 * 60:
+                return "月"
+            if value is None or value <= 0:
+                return "窗口"
+            hours = value / 3600
+            return f"{hours:g} 小时"
+
+        rows: list[dict[str, Any]] = []
+
+        def add_row(key: str, label: str, used_percent: Any, *, scope: str = "window") -> None:
+            reached = None
+            allowed = None
+            try:
+                observed = float(used_percent)
+            except (TypeError, ValueError):
+                pass
+            else:
+                reached = observed >= 100
+                allowed = not reached
+            rows.append({
+                "key": key,
+                "label": label,
+                "scope": scope,
+                "metric": None,
+                "plan_type": payload.get("plan_type", payload.get("planType")),
+                "used_percent": used_percent,
+                "allowed": allowed,
+                "limit_reached": reached,
+                "window_seconds": seconds,
+                "reset_at": end,
+                "reset_after_seconds": None,
+                "window_usage_tokens": None,
+                "window_usage_cost": None,
+            })
+
+        percent = config.get("creditUsagePercent", config.get("credit_usage_percent"))
+        if percent is not None or period or end:
+            add_row(
+                "xai.credit_usage",
+                f"OAuth 用量 · {window_label(seconds)}",
+                percent,
+            )
+        products = config.get("productUsage", config.get("product_usage"))
+        for item in products if isinstance(products, list) else []:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("product") or "").strip()
+            product_percent = item.get("usagePercent", item.get("usage_percent"))
+            if not name or product_percent is None:
+                continue
+            add_row(
+                f"xai.product.{name}",
+                f"{name} · {window_label(seconds)}",
+                product_percent,
+                scope="feature",
+            )
+        return rows
+
+    @staticmethod
     def _quota_rows(payload: Any) -> tuple[list[dict[str, Any]], int | None]:
         if not isinstance(payload, dict):
             return [], None
@@ -3838,6 +3944,10 @@ class BillingService:
                 })
             credits = payload.get("rateLimitResetCreditsAvailableCount")
             return rows, int(credits) if isinstance(credits, (int, float)) else None
+
+        xai_rows = BillingService._xai_billing_quota_rows(payload)
+        if xai_rows:
+            return xai_rows, None
 
         rate_limit = payload.get("rate_limit", payload.get("rateLimit"))
         if isinstance(rate_limit, dict):
@@ -4261,7 +4371,6 @@ class BillingService:
                 quota["reset_at"] = self._iso_timestamp(reset_at_ms)
             quota_reset_guard = self._quota_reset_guard(identity, quota_rows)
             id_token = identity.get("id_token") if isinstance(identity.get("id_token"), dict) else {}
-            provider = str(identity.get("provider") or identity.get("type") or "").strip().lower()
             plan_type = identity.get("plan_type") or identity.get("planType") or id_token.get("plan_type") or id_token.get("planType")
             quota_status = str(quota_item.get("status") or "unsupported")
             accounts.append({
@@ -4319,7 +4428,8 @@ class BillingService:
                 "reset_credits": quota_item.get("reset_credits") or [],
                 "reset_credits_error": quota_item.get("reset_credits_error"),
                 "can_refresh": self._upstream_auth_type(identity) == "oauth" and bool(auth_index)
-                and provider == "codex" and not bool(identity.get("disabled") or identity.get("unavailable")),
+                and self._oauth_quota_provider(identity) is not None
+                and not bool(identity.get("disabled") or identity.get("unavailable")),
             })
         accounts.sort(key=lambda item: (item["disabled"], str(item["name"]).casefold()))
         return accounts, account_by_auth, auth_by_account
@@ -4372,6 +4482,15 @@ class BillingService:
     def _cpa_account_provider(item: dict[str, Any]) -> str:
         return str(item.get("provider") or item.get("type") or "").strip().lower().replace("_", "-")
 
+    @classmethod
+    def _oauth_quota_provider(cls, item: dict[str, Any]) -> str | None:
+        provider = cls._cpa_account_provider(item)
+        if provider in CODEX_OAUTH_PROVIDERS:
+            return "codex"
+        if provider in XAI_OAUTH_PROVIDERS:
+            return "xai"
+        return None
+
     @staticmethod
     def _cpa_account_headers(item: dict[str, Any]) -> dict[str, str]:
         headers = {
@@ -4384,6 +4503,96 @@ class BillingService:
         if account_id:
             headers["Chatgpt-Account-Id"] = str(account_id)
         return headers
+
+    @staticmethod
+    def _cpa_xai_headers(item: dict[str, Any] | None = None) -> dict[str, str]:
+        headers = {
+            "Authorization": "Bearer $TOKEN$",
+            "Accept": "*/*",
+            "Content-Type": "application/json",
+            "x-xai-token-auth": "xai-grok-cli",
+            "x-grok-client-version": "0.2.91",
+            "User-Agent": "grok-pager/0.2.91 grok-shell/0.2.91 (macos; aarch64)",
+        }
+        identity = item or {}
+        user_id = (
+            identity.get("sub")
+            or identity.get("user_id")
+            or identity.get("userId")
+        )
+        if not user_id:
+            metadata = identity.get("metadata") if isinstance(identity.get("metadata"), dict) else {}
+            attributes = identity.get("attributes") if isinstance(identity.get("attributes"), dict) else {}
+            user_id = metadata.get("sub") or attributes.get("sub")
+        if user_id:
+            headers["x-userid"] = str(user_id)
+        return headers
+
+    def _cpa_xai_quota_item(
+        self,
+        account_id: str,
+        auth_index: str,
+        refreshed_at: str | None,
+        item: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        reset_credit_metadata = {
+            "reset_credits_available": None,
+            "reset_credits": [],
+            "reset_credits_error": None,
+        }
+        try:
+            # CPA has no quota-provider plugin for xAI OAuth. Its management
+            # panel probes the same usage via /v0/management/api-call.
+            result = self.cpa.api_call(
+                auth_index,
+                "GET",
+                XAI_BILLING_CREDITS_URL,
+                self._cpa_xai_headers(item),
+            )
+            status_code = int(result.get("status_code") or 0)
+            body = result.get("body")
+            payload = json.loads(body) if isinstance(body, str) and body.strip() else body
+            if status_code < 200 or status_code >= 300:
+                return {
+                    "account_id": account_id,
+                    "auth_index": auth_index,
+                    "status": "failed",
+                    "http_status_code": status_code or None,
+                    "error": f"上游额度接口返回 HTTP {status_code}",
+                    "refreshed_at": refreshed_at,
+                    "quota": {},
+                    **reset_credit_metadata,
+                }
+            if not isinstance(payload, dict) or not self._xai_billing_quota_rows(payload):
+                return {
+                    "account_id": account_id,
+                    "auth_index": auth_index,
+                    "status": "failed",
+                    "http_status_code": status_code,
+                    "error": "上游额度响应不是有效的 xAI billing 对象",
+                    "refreshed_at": refreshed_at,
+                    "quota": {},
+                    **reset_credit_metadata,
+                }
+            return {
+                "account_id": account_id,
+                "auth_index": auth_index,
+                "status": "completed",
+                "http_status_code": status_code,
+                "refreshed_at": refreshed_at,
+                "quota": payload,
+                **reset_credit_metadata,
+            }
+        except (BillingError, httpx.HTTPError, json.JSONDecodeError) as exc:
+            return {
+                "account_id": account_id,
+                "auth_index": auth_index,
+                "status": "failed",
+                "error": f"额度读取失败：{type(exc).__name__}",
+                "refreshed_at": refreshed_at,
+                "quota": {},
+                **reset_credit_metadata,
+            }
 
     def _cpa_accounts_raw(self, *, force: bool = False) -> dict[str, Any]:
         files = self.cpa.upstream_channels()
@@ -4406,8 +4615,8 @@ class BillingService:
                     "quota": {},
                 })
                 continue
-            provider = self._cpa_account_provider(item)
-            if provider != "codex":
+            quota_provider = self._oauth_quota_provider(item)
+            if quota_provider is None:
                 quota_items.append({
                     "account_id": account_id,
                     "auth_index": auth_index,
@@ -4415,6 +4624,9 @@ class BillingService:
                     "refreshed_at": None,
                     "quota": {},
                 })
+                continue
+            if quota_provider == "xai":
+                quota_items.append(self._cpa_xai_quota_item(account_id, auth_index, refreshed_at, item))
                 continue
             id_token = item.get("id_token") if isinstance(item.get("id_token"), dict) else {}
             account_token_id = id_token.get("chatgpt_account_id") or id_token.get("chatgptAccountId")
@@ -4442,7 +4654,7 @@ class BillingService:
                 result = self.cpa.api_call(
                     auth_index,
                     "GET",
-                    "https://chatgpt.com/backend-api/wham/usage",
+                    CODEX_USAGE_URL,
                     self._cpa_account_headers(item),
                 )
                 status_code = int(result.get("status_code") or 0)

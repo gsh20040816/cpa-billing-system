@@ -1084,6 +1084,95 @@ def test_cpa_accounts_are_sanitized_and_refresh_uses_public_account_ids(service,
     assert refresh["accepted"] == 1
 
 
+
+def test_xai_oauth_quota_uses_cpa_api_call(service, monkeypatch) -> None:
+    files = [{
+        "id": "xai-account",
+        "auth_index": "xai-auth-index",
+        "name": "gsh@example.com",
+        "label": "gsh@example.com",
+        "type": "xai",
+        "provider": "xai",
+        "account_type": "oauth",
+        "sub": "xai-user-1",
+        "disabled": False,
+        "unavailable": False,
+    }]
+    credits = {
+        "config": {
+            "currentPeriod": {
+                "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                "start": "2026-09-16T08:17:07.555893+00:00",
+                "end": "2026-09-23T08:17:07.555893+00:00",
+            },
+            "creditUsagePercent": 13.0,
+            "productUsage": [
+                {"product": "GrokBuild", "usagePercent": 13.0},
+                {"product": "GrokChat"},
+            ],
+            "billingPeriodStart": "2026-09-16T08:17:07.555893+00:00",
+            "billingPeriodEnd": "2026-09-23T08:17:07.555893+00:00",
+        }
+    }
+    calls = []
+
+    def api_call(auth_index, method, url, headers=None, data=""):
+        calls.append((auth_index, method, url, headers or {}, data))
+        assert auth_index == "xai-auth-index"
+        assert method == "GET"
+        assert url == "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
+        assert (headers or {}).get("Authorization") == "Bearer $TOKEN$"
+        assert (headers or {}).get("x-userid") == "xai-user-1"
+        return {"status_code": 200, "body": json.dumps(credits)}
+
+    monkeypatch.setattr(service.cpa, "auth_files", lambda: files)
+    monkeypatch.setattr(service.cpa, "api_call", api_call)
+    monkeypatch.setattr(service.cpa, "codex_reset_credits", lambda *args, **kwargs: pytest.fail("xAI must not query Codex reset credits"))
+
+    snapshot = service.accounts_snapshot()
+    serialized = json.dumps(snapshot)
+    assert "xai-auth-index" not in serialized
+    account = snapshot["accounts"][0]
+    assert account["id"] == "xai-account"
+    assert account["auth_type"] == "oauth"
+    assert account["can_refresh"] is True
+    assert account["quota_status"] == "completed"
+    assert account["reset_credits"] == []
+    assert account["reset_credits_available"] is None
+    rows = {item["key"]: item for item in account["quota"]}
+    assert rows["xai.credit_usage"]["used_percent"] == 13.0
+    assert rows["xai.credit_usage"]["window_seconds"] == 7 * 24 * 60 * 60
+    assert rows["xai.credit_usage"]["limit_reached"] is False
+    assert rows["xai.product.GrokBuild"]["used_percent"] == 13.0
+    assert rows["xai.product.GrokBuild"]["scope"] == "feature"
+    assert "xai.product.GrokChat" not in rows
+    assert len(calls) == 1
+
+    refresh = service.refresh_account_quotas(["xai-account"])
+    assert refresh["tasks"] == []
+    assert refresh["accepted"] == 1
+    assert len(calls) == 2
+
+
+def test_unknown_oauth_provider_stays_unsupported_without_quota_probe(service, monkeypatch) -> None:
+    monkeypatch.setattr(service.cpa, "auth_files", lambda: [{
+        "id": "claude-account",
+        "auth_index": "claude-auth",
+        "type": "claude",
+        "provider": "claude",
+        "account_type": "oauth",
+        "disabled": False,
+    }])
+    monkeypatch.setattr(service.cpa, "api_call", lambda *args, **kwargs: pytest.fail("unsupported OAuth must not probe quota"))
+    monkeypatch.setattr(service.cpa, "codex_reset_credits", lambda *args, **kwargs: pytest.fail("unsupported OAuth must not query reset credits"))
+
+    snapshot = service.accounts_snapshot()
+    account = snapshot["accounts"][0]
+    assert account["quota_status"] == "unsupported"
+    assert account["can_refresh"] is False
+    assert account["quota"] == []
+
+
 def test_cpa_reset_credit_connector_429_is_cooled(service, monkeypatch) -> None:
     calls = []
 
