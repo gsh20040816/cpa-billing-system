@@ -19,15 +19,32 @@ const tab = ref('overview')
 const snackbar = reactive({ show: false, text: '', color: 'success' })
 
 const cycleDialog = reactive({
-  open: false, name: '', start: '', end: '', gradient_rule_id: null, upstream_costs: {}, waiver: '',
+  open: false, name: '', start: '', end: '', waiver: '',
 })
 const cycleConfigDialog = reactive({
-  open: false, cycle: null, gradient_rule_id: null, upstream_costs: {}, reason: '',
+  open: false, cycle: null, reason: '',
+})
+const groupDialog = reactive({
+  open: false, id: null, name: '', gradient_rule_id: null, reason: '',
+})
+const deleteGroupDialog = reactive({ open: false, group: null, reason: '' })
+const accountBillingDialog = reactive({
+  open: false,
+  account: null,
+  group_id: null,
+  subscription_mode: 'recurring',
+  period_start: '',
+  period_end: '',
+  recurring_unit: 'month',
+  recurring_interval: 1,
+  period_cost: '',
+  rate: '',
+  reason: '',
 })
 const closeDialog = reactive({ open: false, cycle: null, confirm_close: false, confirm_waiver: false })
 const adjustmentDialog = reactive({ open: false, cycle: '', telegram_user_id: '', amount_cents: '', reason: '' })
 const manualUsageDialog = reactive({
-  open: false, id: null, cycle: '', pool_id: null, telegram_user_id: null, amount_usd: '', reason: '',
+  open: false, id: null, cycle: '', pool_id: null, group_id: null, telegram_user_id: null, amount_usd: '', reason: '',
 })
 const transferDialog = reactive({ open: false, key_id: '', telegram_user_id: '', reason: '', confirm_transfer: false })
 const poolDialog = reactive({ open: false, name: '', auth_pattern: '', model_pattern: '', priority: 100 })
@@ -84,10 +101,14 @@ const pricingModels = computed(() => {
   const needle = pricingSearch.value.trim().toLowerCase()
   return (admin.value.pricing_rules?.models || []).filter((item) => !needle || item.model.toLowerCase().includes(needle))
 })
+const upstreamGroups = computed(() => admin.value.upstream_groups || [])
+const accountConfigs = computed(() => admin.value.account_configs || [])
 const manualUsagePools = computed(() => {
   const cycle = openCycles.value.find((item) => item.name === manualUsageDialog.cycle)
-  return cycle?.pool_costs || []
+  if (cycle?.pool_costs?.length) return cycle.pool_costs
+  return activePools.value.map((pool) => ({ pool_id: pool.id, pool: pool.name }))
 })
+const cycleAccountsReady = computed(() => upstreamAccounts.value.length > 0 && upstreamAccounts.value.every((account) => accountBillingReady(account)))
 const metrics = computed(() => [
   { label: 'CPAMP 事件', value: number(reconciliation.value.cpamp_events), mono: true },
   { label: '镜像事件', value: number(reconciliation.value.raw_events), mono: true },
@@ -159,10 +180,37 @@ function isUpstreamApiKey(account) {
   return ['api_key', 'api-key', 'apikey', 'key'].includes(String(account.auth_type || '').toLowerCase())
 }
 
+function toDatetimeLocal(value) {
+  if (!value) return ''
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return String(value).slice(0, 16)
+  const pad = (item) => String(item).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`
+}
+
+function accountConfig(accountId) {
+  return accountConfigs.value.find((item) => item.account_id === accountId) || null
+}
+
+function accountBillingReady(account) {
+  const config = accountConfig(account.id)
+  if (!config) return false
+  if (isUpstreamApiKey(account)) return Boolean(config.rate)
+  return Boolean(config.subscription_mode && config.period_start && config.period_cost)
+}
+
+function accountBillingSummary(account) {
+  const config = accountConfig(account.id)
+  if (!config) return '未配置'
+  if (isUpstreamApiKey(account)) return `${config.rate || '-'} ¥/USD · ${config.group_name || '未分组'}`
+  const mode = config.subscription_mode === 'recurring' ? '循环' : '一次性'
+  return `${mode} ${config.period_cost ? money(config.period_cost, '¥') : '-'} · ${config.group_name || '未分组'}`
+}
+
 function accountCycleCosts(account) {
   return openCycles.value.map((cycle) => {
     const cost = (cycle.upstream_costs || []).find((item) => item.account_id === account.id)
-    if (!cost) return { cycle: cycle.name, value: '未配置' }
+    if (!cost) return { cycle: cycle.name, value: '未冻结' }
     return {
       cycle: cycle.name,
       value: isUpstreamApiKey(account) ? `${cost.rate} ¥/USD` : money(cost.fixed_cost, '¥'),
@@ -170,33 +218,51 @@ function accountCycleCosts(account) {
   })
 }
 
-function openAccountCost(account) {
-  const cycle = openCycles.value.find((item) => (
-    item.upstream_costs || []
-  ).some((cost) => cost.account_id === account.id)) || openCycles.value[0]
-  if (!cycle) {
-    notify('当前没有可配置的开放账期', 'warning')
-    return
-  }
-  openCycleConfig(cycle)
-}
-
-function initializeUpstreamCosts(target, existing = [], accounts = upstreamAccounts.value) {
-  target.upstream_costs = {}
-  accounts.forEach((account) => {
-    const current = existing.find((item) => item.account_id === account.id)
-    target.upstream_costs[account.id] = isUpstreamApiKey(account)
-      ? (current?.rate || '0')
-      : (current?.fixed_cost || '0.00')
+function openAccountBilling(account) {
+  const config = accountConfig(account.id)
+  const defaultGroup = upstreamGroups.value.find((item) => item.is_default) || upstreamGroups.value[0]
+  Object.assign(accountBillingDialog, {
+    open: true,
+    account,
+    group_id: config?.group_id || defaultGroup?.id || null,
+    subscription_mode: config?.subscription_mode || (isUpstreamApiKey(account) ? null : 'recurring'),
+    period_start: toDatetimeLocal(config?.period_start),
+    period_end: toDatetimeLocal(config?.period_end),
+    recurring_unit: config?.recurring_unit || 'month',
+    recurring_interval: config?.recurring_interval || 1,
+    period_cost: config?.period_cost || '',
+    rate: config?.rate || '',
+    reason: '',
   })
 }
 
-function upstreamCostsPayload(target, accounts = upstreamAccounts.value) {
-  return accounts.map((account) => ({
-    account_id: account.id,
-    fixed_cost: isUpstreamApiKey(account) ? null : String(target.upstream_costs[account.id] || '0'),
-    rate: isUpstreamApiKey(account) ? String(target.upstream_costs[account.id] || '0') : null,
-  }))
+async function saveAccountBilling() {
+  const account = accountBillingDialog.account
+  if (!account || !accountBillingDialog.reason.trim() || !accountBillingDialog.group_id) {
+    notify('请填写分组和修改原因', 'warning')
+    return
+  }
+  const body = {
+    group_id: Number(accountBillingDialog.group_id),
+    reason: accountBillingDialog.reason.trim(),
+  }
+  if (isUpstreamApiKey(account)) {
+    body.rate = String(accountBillingDialog.rate || '')
+  } else {
+    body.subscription_mode = accountBillingDialog.subscription_mode
+    body.period_start = accountBillingDialog.period_start
+    body.period_end = accountBillingDialog.period_end || null
+    body.recurring_unit = accountBillingDialog.subscription_mode === 'recurring' ? accountBillingDialog.recurring_unit : null
+    body.recurring_interval = accountBillingDialog.subscription_mode === 'recurring' ? Number(accountBillingDialog.recurring_interval || 1) : null
+    body.period_cost = String(accountBillingDialog.period_cost || '')
+  }
+  const result = await mutate(
+    `/api/admin/accounts/${encodeURIComponent(account.id)}/billing`,
+    body,
+    '上游账号计费配置已保存',
+    'PUT',
+  )
+  if (result) accountBillingDialog.open = false
 }
 
 function openCreateCycle() {
@@ -205,10 +271,8 @@ function openCreateCycle() {
     name: '',
     start: '',
     end: '',
-    gradient_rule_id: activeGradients.value[0]?.id || null,
     waiver: '',
   })
-  initializeUpstreamCosts(cycleDialog)
 }
 
 async function createCycle() {
@@ -217,8 +281,7 @@ async function createCycle() {
     start: cycleDialog.start,
     end: cycleDialog.end,
     fixed_cost: '0',
-    gradient_rule_id: cycleDialog.gradient_rule_id,
-    upstream_costs: upstreamCostsPayload(cycleDialog),
+    upstream_costs: upstreamAccounts.value.map((account) => ({ account_id: account.id })),
     waiver: cycleDialog.waiver || null,
   }, '账期已创建')
   if (result) cycleDialog.open = false
@@ -228,20 +291,53 @@ function openCycleConfig(cycle) {
   Object.assign(cycleConfigDialog, {
     open: true,
     cycle,
-    gradient_rule_id: cycle.gradient_rule_id,
     reason: '',
   })
-  initializeUpstreamCosts(cycleConfigDialog, cycle.upstream_costs || [], cycleConfigAccounts.value)
 }
 
 async function saveCycleConfig() {
   const cycle = cycleConfigDialog.cycle
   const result = await mutate(`/api/admin/cycles/${encodeURIComponent(cycle.name)}/configuration`, {
-    gradient_rule_id: cycleConfigDialog.gradient_rule_id,
-    upstream_costs: upstreamCostsPayload(cycleConfigDialog, cycleConfigAccounts.value),
     reason: cycleConfigDialog.reason,
-  }, '账期计费配置已更新', 'PUT')
+    upstream_costs: cycleConfigAccounts.value.map((account) => ({ account_id: account.id })),
+  }, '已按当前账号配置重新冻结账期', 'PUT')
   if (result) cycleConfigDialog.open = false
+}
+
+function openGroupDialog(group = null) {
+  Object.assign(groupDialog, {
+    open: true,
+    id: group?.id || null,
+    name: group?.name || '',
+    gradient_rule_id: group?.gradient_rule_id || activeGradients.value[0]?.id || null,
+    reason: '',
+  })
+}
+
+async function saveGroup() {
+  const editing = Boolean(groupDialog.id)
+  const path = editing ? `/api/admin/upstream-groups/${groupDialog.id}` : '/api/admin/upstream-groups'
+  const result = await mutate(path, {
+    name: groupDialog.name,
+    gradient_rule_id: groupDialog.gradient_rule_id,
+    reason: groupDialog.reason,
+  }, editing ? '上游分组已更新' : '上游分组已创建', editing ? 'PUT' : 'POST')
+  if (result) groupDialog.open = false
+}
+
+function openDeleteGroup(group) {
+  Object.assign(deleteGroupDialog, { open: true, group, reason: '' })
+}
+
+async function deleteGroup() {
+  const group = deleteGroupDialog.group
+  const result = await mutate(
+    `/api/admin/upstream-groups/${group.id}`,
+    { reason: deleteGroupDialog.reason },
+    '上游分组已删除',
+    'DELETE',
+  )
+  if (result) deleteGroupDialog.open = false
 }
 
 async function previewCycle(name) {
@@ -273,7 +369,8 @@ async function createAdjustment() {
 function selectManualUsageCycle(cycleName) {
   manualUsageDialog.cycle = cycleName
   const cycle = openCycles.value.find((item) => item.name === cycleName)
-  manualUsageDialog.pool_id = cycle?.pool_costs?.[0]?.pool_id || null
+  manualUsageDialog.pool_id = cycle?.pool_costs?.[0]?.pool_id || activePools.value[0]?.id || null
+  manualUsageDialog.group_id = cycle?.groups?.[0]?.group_id || upstreamGroups.value.find((item) => item.is_default)?.id || null
 }
 
 function openManualUsage(item = null) {
@@ -283,6 +380,7 @@ function openManualUsage(item = null) {
       id: item.id,
       cycle: item.cycle,
       pool_id: item.pool_id,
+      group_id: item.group_id,
       telegram_user_id: item.user_id,
       amount_usd: item.amount_usd,
       reason: item.reason,
@@ -294,7 +392,8 @@ function openManualUsage(item = null) {
     open: true,
     id: null,
     cycle: cycle?.name || '',
-    pool_id: cycle?.pool_costs?.[0]?.pool_id || null,
+    pool_id: cycle?.pool_costs?.[0]?.pool_id || activePools.value[0]?.id || null,
+    group_id: cycle?.groups?.[0]?.group_id || upstreamGroups.value.find((item) => item.is_default)?.id || null,
     telegram_user_id: registeredUsers.value[0]?.id || null,
     amount_usd: '',
     reason: '',
@@ -309,6 +408,7 @@ async function saveManualUsage() {
   const result = await mutate(path, {
     cycle: manualUsageDialog.cycle,
     pool_id: Number(manualUsageDialog.pool_id),
+    group_id: manualUsageDialog.group_id ? Number(manualUsageDialog.group_id) : null,
     telegram_user_id: Number(manualUsageDialog.telegram_user_id),
     amount_usd: String(manualUsageDialog.amount_usd),
     reason: manualUsageDialog.reason,
@@ -583,8 +683,8 @@ const autoRefresh = useAutoRefresh((silent) => load(silent), { interval: 30_000 
             <div class="section-band__head"><div><h2>上游账号</h2><p>额度与窗口来自 CPA 上游读取，用量与费用来自本地账本</p></div></div>
             <div class="section-band__body section-band__body--flush">
               <v-table density="compact">
-                <thead><tr><th>账号</th><th>类型</th><th>计划</th><th class="text-right">请求</th><th class="text-right">Tokens</th><th class="text-right">费用</th><th>开放账期成本</th><th>额度</th><th class="text-right">操作</th></tr></thead>
-                <tbody><tr v-for="item in data?.accounts?.accounts || []" :key="item.id"><td>{{ item.name }}</td><td><v-chip size="small" variant="tonal">{{ isUpstreamApiKey(item) ? 'API key' : 'OAuth' }}</v-chip></td><td>{{ item.plan_type || '-' }}</td><td class="text-right mono">{{ number(item.usage.requests) }}</td><td class="text-right mono">{{ number(item.usage.total_tokens) }}</td><td class="text-right mono">{{ money(item.usage.cost) }}</td><td><div v-for="cost in accountCycleCosts(item)" :key="cost.cycle"><span class="data-muted text-caption">{{ cost.cycle }}</span> <strong class="mono">{{ cost.value }}</strong></div><span v-if="!openCycles.length" class="data-muted">无开放账期</span></td><td><div v-for="quota in item.quota || []" :key="quota.key"><div>{{ quota.label }}</div><div class="data-muted text-caption">恢复 {{ dateTime(quota.reset_at) }}</div></div><div v-for="credit in item.reset_credits || []" :key="credit.id" class="data-muted text-caption">主动重置过期 {{ dateTime(credit.expires_at) }}</div><span v-if="!item.quota?.length && !item.reset_credits?.length" class="data-muted">-</span></td><td class="text-right admin-actions"><v-btn size="small" variant="text" :disabled="!openCycles.length" @click="openAccountCost(item)"><Edit3 :size="15" class="mr-1" />{{ isUpstreamApiKey(item) ? '配置费率' : '配置成本' }}</v-btn><v-btn v-if="item.can_refresh && item.reset_credits?.length" size="small" variant="text" color="warning" @click="openResetQuota(item)"><RefreshCw :size="15" class="mr-1" />重置上游额度</v-btn><span v-else-if="item.can_refresh" class="data-muted">无可用主动重置次数</span></td></tr></tbody>
+                <thead><tr><th>账号</th><th>类型</th><th>计划</th><th class="text-right">请求</th><th class="text-right">Tokens</th><th class="text-right">费用</th><th>计费配置</th><th>开放账期成本</th><th>额度</th><th class="text-right">操作</th></tr></thead>
+                <tbody><tr v-for="item in data?.accounts?.accounts || []" :key="item.id"><td>{{ item.name }}</td><td><v-chip size="small" variant="tonal">{{ isUpstreamApiKey(item) ? 'API key' : 'OAuth' }}</v-chip></td><td>{{ item.plan_type || '-' }}</td><td class="text-right mono">{{ number(item.usage.requests) }}</td><td class="text-right mono">{{ number(item.usage.total_tokens) }}</td><td class="text-right mono">{{ money(item.usage.cost) }}</td><td><div>{{ accountBillingSummary(item) }}</div></td><td><div v-for="cost in accountCycleCosts(item)" :key="cost.cycle"><span class="data-muted text-caption">{{ cost.cycle }}</span> <strong class="mono">{{ cost.value }}</strong></div><span v-if="!openCycles.length" class="data-muted">无开放账期</span></td><td><div v-for="quota in item.quota || []" :key="quota.key"><div>{{ quota.label }}</div><div class="data-muted text-caption">恢复 {{ dateTime(quota.reset_at) }}</div></div><div v-for="credit in item.reset_credits || []" :key="credit.id" class="data-muted text-caption">主动重置过期 {{ dateTime(credit.expires_at) }}</div><span v-if="!item.quota?.length && !item.reset_credits?.length" class="data-muted">-</span></td><td class="text-right admin-actions"><v-btn size="small" variant="text" @click="openAccountBilling(item)"><Edit3 :size="15" class="mr-1" />配置计费</v-btn><v-btn v-if="item.can_refresh && item.reset_credits?.length" size="small" variant="text" color="warning" @click="openResetQuota(item)"><RefreshCw :size="15" class="mr-1" />重置上游额度</v-btn><span v-else-if="item.can_refresh" class="data-muted">无可用主动重置次数</span></td></tr></tbody>
               </v-table>
             </div>
           </section>
@@ -598,13 +698,16 @@ const autoRefresh = useAutoRefresh((silent) => load(silent), { interval: 30_000 
             </div>
             <div class="section-band__body section-band__body--flush">
               <v-table density="compact">
-                <thead><tr><th>名称</th><th>时间</th><th>价格版本</th><th>梯度规则</th><th>上游渠道成本</th><th>状态</th><th class="text-right">操作</th></tr></thead>
+                <thead><tr><th>名称</th><th>时间</th><th>价格版本</th><th>上游分组</th><th>上游渠道成本</th><th>状态</th><th class="text-right">操作</th></tr></thead>
                 <tbody>
                   <tr v-for="item in admin.cycles || []" :key="item.name">
                     <td><div class="mono">{{ item.name }}</div><div v-if="item.waiver" class="data-muted text-caption admin-wrap">{{ item.waiver }}</div></td>
                     <td><div>{{ item.start }}</div><div class="data-muted text-caption">至 {{ item.end }}</div></td>
                     <td>{{ item.pricing_version || '-' }}</td>
-                    <td>{{ item.gradient_rule || '-' }}</td>
+                    <td>
+                      <div v-for="group in item.groups || []" :key="group.group_id">{{ group.group }} · {{ group.gradient_rule }}</div>
+                      <span v-if="!item.groups?.length">{{ item.gradient_rule || '-' }}</span>
+                    </td>
                     <td>
                       <template v-if="item.upstream_costs?.length">
                         <div v-for="cost in item.upstream_costs" :key="cost.account_id">
@@ -682,7 +785,30 @@ const autoRefresh = useAutoRefresh((silent) => load(silent), { interval: 30_000 
         <v-window-item value="rules">
           <section class="section-band">
             <div class="section-band__head">
-              <div><h2>梯度规则</h2><p>修改会传播到关联的未关闭账期；关闭账期保留快照</p></div>
+              <div><h2>上游账号分组</h2><p>分组独立计费后再加总；迁移默认全部账号在 default 组</p></div>
+              <v-btn color="primary" size="small" @click="openGroupDialog()"><Plus :size="16" class="mr-2" />新建分组</v-btn>
+            </div>
+            <div class="section-band__body section-band__body--flush">
+              <v-table density="compact">
+                <thead><tr><th>名称</th><th>梯度规则</th><th class="text-right">账号数</th><th>状态</th><th class="text-right">操作</th></tr></thead>
+                <tbody>
+                  <tr v-for="group in upstreamGroups" :key="group.id">
+                    <td>{{ group.name }}</td>
+                    <td>{{ group.gradient_rule }}</td>
+                    <td class="text-right mono">{{ number(group.account_count) }}</td>
+                    <td><v-chip size="small" variant="tonal">{{ group.is_default ? '默认' : '自定义' }}</v-chip></td>
+                    <td class="text-right admin-actions">
+                      <v-btn size="small" variant="text" @click="openGroupDialog(group)"><Edit3 :size="15" class="mr-1" />编辑</v-btn>
+                      <v-btn v-if="!group.is_default" size="small" variant="text" color="error" @click="openDeleteGroup(group)"><Trash2 :size="15" class="mr-1" />删除</v-btn>
+                    </td>
+                  </tr>
+                </tbody>
+              </v-table>
+            </div>
+          </section>
+          <section class="section-band">
+            <div class="section-band__head">
+              <div><h2>梯度规则</h2><p>修改会传播到关联的未关闭账期和上游分组；关闭账期保留快照</p></div>
               <v-btn size="small" color="primary" @click="openGradient()"><Plus :size="16" class="mr-2" />新增规则</v-btn>
             </div>
             <div class="section-band__body section-band__body--flush">
@@ -825,11 +951,11 @@ const autoRefresh = useAutoRefresh((silent) => load(silent), { interval: 30_000 
     </v-dialog>
 
     <v-dialog v-model="cycleDialog.open" max-width="760">
-      <v-card><v-card-title>创建账期</v-card-title><v-card-text><div class="dialog-grid"><v-text-field v-model="cycleDialog.name" label="名称" /><v-select v-model="cycleDialog.gradient_rule_id" :items="activeGradients" item-title="name" item-value="id" label="梯度规则" /><v-text-field v-model="cycleDialog.start" label="开始时间" type="datetime-local" /><v-text-field v-model="cycleDialog.end" label="结束时间" type="datetime-local" /><div class="dialog-wide pool-cost-editor"><div class="editor-label">上游渠道成本</div><div class="data-muted text-caption mb-3">OAuth 按账号填写账期固定成本；API key 按渠道填写人民币 / USD 费率，实际消耗会动态加入成本。</div><v-alert v-if="!upstreamAccounts.length" type="warning" variant="tonal">CPA 当前未返回可配置的上游账号，不能创建新成本模型账期。</v-alert><v-text-field v-for="account in upstreamAccounts" :key="account.id" v-model="cycleDialog.upstream_costs[account.id]" :label="account.name" type="number" min="0" :step="isUpstreamApiKey(account) ? 0.000001 : 0.01" :prefix="isUpstreamApiKey(account) ? undefined : '¥'" :suffix="isUpstreamApiKey(account) ? '¥ / USD' : '固定 / 账期'" /></div><v-textarea v-model="cycleDialog.waiver" label="数据质量说明" rows="2" class="dialog-wide" /></div></v-card-text><v-card-actions><v-spacer /><v-btn variant="text" @click="cycleDialog.open = false">取消</v-btn><v-btn color="primary" :loading="mutating" :disabled="!upstreamAccounts.length" @click="createCycle"><Save :size="16" class="mr-2" />创建</v-btn></v-card-actions></v-card>
+      <v-card><v-card-title>创建账期</v-card-title><v-card-text><div class="dialog-grid"><v-text-field v-model="cycleDialog.name" label="名称" /><v-text-field v-model="cycleDialog.start" label="开始时间" type="datetime-local" /><v-text-field v-model="cycleDialog.end" label="结束时间" type="datetime-local" /><div class="dialog-wide pool-cost-editor"><div class="editor-label">将按账号订阅与分组冻结成本</div><div class="data-muted text-caption mb-3">OAuth 按订阅周期摊入本账期；API key 使用已配置费率。请先在上游账号里完成计费配置。</div><v-alert v-if="!upstreamAccounts.length" type="warning" variant="tonal">CPA 当前未返回可配置的上游账号，不能创建新成本模型账期。</v-alert><v-alert v-else-if="!cycleAccountsReady" type="warning" variant="tonal">还有上游账号未完成订阅或费率配置。</v-alert><v-table v-if="upstreamAccounts.length" density="compact"><thead><tr><th>账号</th><th>分组 / 订阅</th></tr></thead><tbody><tr v-for="account in upstreamAccounts" :key="account.id"><td>{{ account.name }}</td><td>{{ accountBillingSummary(account) }}</td></tr></tbody></v-table></div><v-textarea v-model="cycleDialog.waiver" label="数据质量说明" rows="2" class="dialog-wide" /></div></v-card-text><v-card-actions><v-spacer /><v-btn variant="text" @click="cycleDialog.open = false">取消</v-btn><v-btn color="primary" :loading="mutating" :disabled="!cycleAccountsReady" @click="createCycle"><Save :size="16" class="mr-2" />创建</v-btn></v-card-actions></v-card>
     </v-dialog>
 
     <v-dialog v-model="cycleConfigDialog.open" max-width="680">
-      <v-card><v-card-title>配置账期 {{ cycleConfigDialog.cycle?.name }}</v-card-title><v-card-text><v-select v-model="cycleConfigDialog.gradient_rule_id" :items="activeGradients" item-title="name" item-value="id" label="梯度规则" /><div class="pool-cost-editor mt-4"><div class="editor-label">上游渠道成本</div><div class="data-muted text-caption mb-3">保存后会冻结账号身份与费率快照，并重新计算开放账期。</div><v-alert v-if="cycleConfigDialog.cycle?.billing_model === 'legacy_pool_fixed'" type="info" variant="tonal" class="mb-3">该账期仍使用旧资源池固定成本；本次保存会迁移到上游渠道成本模型。</v-alert><v-text-field v-for="account in cycleConfigAccounts" :key="account.id" v-model="cycleConfigDialog.upstream_costs[account.id]" :label="account.name" type="number" min="0" :step="isUpstreamApiKey(account) ? 0.000001 : 0.01" :prefix="isUpstreamApiKey(account) ? undefined : '¥'" :suffix="isUpstreamApiKey(account) ? '¥ / USD' : '固定 / 账期'" /></div><v-textarea v-model="cycleConfigDialog.reason" label="修改原因" rows="2" class="mt-4" /></v-card-text><v-card-actions><v-spacer /><v-btn variant="text" @click="cycleConfigDialog.open = false">取消</v-btn><v-btn color="primary" :loading="mutating" :disabled="!cycleConfigAccounts.length" @click="saveCycleConfig"><Save :size="16" class="mr-2" />保存配置</v-btn></v-card-actions></v-card>
+      <v-card><v-card-title>配置账期 {{ cycleConfigDialog.cycle?.name }}</v-card-title><v-card-text><div class="data-muted text-caption mb-3">保存后会按当前账号订阅、费率和分组重新冻结快照，并重新计算开放账期。</div><v-alert v-if="cycleConfigDialog.cycle?.billing_model === 'legacy_pool_fixed'" type="info" variant="tonal" class="mb-3">该账期仍使用旧资源池固定成本；本次保存会迁移到上游渠道成本模型。</v-alert><v-table density="compact"><thead><tr><th>账号</th><th>当前配置</th></tr></thead><tbody><tr v-for="account in cycleConfigAccounts" :key="account.id"><td>{{ account.name }}</td><td>{{ accountBillingSummary(account) }}</td></tr></tbody></v-table><v-textarea v-model="cycleConfigDialog.reason" label="修改原因" rows="2" class="mt-4" /></v-card-text><v-card-actions><v-spacer /><v-btn variant="text" @click="cycleConfigDialog.open = false">取消</v-btn><v-btn color="primary" :loading="mutating" :disabled="!cycleConfigAccounts.length || !cycleConfigDialog.reason.trim()" @click="saveCycleConfig"><Save :size="16" class="mr-2" />重新冻结</v-btn></v-card-actions></v-card>
     </v-dialog>
 
     <v-dialog v-model="gradientDialog.open" max-width="820">
@@ -886,6 +1012,7 @@ const autoRefresh = useAutoRefresh((silent) => load(silent), { interval: 30_000 
           <div class="dialog-grid">
             <v-select :model-value="manualUsageDialog.cycle" :items="openCycles" item-title="name" item-value="name" label="未关闭账期" @update:model-value="selectManualUsageCycle" />
             <v-select v-model="manualUsageDialog.pool_id" :items="manualUsagePools" item-title="pool" item-value="pool_id" label="资源池" />
+            <v-select v-model="manualUsageDialog.group_id" :items="upstreamGroups" item-title="name" item-value="id" label="上游分组" />
             <v-autocomplete v-model="manualUsageDialog.telegram_user_id" :items="registeredUsers" item-title="name" item-value="id" label="Telegram 用户" />
             <v-text-field v-model="manualUsageDialog.amount_usd" label="原始等效用量（USD）" type="number" step="0.000000001" prefix="$" />
             <v-textarea v-model="manualUsageDialog.reason" label="原因" rows="2" class="dialog-wide" />
@@ -907,6 +1034,53 @@ const autoRefresh = useAutoRefresh((silent) => load(silent), { interval: 30_000 
           <v-textarea v-model="userAdminDialog.reason" label="变更原因" rows="3" autofocus />
         </v-card-text>
         <v-card-actions><v-spacer /><v-btn variant="text" @click="userAdminDialog.open = false">取消</v-btn><v-btn color="primary" :disabled="!userAdminDialog.reason.trim()" :loading="mutating" @click="saveUserAdmin">确认变更</v-btn></v-card-actions>
+      </v-card>
+    </v-dialog>
+
+    <v-dialog v-model="accountBillingDialog.open" max-width="680">
+      <v-card>
+        <v-card-title>配置上游计费 {{ accountBillingDialog.account?.name }}</v-card-title>
+        <v-card-text>
+          <div class="dialog-grid">
+            <v-select v-model="accountBillingDialog.group_id" :items="upstreamGroups" item-title="name" item-value="id" label="上游分组" />
+            <template v-if="isUpstreamApiKey(accountBillingDialog.account || {})">
+              <v-text-field v-model="accountBillingDialog.rate" label="人民币 / USD 费率" type="number" min="0" step="0.000001" suffix="¥ / USD" />
+            </template>
+            <template v-else>
+              <v-select v-model="accountBillingDialog.subscription_mode" :items="[{title:'循环订阅',value:'recurring'},{title:'一次性',value:'one_time'}]" item-title="title" item-value="value" label="订阅类型" />
+              <v-text-field v-model="accountBillingDialog.period_start" label="订阅开始" type="datetime-local" />
+              <v-text-field v-model="accountBillingDialog.period_end" :label="accountBillingDialog.subscription_mode === 'recurring' ? '订阅结束（可空）' : '订阅结束'" type="datetime-local" />
+              <v-select v-if="accountBillingDialog.subscription_mode === 'recurring'" v-model="accountBillingDialog.recurring_unit" :items="[{title:'按月',value:'month'},{title:'按天',value:'day'}]" item-title="title" item-value="value" label="循环单位" />
+              <v-text-field v-if="accountBillingDialog.subscription_mode === 'recurring'" v-model="accountBillingDialog.recurring_interval" label="循环间隔" type="number" min="1" />
+              <v-text-field v-model="accountBillingDialog.period_cost" label="每周期成本" type="number" min="0" step="0.01" prefix="¥" />
+            </template>
+            <v-textarea v-model="accountBillingDialog.reason" label="修改原因" rows="2" class="dialog-wide" />
+          </div>
+        </v-card-text>
+        <v-card-actions><v-spacer /><v-btn variant="text" @click="accountBillingDialog.open = false">取消</v-btn><v-btn color="primary" :loading="mutating" :disabled="!accountBillingDialog.reason.trim() || !accountBillingDialog.group_id" @click="saveAccountBilling"><Save :size="16" class="mr-2" />保存</v-btn></v-card-actions>
+      </v-card>
+    </v-dialog>
+
+    <v-dialog v-model="groupDialog.open" max-width="560">
+      <v-card>
+        <v-card-title>{{ groupDialog.id ? '编辑上游分组' : '新建上游分组' }}</v-card-title>
+        <v-card-text>
+          <v-text-field v-model="groupDialog.name" label="名称" :disabled="Boolean(groupDialog.id && upstreamGroups.find((item) => item.id === groupDialog.id)?.is_default)" />
+          <v-select v-model="groupDialog.gradient_rule_id" :items="activeGradients" item-title="name" item-value="id" label="梯度规则" class="mt-3" />
+          <v-textarea v-model="groupDialog.reason" label="修改原因" rows="2" class="mt-3" />
+        </v-card-text>
+        <v-card-actions><v-spacer /><v-btn variant="text" @click="groupDialog.open = false">取消</v-btn><v-btn color="primary" :loading="mutating" :disabled="!groupDialog.name || !groupDialog.gradient_rule_id || !groupDialog.reason.trim()" @click="saveGroup"><Save :size="16" class="mr-2" />保存</v-btn></v-card-actions>
+      </v-card>
+    </v-dialog>
+
+    <v-dialog v-model="deleteGroupDialog.open" max-width="520">
+      <v-card>
+        <v-card-title>删除上游分组</v-card-title>
+        <v-card-text>
+          <v-alert type="warning" variant="tonal" class="mb-4">仍有账号或未关闭账期占用的分组不能删除。</v-alert>
+          <v-textarea v-model="deleteGroupDialog.reason" label="删除原因" rows="2" />
+        </v-card-text>
+        <v-card-actions><v-spacer /><v-btn variant="text" @click="deleteGroupDialog.open = false">取消</v-btn><v-btn color="error" :loading="mutating" :disabled="!deleteGroupDialog.reason.trim()" @click="deleteGroup"><Trash2 :size="16" class="mr-2" />删除</v-btn></v-card-actions>
       </v-card>
     </v-dialog>
 

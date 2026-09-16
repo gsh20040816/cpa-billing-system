@@ -255,6 +255,30 @@ class GradientRule(Base):
     updated_at_ms: Mapped[int] = mapped_column(BigInteger)
 
 
+class UpstreamAccountGroup(Base):
+    __tablename__ = "upstream_account_groups"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(80), unique=True)
+    is_default: Mapped[bool] = mapped_column(Boolean, default=False)
+    gradient_rule_id: Mapped[int] = mapped_column(ForeignKey("gradient_rules.id"))
+    created_at_ms: Mapped[int] = mapped_column(BigInteger)
+    updated_at_ms: Mapped[int] = mapped_column(BigInteger)
+
+
+class UpstreamAccountConfig(Base):
+    __tablename__ = "upstream_account_configs"
+    account_id: Mapped[str] = mapped_column(String(200), primary_key=True)
+    group_id: Mapped[int] = mapped_column(ForeignKey("upstream_account_groups.id"))
+    subscription_mode: Mapped[str | None] = mapped_column(String(20))
+    period_start_at_ms: Mapped[int | None] = mapped_column(BigInteger)
+    period_end_at_ms: Mapped[int | None] = mapped_column(BigInteger)
+    recurring_unit: Mapped[str | None] = mapped_column(String(20))
+    recurring_interval: Mapped[int | None] = mapped_column(Integer)
+    period_cost_cents: Mapped[int | None] = mapped_column(BigInteger)
+    rate_ppm: Mapped[int | None] = mapped_column(BigInteger)
+    updated_at_ms: Mapped[int] = mapped_column(BigInteger)
+
+
 class BillingCycle(Base):
     __tablename__ = "billing_cycles"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -293,6 +317,31 @@ class CycleUpstreamCost(Base):
     token_count: Mapped[int | None] = mapped_column(BigInteger)
     actual_weight_nano_usd: Mapped[int | None] = mapped_column(BigInteger)
     amount_cents: Mapped[int | None] = mapped_column(BigInteger)
+    group_id: Mapped[int | None] = mapped_column(Integer)
+    group_name: Mapped[str | None] = mapped_column(String(80))
+    subscription_mode: Mapped[str | None] = mapped_column(String(20))
+    period_start_at_ms: Mapped[int | None] = mapped_column(BigInteger)
+    period_end_at_ms: Mapped[int | None] = mapped_column(BigInteger)
+    recurring_unit: Mapped[str | None] = mapped_column(String(20))
+    recurring_interval: Mapped[int | None] = mapped_column(Integer)
+    period_cost_cents: Mapped[int | None] = mapped_column(BigInteger)
+
+
+class CycleGroup(Base):
+    __tablename__ = "cycle_groups"
+    cycle_id: Mapped[int] = mapped_column(ForeignKey("billing_cycles.id"), primary_key=True)
+    group_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    group_name: Mapped[str] = mapped_column(String(80))
+    gradient_rule_id: Mapped[int] = mapped_column(ForeignKey("gradient_rules.id"))
+    tiers_json: Mapped[str] = mapped_column(Text)
+    is_default: Mapped[bool] = mapped_column(Boolean, default=False)
+    fixed_cost_cents: Mapped[int] = mapped_column(BigInteger, default=0)
+    dynamic_cost_cents: Mapped[int] = mapped_column(BigInteger, default=0)
+    metered_amount_cents: Mapped[int] = mapped_column(BigInteger, default=0)
+    residual_cost_cents: Mapped[int] = mapped_column(BigInteger, default=0)
+    member_amount_cents: Mapped[int] = mapped_column(BigInteger, default=0)
+    surplus_cents: Mapped[int] = mapped_column(BigInteger, default=0)
+    unallocated_cents: Mapped[int] = mapped_column(BigInteger, default=0)
 
 
 class Statement(Base):
@@ -314,6 +363,7 @@ class StatementLine(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     statement_id: Mapped[int] = mapped_column(ForeignKey("statements.id"))
     pool_id: Mapped[int] = mapped_column(ForeignKey("resource_pools.id"))
+    group_id: Mapped[int | None] = mapped_column(Integer)
     actual_weight_nano_usd: Mapped[int] = mapped_column(BigInteger)
     billed_weight_nano_usd: Mapped[int] = mapped_column(BigInteger)
     amount_cents: Mapped[int] = mapped_column(BigInteger)
@@ -350,10 +400,12 @@ class ManualUsageAdjustment(Base):
     __table_args__ = (
         CheckConstraint("amount_nano_usd != 0", name="ck_manual_usage_adjustments_nonzero"),
         Index("idx_manual_usage_cycle_pool_user", "cycle_id", "pool_id", "telegram_user_id"),
+        Index("idx_manual_usage_cycle_group_pool_user", "cycle_id", "group_id", "pool_id", "telegram_user_id"),
     )
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     cycle_id: Mapped[int] = mapped_column(ForeignKey("billing_cycles.id"))
     pool_id: Mapped[int] = mapped_column(ForeignKey("resource_pools.id"))
+    group_id: Mapped[int | None] = mapped_column(ForeignKey("upstream_account_groups.id"))
     telegram_user_id: Mapped[int] = mapped_column(ForeignKey("telegram_users.telegram_user_id"))
     amount_nano_usd: Mapped[int] = mapped_column(BigInteger)
     reason: Mapped[str] = mapped_column(Text)

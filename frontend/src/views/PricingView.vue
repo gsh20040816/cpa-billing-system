@@ -107,10 +107,11 @@ watch(cycle, (value, previous) => { if (previous && value !== previous) autoRefr
           <div class="section-band__head"><div><h2>{{ data?.billing?.billing_model === 'upstream_channels' ? '上游渠道成本' : '资源池固定成本' }}</h2><p>{{ data?.billing?.cycle?.name || '未选择账期' }} · {{ data?.billing?.billing_model === 'upstream_channels' ? 'OAuth 固定成本 + API key 动态成本' : '旧成本模型' }}</p></div></div>
           <div class="section-band__body section-band__body--flush">
             <v-table v-if="data?.billing?.billing_model === 'upstream_channels'" density="compact">
-              <thead><tr><th>上游账号</th><th>认证类型</th><th class="text-right">成本参数</th><th class="text-right">等效消耗 USD</th><th class="text-right">当前成本</th></tr></thead>
+              <thead><tr><th>上游账号</th><th>分组</th><th>认证类型</th><th class="text-right">成本参数</th><th class="text-right">等效消耗 USD</th><th class="text-right">当前成本</th></tr></thead>
               <tbody>
                 <tr v-for="item in data?.billing?.upstream_costs || []" :key="item.account_id">
                   <td>{{ item.account_name }}</td>
+                  <td>{{ item.group_name || '-' }}</td>
                   <td><v-chip size="small" variant="tonal">{{ item.auth_type === 'api_key' ? 'API key' : 'OAuth' }}</v-chip></td>
                   <td class="text-right mono">{{ item.auth_type === 'api_key' ? `${item.rate} ¥/USD` : money(item.fixed_cost, '¥') }}</td>
                   <td class="text-right mono">{{ money(item.actual) }}</td>

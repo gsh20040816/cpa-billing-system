@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import calendar
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
-from typing import Iterable
+from typing import Iterable, Iterator
+from zoneinfo import ZoneInfo
 
 
 NANO_USD = 1_000_000_000
@@ -89,3 +92,92 @@ def format_yuan_per_usd(amount_cents: int, usage_nano_usd: int) -> str | None:
         return None
     rate = Decimal(amount_cents) * Decimal(NANO_USD) / (Decimal(usage_nano_usd) * Decimal(100))
     return format(rate, ".6f")
+
+
+def add_calendar_months(value: datetime, months: int) -> datetime:
+    month_index = value.month - 1 + months
+    year = value.year + month_index // 12
+    month = month_index % 12 + 1
+    day = min(value.day, calendar.monthrange(year, month)[1])
+    return value.replace(year=year, month=month, day=day)
+
+
+def overlap_ms(start_a: int, end_a: int, start_b: int, end_b: int) -> int:
+    return max(0, min(end_a, end_b) - max(start_a, start_b))
+
+
+def iter_subscription_periods(
+    start_ms: int,
+    end_ms: int | None,
+    unit: str,
+    interval: int,
+    until_ms: int,
+    timezone: str,
+) -> Iterator[tuple[int, int]]:
+    zone = ZoneInfo(timezone)
+    start = datetime.fromtimestamp(start_ms / 1000, zone)
+    hard_end = None if end_ms is None else datetime.fromtimestamp(end_ms / 1000, zone)
+    limit = datetime.fromtimestamp(until_ms / 1000, zone)
+    index = 0
+    while index <= 2400:
+        if unit == "month":
+            period_start = add_calendar_months(start, index * interval)
+            period_end = add_calendar_months(start, (index + 1) * interval)
+        else:
+            period_start = start + timedelta(days=interval * index)
+            period_end = start + timedelta(days=interval * (index + 1))
+        if hard_end is not None:
+            if period_start >= hard_end:
+                return
+            if period_end > hard_end:
+                period_end = hard_end
+        if period_start >= limit:
+            return
+        yield int(period_start.timestamp() * 1000), int(period_end.timestamp() * 1000)
+        index += 1
+    raise ValueError("subscription period iteration exceeded limit")
+
+
+def prorate_subscription_cost(
+    *,
+    mode: str,
+    period_cost_cents: int,
+    start_ms: int,
+    end_ms: int | None,
+    recurring_unit: str | None,
+    recurring_interval: int | None,
+    cycle_start_ms: int,
+    cycle_end_ms: int,
+    timezone: str,
+) -> int:
+    if period_cost_cents < 0:
+        raise ValueError("subscription cost cannot be negative")
+    if cycle_end_ms <= cycle_start_ms or period_cost_cents == 0:
+        return 0
+    if mode == "one_time":
+        if end_ms is None or end_ms <= start_ms:
+            raise ValueError("one-time subscription requires a valid end time")
+        periods = [(start_ms, end_ms)]
+    elif mode == "recurring":
+        unit = recurring_unit or "month"
+        interval = int(recurring_interval or 1)
+        if unit not in {"month", "day"} or interval < 1:
+            raise ValueError("recurring subscription period is invalid")
+        periods = [
+            period
+            for period in iter_subscription_periods(
+                start_ms, end_ms, unit, interval, cycle_end_ms, timezone,
+            )
+            if period[1] > cycle_start_ms
+        ]
+    else:
+        raise ValueError(f"unsupported subscription mode: {mode}")
+
+    total = Decimal(0)
+    for period_start, period_end in periods:
+        duration = period_end - period_start
+        overlap = overlap_ms(period_start, period_end, cycle_start_ms, cycle_end_ms)
+        if duration <= 0 or overlap <= 0:
+            continue
+        total += Decimal(period_cost_cents) * Decimal(overlap) / Decimal(duration)
+    return int(total.to_integral_value(rounding=ROUND_HALF_UP))

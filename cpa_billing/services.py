@@ -33,6 +33,7 @@ from .domain import (
     format_yuan_per_usd,
     largest_remainder,
     parse_tiers,
+    prorate_subscription_cost,
     tiered_weight,
 )
 from .models import (
@@ -43,6 +44,7 @@ from .models import (
     AuditLog,
     BillingCycle,
     CPAMPSource,
+    CycleGroup,
     CyclePoolCost,
     CycleUpstreamCost,
     DeadLetter,
@@ -64,6 +66,8 @@ from .models import (
     StatementLine,
     SyncCheckpoint,
     TelegramUser,
+    UpstreamAccountConfig,
+    UpstreamAccountGroup,
     WebSession,
 )
 from .security import (
@@ -77,6 +81,8 @@ from .security import (
     secure_token,
 )
 
+
+DEFAULT_UPSTREAM_GROUP_NAME = "default"
 
 DEFAULT_TIERS = [
     {"left": 0, "right": 300, "multiplier": 1},
@@ -556,10 +562,11 @@ def _metered_amount_cents(actual_nano_usd: int, multiplier_ppm: int) -> int:
 
 @dataclass(frozen=True)
 class CycleEstimate:
-    user_lines: dict[int, list[tuple[int, int, int, int]]]
+    user_lines: dict[int, list[tuple[int | None, int, int, int, int]]]
     metered_keys: list[dict[str, Any]]
     upstream_costs: list[dict[str, Any]]
     pool_totals: list[dict[str, Any]]
+    group_totals: list[dict[str, Any]]
     adjustments: dict[int, int]
     generated_at_ms: int
     billing_model: str
@@ -630,6 +637,8 @@ class BillingService:
                     updated_at_ms=now,
                 )
                 session.add(gradient)
+                session.flush()
+            self._ensure_default_upstream_group(session)
         self.import_cpamp_prices("cpamp-initial")
 
     def _cpamp(self) -> sqlite3.Connection:
@@ -2196,62 +2205,6 @@ class BillingService:
         upstream_rows = list(session.scalars(
             select(CycleUpstreamCost).where(CycleUpstreamCost.cycle_id == cycle.id)
         ))
-        upstream_costs: list[dict[str, Any]] = []
-        upstream_fixed_by_pool: dict[int, int] = defaultdict(int)
-        upstream_dynamic_by_pool: dict[int, int] = defaultdict(int)
-        if upstream_rows:
-            usage_by_auth: dict[str, dict[int, dict[str, int]]] = defaultdict(dict)
-            for auth_index, pool_id, requests, tokens, actual in session.execute(
-                select(
-                    RawUsageEvent.auth_index,
-                    RatedEvent.pool_id,
-                    func.count(RatedEvent.id),
-                    func.sum(RawUsageEvent.total_tokens),
-                    func.sum(RatedEvent.rated_weight_nano_usd),
-                )
-                .join(RawUsageEvent, RawUsageEvent.id == RatedEvent.raw_event_id)
-                .where(*period, RatedEvent.pool_id.is_not(None), RawUsageEvent.auth_index.is_not(None))
-                .group_by(RawUsageEvent.auth_index, RatedEvent.pool_id)
-            ):
-                usage_by_auth[str(auth_index)][int(pool_id)] = {
-                    "requests": int(requests or 0),
-                    "tokens": int(tokens or 0),
-                    "actual_nano_usd": int(actual or 0),
-                }
-
-            default_pool_id = next((pool_id for pool_id, name in pools.items() if name == "default-cpa"), None)
-            for row in upstream_rows:
-                by_pool = usage_by_auth.get(row.auth_index, {})
-                total_actual = sum(item["actual_nano_usd"] for item in by_pool.values())
-                total_requests = sum(item["requests"] for item in by_pool.values())
-                total_tokens = sum(item["tokens"] for item in by_pool.values())
-                if row.auth_type == "oauth":
-                    amount = int(row.fixed_cost_cents or 0)
-                    weights = {pool_id: item["actual_nano_usd"] for pool_id, item in by_pool.items()}
-                    if not any(weights.values()) and default_pool_id is not None:
-                        weights = {default_pool_id: 1}
-                    allocated = largest_remainder(amount, weights)
-                else:
-                    amount = _metered_amount_cents(total_actual, int(row.rate_ppm or 0))
-                    allocated = largest_remainder(
-                        amount,
-                        {pool_id: item["actual_nano_usd"] for pool_id, item in by_pool.items()},
-                    )
-                for pool_id, pool_amount in allocated.items():
-                    costs[pool_id] = costs.get(pool_id, 0) + pool_amount
-                    target = upstream_fixed_by_pool if row.auth_type == "oauth" else upstream_dynamic_by_pool
-                    target[pool_id] += pool_amount
-                upstream_costs.append({
-                    "account_id": row.account_id,
-                    "account_name": row.account_name,
-                    "auth_type": row.auth_type,
-                    "fixed_cost_cents": row.fixed_cost_cents,
-                    "rate_ppm": row.rate_ppm,
-                    "requests": total_requests,
-                    "tokens": total_tokens,
-                    "actual_nano_usd": total_actual,
-                    "amount_cents": amount,
-                })
         for pool_id, key_hash, requests, tokens, actual in unowned_usage:
             key = key_by_hash.get(str(key_hash or ""))
             if key is None or key.billing_multiplier_ppm is None:
@@ -2272,15 +2225,28 @@ class BillingService:
             metered_by_pool[int(pool_id)].append(item)
             metered_keys.append(item)
 
-        user_lines: dict[int, list[tuple[int, int, int, int]]] = defaultdict(list)
+        adjustments: dict[int, int] = defaultdict(int)
+        for row in session.scalars(select(Adjustment).where(Adjustment.cycle_id == cycle.id)):
+            adjustments[row.telegram_user_id] += int(row.amount_cents)
+
+        if upstream_rows:
+            return self._build_grouped_upstream_estimate(
+                session,
+                cycle,
+                strict,
+                period,
+                pools,
+                upstream_rows,
+                metered_keys,
+                metered_by_pool,
+                adjustments,
+            )
+
+        user_lines: dict[int, list[tuple[int | None, int, int, int, int]]] = defaultdict(list)
         pool_totals: list[dict[str, Any]] = []
         for pool_id in sorted(costs.keys() | pool_users.keys() | metered_by_pool.keys()):
-            if upstream_rows:
-                fixed = upstream_fixed_by_pool.get(pool_id, 0)
-                dynamic = upstream_dynamic_by_pool.get(pool_id, 0)
-            else:
-                fixed = int(costs.get(pool_id, 0))
-                dynamic = 0
+            fixed = int(costs.get(pool_id, 0))
+            dynamic = 0
             metered = sum(item["amount_cents"] for item in metered_by_pool.get(pool_id, []))
             total_cost = int(costs.get(pool_id, 0))
             residual = max(0, total_cost - metered)
@@ -2290,7 +2256,7 @@ class BillingService:
                 raise BillingError(f"pool {pool_id} has residual cost but no billable Telegram usage")
             allocated = largest_remainder(residual, billed)
             for user_id, actual in users.items():
-                user_lines[user_id].append((pool_id, actual, billed[user_id], allocated[user_id]))
+                user_lines[user_id].append((None, pool_id, actual, billed[user_id], allocated[user_id]))
             member_amount = sum(allocated.values())
             pool_totals.append({
                 "pool_id": pool_id,
@@ -2303,17 +2269,263 @@ class BillingService:
                 "surplus_cents": max(0, metered - total_cost),
                 "unallocated_cents": max(0, residual - member_amount),
             })
-        adjustments: dict[int, int] = defaultdict(int)
-        for row in session.scalars(select(Adjustment).where(Adjustment.cycle_id == cycle.id)):
-            adjustments[row.telegram_user_id] += int(row.amount_cents)
+        return CycleEstimate(
+            user_lines=dict(user_lines),
+            metered_keys=sorted(metered_keys, key=lambda item: (item["amount_cents"], item["actual_nano_usd"]), reverse=True),
+            upstream_costs=[],
+            pool_totals=pool_totals,
+            group_totals=[],
+            adjustments=dict(adjustments),
+            generated_at_ms=now_ms(),
+            billing_model="legacy_pool_fixed",
+        )
+
+    def _oauth_cycle_amount(self, row: CycleUpstreamCost, cycle: BillingCycle) -> int:
+        if row.subscription_mode in {"one_time", "recurring"} and row.period_cost_cents is not None and row.period_start_at_ms is not None:
+            try:
+                return prorate_subscription_cost(
+                    mode=str(row.subscription_mode),
+                    period_cost_cents=int(row.period_cost_cents),
+                    start_ms=int(row.period_start_at_ms),
+                    end_ms=row.period_end_at_ms,
+                    recurring_unit=row.recurring_unit,
+                    recurring_interval=row.recurring_interval,
+                    cycle_start_ms=cycle.start_at_ms,
+                    cycle_end_ms=cycle.end_at_ms,
+                    timezone=cycle.timezone or self.settings.timezone,
+                )
+            except ValueError as exc:
+                raise BillingError(f"上游账号 {row.account_name} 的订阅周期无效：{exc}") from exc
+        return int(row.fixed_cost_cents or 0)
+
+    def _cycle_group_snapshots(self, session: Any, cycle: BillingCycle) -> list[CycleGroup]:
+        groups = list(session.scalars(
+            select(CycleGroup).where(CycleGroup.cycle_id == cycle.id).order_by(CycleGroup.group_id)
+        ))
+        if groups:
+            return groups
+        default = self._ensure_default_upstream_group(session)
+        return [CycleGroup(
+            cycle_id=cycle.id,
+            group_id=default.id,
+            group_name=default.name,
+            gradient_rule_id=cycle.gradient_rule_id,
+            tiers_json=cycle.tiers_json,
+            is_default=True,
+        )]
+
+    def _build_grouped_upstream_estimate(
+        self,
+        session: Any,
+        cycle: BillingCycle,
+        strict: bool,
+        period: tuple[Any, ...],
+        pools: dict[int, str],
+        upstream_rows: list[CycleUpstreamCost],
+        metered_keys: list[dict[str, Any]],
+        metered_by_pool: dict[int, list[dict[str, Any]]],
+        adjustments: dict[int, int],
+    ) -> CycleEstimate:
+        group_rows = self._cycle_group_snapshots(session, cycle)
+        group_by_id = {row.group_id: row for row in group_rows}
+        default_group_id = next((row.group_id for row in group_rows if row.is_default), group_rows[0].group_id)
+        usage_by_auth: dict[str, dict[int, dict[str, int]]] = defaultdict(lambda: defaultdict(lambda: {
+            "requests": 0, "tokens": 0, "actual_nano_usd": 0,
+        }))
+        user_usage_by_auth: dict[str, dict[int, dict[int, int]]] = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
+        for auth_index, pool_id, user_id, requests, tokens, actual in session.execute(
+            select(
+                RawUsageEvent.auth_index,
+                RatedEvent.pool_id,
+                RatedEvent.telegram_user_id,
+                func.count(RatedEvent.id),
+                func.sum(RawUsageEvent.total_tokens),
+                func.sum(RatedEvent.rated_weight_nano_usd),
+            )
+            .join(RawUsageEvent, RawUsageEvent.id == RatedEvent.raw_event_id)
+            .where(*period, RatedEvent.pool_id.is_not(None), RawUsageEvent.auth_index.is_not(None))
+            .group_by(RawUsageEvent.auth_index, RatedEvent.pool_id, RatedEvent.telegram_user_id)
+        ):
+            pool_usage = usage_by_auth[str(auth_index)][int(pool_id)]
+            pool_usage["requests"] += int(requests or 0)
+            pool_usage["tokens"] += int(tokens or 0)
+            pool_usage["actual_nano_usd"] += int(actual or 0)
+            if user_id is not None:
+                user_usage_by_auth[str(auth_index)][int(user_id)][int(pool_id)] += int(actual or 0)
+
+        unowned_by_auth = session.execute(
+            select(
+                RawUsageEvent.auth_index,
+                RatedEvent.pool_id,
+                RawUsageEvent.api_key_hash,
+                func.sum(RatedEvent.rated_weight_nano_usd),
+            )
+            .join(RawUsageEvent, RawUsageEvent.id == RatedEvent.raw_event_id)
+            .where(*period, RatedEvent.telegram_user_id.is_(None), RatedEvent.pool_id.is_not(None), RawUsageEvent.auth_index.is_not(None))
+            .group_by(RawUsageEvent.auth_index, RatedEvent.pool_id, RawUsageEvent.api_key_hash)
+        ).all()
+
+        default_pool_id = next((pool_id for pool_id, name in pools.items() if name == "default-cpa"), None)
+        upstream_costs: list[dict[str, Any]] = []
+        group_account_ids: dict[int, list[str]] = defaultdict(list)
+        group_fixed: dict[int, int] = defaultdict(int)
+        group_dynamic: dict[int, int] = defaultdict(int)
+        group_auth: dict[int, set[str]] = defaultdict(set)
+        pool_fixed: dict[int, int] = defaultdict(int)
+        pool_dynamic: dict[int, int] = defaultdict(int)
+
+        for row in upstream_rows:
+            group_id = int(row.group_id or default_group_id)
+            if group_id not in group_by_id:
+                group_id = default_group_id
+            by_pool = usage_by_auth.get(row.auth_index, {})
+            total_actual = sum(item["actual_nano_usd"] for item in by_pool.values())
+            total_requests = sum(item["requests"] for item in by_pool.values())
+            total_tokens = sum(item["tokens"] for item in by_pool.values())
+            if row.auth_type == "oauth":
+                amount = self._oauth_cycle_amount(row, cycle)
+                weights = {pool_id: item["actual_nano_usd"] for pool_id, item in by_pool.items()}
+                if not any(weights.values()) and default_pool_id is not None:
+                    weights = {default_pool_id: 1}
+                allocated = largest_remainder(amount, weights)
+                group_fixed[group_id] += amount
+                for pool_id, pool_amount in allocated.items():
+                    pool_fixed[pool_id] += pool_amount
+            else:
+                amount = _metered_amount_cents(total_actual, int(row.rate_ppm or 0))
+                allocated = largest_remainder(
+                    amount,
+                    {pool_id: item["actual_nano_usd"] for pool_id, item in by_pool.items()},
+                )
+                group_dynamic[group_id] += amount
+                for pool_id, pool_amount in allocated.items():
+                    pool_dynamic[pool_id] += pool_amount
+            group_account_ids[group_id].append(row.account_id)
+            group_auth[group_id].add(row.auth_index)
+            upstream_costs.append({
+                "account_id": row.account_id,
+                "account_name": row.account_name,
+                "auth_type": row.auth_type,
+                "group_id": group_id,
+                "group_name": group_by_id[group_id].group_name,
+                "fixed_cost_cents": amount if row.auth_type == "oauth" else None,
+                "rate_ppm": row.rate_ppm,
+                "requests": total_requests,
+                "tokens": total_tokens,
+                "actual_nano_usd": total_actual,
+                "amount_cents": amount,
+                "subscription_mode": row.subscription_mode,
+                "period_cost_cents": row.period_cost_cents,
+            })
+
+        key_by_hash = {
+            key.cpamp_hash: key
+            for key in session.scalars(select(APIKey))
+        } if unowned_by_auth else {}
+        group_metered: dict[int, int] = defaultdict(int)
+        for auth_index, pool_id, key_hash, actual in unowned_by_auth:
+            key = key_by_hash.get(str(key_hash or ""))
+            if key is None or key.billing_multiplier_ppm is None:
+                continue
+            amount = _metered_amount_cents(int(actual or 0), int(key.billing_multiplier_ppm))
+            group_id = next((gid for gid, auths in group_auth.items() if str(auth_index) in auths), default_group_id)
+            group_metered[group_id] += amount
+
+        manual_by_group: dict[int, dict[int, dict[int, int]]] = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
+        for pool_id, user_id, group_id, weight in session.execute(
+            select(
+                ManualUsageAdjustment.pool_id,
+                ManualUsageAdjustment.telegram_user_id,
+                ManualUsageAdjustment.group_id,
+                func.sum(ManualUsageAdjustment.amount_nano_usd),
+            )
+            .where(ManualUsageAdjustment.cycle_id == cycle.id)
+            .group_by(ManualUsageAdjustment.pool_id, ManualUsageAdjustment.telegram_user_id, ManualUsageAdjustment.group_id)
+        ):
+            manual_weight = int(weight or 0)
+            if manual_weight < 0:
+                raise BillingError("手动原始用量余额不能为负数")
+            gid = int(group_id or default_group_id)
+            manual_by_group[gid][int(user_id)][int(pool_id)] += manual_weight
+
+        user_lines: dict[int, list[tuple[int | None, int, int, int, int]]] = defaultdict(list)
+        group_totals: list[dict[str, Any]] = []
+        pool_member: dict[int, int] = defaultdict(int)
+        involved_group_ids = set(group_by_id) | set(group_fixed) | set(group_dynamic) | set(group_metered) | set(manual_by_group)
+        for group_id in sorted(involved_group_ids):
+            snapshot = group_by_id.get(group_id)
+            if snapshot is None:
+                continue
+            group_tiers = parse_tiers(json.loads(snapshot.tiers_json))
+            users: dict[int, dict[int, int]] = defaultdict(lambda: defaultdict(int))
+            for auth_index in group_auth.get(group_id, set()):
+                for user_id, by_pool in user_usage_by_auth.get(auth_index, {}).items():
+                    for pool_id, actual in by_pool.items():
+                        users[user_id][pool_id] += actual
+            for user_id, by_pool in manual_by_group.get(group_id, {}).items():
+                for pool_id, actual in by_pool.items():
+                    users[user_id][pool_id] += actual
+            totals = {user_id: sum(by_pool.values()) for user_id, by_pool in users.items()}
+            billed = {user_id: tiered_weight(actual, group_tiers) for user_id, actual in totals.items()}
+            fixed = group_fixed.get(group_id, 0)
+            dynamic = group_dynamic.get(group_id, 0)
+            metered = group_metered.get(group_id, 0)
+            total_cost = fixed + dynamic
+            residual = max(0, total_cost - metered)
+            if strict and residual and not any(weight > 0 for weight in billed.values()):
+                raise BillingError(f"group {snapshot.group_name} has residual cost but no billable Telegram usage")
+            allocated = largest_remainder(residual, billed)
+            for user_id, actual in totals.items():
+                pool_weights = users[user_id]
+                pool_amounts = largest_remainder(allocated.get(user_id, 0), pool_weights)
+                pool_billed = largest_remainder(billed[user_id], pool_weights)
+                for pool_id, pool_actual in pool_weights.items():
+                    amount = pool_amounts.get(pool_id, 0)
+                    user_lines[user_id].append((group_id, pool_id, pool_actual, pool_billed.get(pool_id, 0), amount))
+                    pool_member[pool_id] += amount
+            member_amount = sum(allocated.values())
+            group_totals.append({
+                "group_id": group_id,
+                "group": snapshot.group_name,
+                "gradient_rule_id": snapshot.gradient_rule_id,
+                "fixed_cost_cents": fixed,
+                "dynamic_cost_cents": dynamic,
+                "metered_amount_cents": metered,
+                "residual_cost_cents": residual,
+                "member_amount_cents": member_amount,
+                "surplus_cents": max(0, metered - total_cost),
+                "unallocated_cents": max(0, residual - member_amount),
+            })
+
+        pool_ids = set(pool_fixed) | set(pool_dynamic) | set(pool_member) | set(metered_by_pool)
+        pool_totals = []
+        for pool_id in sorted(pool_ids):
+            fixed = pool_fixed.get(pool_id, 0)
+            dynamic = pool_dynamic.get(pool_id, 0)
+            metered = sum(item["amount_cents"] for item in metered_by_pool.get(pool_id, []))
+            total_cost = fixed + dynamic
+            residual = max(0, total_cost - metered)
+            member_amount = pool_member.get(pool_id, 0)
+            pool_totals.append({
+                "pool_id": pool_id,
+                "pool": pools.get(pool_id, str(pool_id)),
+                "fixed_cost_cents": fixed,
+                "dynamic_cost_cents": dynamic,
+                "metered_amount_cents": metered,
+                "residual_cost_cents": residual,
+                "member_amount_cents": member_amount,
+                "surplus_cents": max(0, metered - total_cost),
+                "unallocated_cents": max(0, residual - member_amount),
+            })
         return CycleEstimate(
             user_lines=dict(user_lines),
             metered_keys=sorted(metered_keys, key=lambda item: (item["amount_cents"], item["actual_nano_usd"]), reverse=True),
             upstream_costs=sorted(upstream_costs, key=lambda item: item["amount_cents"], reverse=True),
             pool_totals=pool_totals,
+            group_totals=sorted(group_totals, key=lambda item: item["group"]),
             adjustments=dict(adjustments),
             generated_at_ms=now_ms(),
-            billing_model="upstream_channels" if upstream_rows else "legacy_pool_fixed",
+            billing_model="upstream_channels",
         )
 
     def _persist_cycle_estimate(self, session: Any, cycle: BillingCycle, estimate: CycleEstimate) -> None:
@@ -2328,14 +2540,28 @@ class BillingService:
             row.token_count = None if item is None else item["tokens"]
             row.actual_weight_nano_usd = None if item is None else item["actual_nano_usd"]
             row.amount_cents = None if item is None else item["amount_cents"]
+            if item is not None and row.auth_type == "oauth" and item.get("fixed_cost_cents") is not None:
+                row.fixed_cost_cents = item["fixed_cost_cents"]
+        group_by_id = {item["group_id"]: item for item in estimate.group_totals}
+        for row in session.scalars(select(CycleGroup).where(CycleGroup.cycle_id == cycle.id)):
+            item = group_by_id.get(row.group_id)
+            if item is None:
+                continue
+            row.fixed_cost_cents = item["fixed_cost_cents"]
+            row.dynamic_cost_cents = item["dynamic_cost_cents"]
+            row.metered_amount_cents = item["metered_amount_cents"]
+            row.residual_cost_cents = item["residual_cost_cents"]
+            row.member_amount_cents = item["member_amount_cents"]
+            row.surplus_cents = item["surplus_cents"]
+            row.unallocated_cents = item["unallocated_cents"]
         for user_id in estimate.user_lines.keys() | estimate.adjustments.keys():
             user_lines = estimate.user_lines.get(user_id, [])
             statement = Statement(
                 cycle_id=cycle.id,
                 telegram_user_id=user_id,
-                actual_weight_nano_usd=sum(value[1] for value in user_lines),
-                billed_weight_nano_usd=sum(value[2] for value in user_lines),
-                amount_cents=sum(value[3] for value in user_lines) + estimate.adjustments.get(user_id, 0),
+                actual_weight_nano_usd=sum(value[2] for value in user_lines),
+                billed_weight_nano_usd=sum(value[3] for value in user_lines),
+                amount_cents=sum(value[4] for value in user_lines) + estimate.adjustments.get(user_id, 0),
                 adjustment_cents=estimate.adjustments.get(user_id, 0),
                 generated_at_ms=estimate.generated_at_ms,
                 final=False,
@@ -2345,10 +2571,11 @@ class BillingService:
             key_count = session.scalar(
                 select(func.count()).select_from(APIKey).where(APIKey.current_owner_id == user_id)
             ) or 0
-            for pool_id, actual, billed, amount in user_lines:
+            for group_id, pool_id, actual, billed, amount in user_lines:
                 session.add(StatementLine(
                     statement_id=statement.id,
                     pool_id=pool_id,
+                    group_id=group_id,
                     actual_weight_nano_usd=actual,
                     billed_weight_nano_usd=billed,
                     amount_cents=amount,
@@ -2407,6 +2634,7 @@ class BillingService:
             if cycle is None:
                 return {"cycle": None, "cycles": [{"name": item.name, "status": item.status} for item in cycles],
                         "rows": [], "models": [], "metered_keys": [], "upstream_costs": [], "pool_totals": [],
+                        "group_totals": [],
                         "billing_model": None,
                         "totals": {"requests": 0, "tokens": 0, "actual": "0.0000",
                                    "request_actual": "0.0000", "manual_actual": "0.0000", "billed": "0.0000",
@@ -2481,12 +2709,16 @@ class BillingService:
                     "account_id": item.account_id,
                     "account_name": item.account_name,
                     "auth_type": item.auth_type,
+                    "group_id": item.group_id,
+                    "group_name": item.group_name,
                     "fixed_cost_cents": item.fixed_cost_cents,
                     "rate_ppm": item.rate_ppm,
                     "requests": int(item.request_count or 0),
                     "tokens": int(item.token_count or 0),
                     "actual_nano_usd": int(item.actual_weight_nano_usd or 0),
                     "amount_cents": int(item.amount_cents or 0),
+                    "subscription_mode": item.subscription_mode,
+                    "period_cost_cents": item.period_cost_cents,
                 } for item in upstream_rows]
                 live_user = {
                     user_id: (statement.actual_weight_nano_usd, statement.billed_weight_nano_usd, statement.amount_cents)
@@ -2552,13 +2784,25 @@ class BillingService:
                         "surplus_cents": max(0, metered - int(fixed)), "unallocated_cents": 0,
                     })
                 generated_at_ms = max((row.generated_at_ms for row in statements.values()), default=cycle.closed_at_ms or now_ms())
+                group_totals = [{
+                    "group_id": item.group_id,
+                    "group": item.group_name,
+                    "gradient_rule_id": item.gradient_rule_id,
+                    "fixed_cost_cents": int(item.fixed_cost_cents or 0),
+                    "dynamic_cost_cents": int(item.dynamic_cost_cents or 0),
+                    "metered_amount_cents": int(item.metered_amount_cents or 0),
+                    "residual_cost_cents": int(item.residual_cost_cents or 0),
+                    "member_amount_cents": int(item.member_amount_cents or 0),
+                    "surplus_cents": int(item.surplus_cents or 0),
+                    "unallocated_cents": int(item.unallocated_cents or 0),
+                } for item in session.scalars(select(CycleGroup).where(CycleGroup.cycle_id == cycle.id))]
             else:
                 estimate = self._build_cycle_estimate(session, cycle, strict=False)
                 live_user = {
                     user_id: (
-                        sum(value[1] for value in lines),
                         sum(value[2] for value in lines),
-                        sum(value[3] for value in lines) + estimate.adjustments.get(user_id, 0),
+                        sum(value[3] for value in lines),
+                        sum(value[4] for value in lines) + estimate.adjustments.get(user_id, 0),
                     )
                     for user_id, lines in estimate.user_lines.items()
                 }
@@ -2568,6 +2812,7 @@ class BillingService:
                 metered_keys = estimate.metered_keys
                 upstream_costs = estimate.upstream_costs
                 pool_totals = estimate.pool_totals
+                group_totals = estimate.group_totals
                 generated_at_ms = estimate.generated_at_ms
                 billing_model = estimate.billing_model
             key_counts = {owner_id: int(count or 0) for owner_id, count in session.execute(
@@ -2695,6 +2940,14 @@ class BillingService:
                     "residual_cost": format_cents(item["residual_cost_cents"]),
                     "member_amount": format_cents(item["member_amount_cents"]),
                 } for item in pool_totals],
+                "group_totals": [{
+                    **item,
+                    "fixed_cost": format_cents(item["fixed_cost_cents"]),
+                    "dynamic_cost": format_cents(item["dynamic_cost_cents"]),
+                    "metered_amount": format_cents(item["metered_amount_cents"]),
+                    "residual_cost": format_cents(item["residual_cost_cents"]),
+                    "member_amount": format_cents(item["member_amount_cents"]),
+                } for item in group_totals],
                 "models": [{"model": model, "requests": int(requests or 0), "tokens": int(tokens or 0),
                             "cost": format_usd_nano(int(cost or 0))} for model, requests, tokens, cost in model_rows],
                 "totals": {
@@ -2708,7 +2961,10 @@ class BillingService:
                     "metered_amount": format_cents(metered_amount_cents),
                     "dynamic_cost": format_cents(dynamic_amount_cents),
                     "amount": format_cents(member_amount_cents + metered_amount_cents),
-                    "fixed_cost": format_cents(sum(item["fixed_cost_cents"] for item in pool_totals)),
+                    "fixed_cost": format_cents(
+                        sum(int(item["fixed_cost_cents"] or 0) for item in upstream_costs if item.get("auth_type") == "oauth")
+                        or sum(item["fixed_cost_cents"] for item in pool_totals)
+                    ),
                     "global_rate": format_yuan_per_usd(member_amount_cents, member_billed_nano_usd),
                 },
             }
@@ -3408,6 +3664,8 @@ class BillingService:
                             "account_id": item.account_id,
                             "account_name": item.account_name,
                             "auth_type": item.auth_type,
+                            "group_id": item.group_id,
+                            "group_name": item.group_name,
                             "fixed_cost_cents": item.fixed_cost_cents,
                             "rate_ppm": item.rate_ppm,
                             "actual_nano_usd": int(item.actual_weight_nano_usd or 0),
@@ -4899,6 +5157,7 @@ class BillingService:
         return {
             "cycle": cycle_name,
             "pool_id": row.pool_id,
+            "group_id": row.group_id,
             "telegram_user_id": row.telegram_user_id,
             "amount_nano_usd": row.amount_nano_usd,
             "amount_usd": format(Decimal(row.amount_nano_usd) / Decimal(NANO_USD), "f"),
@@ -4920,9 +5179,32 @@ class BillingService:
             raise BillingError("Telegram 用户不存在或尚未注册")
         pool = session.get(ResourcePool, pool_id)
         configured = session.get(CyclePoolCost, {"cycle_id": cycle.id, "pool_id": pool_id})
-        if pool is None or configured is None:
+        has_upstream = session.scalar(
+            select(func.count()).select_from(CycleUpstreamCost).where(CycleUpstreamCost.cycle_id == cycle.id)
+        ) or 0
+        if pool is None:
+            raise BillingError("资源池未配置到该账期")
+        if configured is None and not has_upstream:
             raise BillingError("资源池未配置到该账期")
         return cycle
+
+    def _manual_usage_group_id(self, session: Any, cycle: BillingCycle, group_id: int | None) -> int | None:
+        has_upstream = session.scalar(
+            select(func.count()).select_from(CycleUpstreamCost).where(CycleUpstreamCost.cycle_id == cycle.id)
+        ) or 0
+        if not has_upstream:
+            return None
+        if group_id is not None:
+            group = session.get(UpstreamAccountGroup, group_id)
+            if group is None:
+                raise BillingError("上游分组不存在")
+            return group.id
+        snapshot = session.scalar(
+            select(CycleGroup).where(CycleGroup.cycle_id == cycle.id, CycleGroup.is_default.is_(True))
+        )
+        if snapshot is not None:
+            return snapshot.group_id
+        return self._ensure_default_upstream_group(session).id
 
     def add_manual_usage_adjustment(
         self,
@@ -4933,10 +5215,12 @@ class BillingService:
         reason: str,
         operator_id: int | None,
         operator_type: str = "telegram",
+        group_id: int | None = None,
     ) -> int:
         normalized_reason = self._normalize_manual_usage_input(amount_nano_usd, reason)
         with self._manual_usage_lock, self.db.session() as session:
             cycle = self._manual_usage_target(session, cycle_name, pool_id, user_id)
+            resolved_group_id = self._manual_usage_group_id(session, cycle, group_id)
             current_manual = self._manual_usage_balance(session, cycle.id, pool_id, user_id)
             if current_manual + amount_nano_usd < 0:
                 raise BillingError("冲销金额不能超过该用户在此资源池的手动原始用量")
@@ -4944,6 +5228,7 @@ class BillingService:
             row = ManualUsageAdjustment(
                 cycle_id=cycle.id,
                 pool_id=pool_id,
+                group_id=resolved_group_id,
                 telegram_user_id=user_id,
                 amount_nano_usd=amount_nano_usd,
                 reason=normalized_reason,
@@ -4974,6 +5259,7 @@ class BillingService:
         reason: str,
         operator_id: int | None,
         operator_type: str = "telegram",
+        group_id: int | None = None,
     ) -> int:
         normalized_reason = self._normalize_manual_usage_input(amount_nano_usd, reason)
         with self._manual_usage_lock, self.db.session() as session:
@@ -4984,6 +5270,7 @@ class BillingService:
             if source_cycle is None or source_cycle.status == "closed":
                 raise BillingError("已关闭账期的补录不能修改")
             target_cycle = self._manual_usage_target(session, cycle_name, pool_id, user_id)
+            resolved_group_id = self._manual_usage_group_id(session, target_cycle, group_id)
             before = self._manual_usage_state(row, source_cycle.name)
             source_group = (row.cycle_id, row.pool_id, row.telegram_user_id)
             target_group = (target_cycle.id, pool_id, user_id)
@@ -5002,6 +5289,7 @@ class BillingService:
             changed_at = now_ms()
             row.cycle_id = target_cycle.id
             row.pool_id = pool_id
+            row.group_id = resolved_group_id
             row.telegram_user_id = user_id
             row.amount_nano_usd = amount_nano_usd
             row.reason = normalized_reason
@@ -5088,7 +5376,12 @@ class BillingService:
             ))
             cycle_pool_costs: dict[int, list[dict[str, Any]]] = defaultdict(list)
             cycle_upstream_costs: dict[int, list[dict[str, Any]]] = defaultdict(list)
+            cycle_groups: dict[int, list[dict[str, Any]]] = defaultdict(list)
             pool_map = {pool.id: pool for pool in pools}
+            self._ensure_default_upstream_group(session)
+            groups = list(session.scalars(select(UpstreamAccountGroup).order_by(UpstreamAccountGroup.is_default.desc(), UpstreamAccountGroup.id)))
+            group_map = {group.id: group for group in groups}
+            account_configs = list(session.scalars(select(UpstreamAccountConfig)))
             for item in session.scalars(select(CyclePoolCost).order_by(CyclePoolCost.cycle_id, CyclePoolCost.pool_id)):
                 cycle_pool_costs[item.cycle_id].append({
                     "pool_id": item.pool_id,
@@ -5106,6 +5399,11 @@ class BillingService:
                     "account_id": item.account_id,
                     "account_name": item.account_name,
                     "auth_type": item.auth_type,
+                    "group_id": item.group_id,
+                    "group_name": item.group_name,
+                    "subscription_mode": item.subscription_mode,
+                    "period_cost_cents": item.period_cost_cents,
+                    "period_cost": None if item.period_cost_cents is None else format_cents(item.period_cost_cents),
                     "fixed_cost_cents": item.fixed_cost_cents,
                     "fixed_cost": None if item.fixed_cost_cents is None else format_cents(item.fixed_cost_cents),
                     "rate_ppm": item.rate_ppm,
@@ -5114,6 +5412,17 @@ class BillingService:
                     ),
                     "actual": None if item.actual_weight_nano_usd is None else format_usd_nano(item.actual_weight_nano_usd),
                     "amount": None if item.amount_cents is None else format_cents(item.amount_cents),
+                })
+            for item in session.scalars(select(CycleGroup).order_by(CycleGroup.cycle_id, CycleGroup.group_name)):
+                cycle_groups[item.cycle_id].append({
+                    "group_id": item.group_id,
+                    "group": item.group_name,
+                    "gradient_rule_id": item.gradient_rule_id,
+                    "gradient_rule": gradient_map[item.gradient_rule_id].name if item.gradient_rule_id in gradient_map else None,
+                    "is_default": bool(item.is_default),
+                    "fixed_cost": format_cents(int(item.fixed_cost_cents or 0)),
+                    "dynamic_cost": format_cents(int(item.dynamic_cost_cents or 0)),
+                    "member_amount": format_cents(int(item.member_amount_cents or 0)),
                 })
             return {
                 "cycles": [{"id": cycle.id, "name": cycle.name, "start": self._format_timestamp(cycle.start_at_ms),
@@ -5125,6 +5434,7 @@ class BillingService:
                             "gradient_rule": gradient_map[cycle.gradient_rule_id].name if cycle.gradient_rule_id in gradient_map else None,
                             "pool_costs": cycle_pool_costs.get(cycle.id, []),
                             "upstream_costs": cycle_upstream_costs.get(cycle.id, []),
+                            "groups": cycle_groups.get(cycle.id, []),
                             "billing_model": "upstream_channels" if cycle_upstream_costs.get(cycle.id) else "legacy_pool_fixed",
                             "fixed_cost_cents": costs.get(cycle.id, 0) + sum(
                                 int(item["fixed_cost_cents"] or 0) for item in cycle_upstream_costs.get(cycle.id, [])
@@ -5187,8 +5497,34 @@ class BillingService:
                     "updated_at": self._iso_timestamp(rule.updated_at_ms),
                     "open_cycle_count": sum(
                         1 for cycle in cycles if cycle.gradient_rule_id == rule.id and cycle.status != "closed"
+                    ) + sum(
+                        1 for group in groups if group.gradient_rule_id == rule.id
                     ),
                 } for rule in gradients],
+                "upstream_groups": [{
+                    "id": group.id,
+                    "name": group.name,
+                    "is_default": bool(group.is_default),
+                    "gradient_rule_id": group.gradient_rule_id,
+                    "gradient_rule": gradient_map[group.gradient_rule_id].name if group.gradient_rule_id in gradient_map else None,
+                    "account_count": sum(1 for item in account_configs if item.group_id == group.id),
+                    "created_at": self._iso_timestamp(group.created_at_ms),
+                    "updated_at": self._iso_timestamp(group.updated_at_ms),
+                } for group in groups],
+                "account_configs": [{
+                    "account_id": item.account_id,
+                    "group_id": item.group_id,
+                    "group_name": group_map[item.group_id].name if item.group_id in group_map else None,
+                    "subscription_mode": item.subscription_mode,
+                    "period_start": self._iso_timestamp(item.period_start_at_ms),
+                    "period_end": self._iso_timestamp(item.period_end_at_ms),
+                    "recurring_unit": item.recurring_unit,
+                    "recurring_interval": item.recurring_interval,
+                    "period_cost_cents": item.period_cost_cents,
+                    "period_cost": None if item.period_cost_cents is None else format_cents(item.period_cost_cents),
+                    "rate_ppm": item.rate_ppm,
+                    "rate": None if item.rate_ppm is None else format(Decimal(item.rate_ppm) / Decimal(1_000_000), "f"),
+                } for item in account_configs],
                 "pricing": [{"id": p.id, "name": p.name, "status": p.status, "source": p.source,
                              "activated_at": self._iso_timestamp(p.activated_at_ms)} for p in pricing_versions],
                 "pricing_rules": {
@@ -5210,6 +5546,8 @@ class BillingService:
                     "cycle": next((cycle.name for cycle in cycles if cycle.id == row.cycle_id), str(row.cycle_id)),
                     "pool_id": row.pool_id,
                     "pool": pool_map[row.pool_id].name if row.pool_id in pool_map else str(row.pool_id),
+                    "group_id": row.group_id,
+                    "group": group_map[row.group_id].name if row.group_id in group_map else None,
                     "user_id": row.telegram_user_id,
                     "user": self._user_name(users.get(row.telegram_user_id), row.telegram_user_id),
                     "amount_nano_usd": row.amount_nano_usd,
@@ -5683,7 +6021,16 @@ class BillingService:
             )))
             for cycle in cycles:
                 cycle.tiers_json = rule.tiers_json
-            self._invalidate_cycle_previews(session, [cycle.id for cycle in cycles])
+            cycle_ids = {cycle.id for cycle in cycles}
+            for row in session.scalars(
+                select(CycleGroup).join(BillingCycle, BillingCycle.id == CycleGroup.cycle_id).where(
+                    CycleGroup.gradient_rule_id == rule.id,
+                    BillingCycle.status != "closed",
+                )
+            ):
+                row.tiers_json = rule.tiers_json
+                cycle_ids.add(row.cycle_id)
+            self._invalidate_cycle_previews(session, sorted(cycle_ids))
             session.add(AuditLog(
                 operator_type="web-admin", operator_id=operator_id, operation="gradient-rule.update",
                 target=str(rule.id), before_json=json.dumps(before),
@@ -5703,6 +6050,17 @@ class BillingService:
                 BillingCycle.status != "closed",
             )):
                 raise BillingError("梯度规则仍被未关闭账期使用")
+            if session.scalar(select(func.count()).select_from(UpstreamAccountGroup).where(
+                UpstreamAccountGroup.gradient_rule_id == rule.id,
+            )):
+                raise BillingError("梯度规则仍被上游账号分组使用")
+            if session.scalar(
+                select(func.count()).select_from(CycleGroup).join(BillingCycle, BillingCycle.id == CycleGroup.cycle_id).where(
+                    CycleGroup.gradient_rule_id == rule.id,
+                    BillingCycle.status != "closed",
+                )
+            ):
+                raise BillingError("梯度规则仍被未关闭账期的上游分组使用")
             rule.active = False
             rule.updated_at_ms = now_ms()
             session.add(AuditLog(
@@ -5710,6 +6068,268 @@ class BillingService:
                 target=str(rule.id), before_json=json.dumps({"name": rule.name}),
                 reason=reason.strip(), created_at_ms=now_ms(),
             ))
+
+    def _ensure_default_upstream_group(self, session: Any) -> UpstreamAccountGroup:
+        group = session.scalar(
+            select(UpstreamAccountGroup).where(UpstreamAccountGroup.is_default.is_(True)).order_by(UpstreamAccountGroup.id)
+        )
+        if group is not None:
+            return group
+        gradient = session.scalar(select(GradientRule).where(GradientRule.active.is_(True)).order_by(GradientRule.id))
+        if gradient is None:
+            raise BillingError("active gradient rule is missing")
+        created = now_ms()
+        group = UpstreamAccountGroup(
+            name=DEFAULT_UPSTREAM_GROUP_NAME,
+            is_default=True,
+            gradient_rule_id=gradient.id,
+            created_at_ms=created,
+            updated_at_ms=created,
+        )
+        session.add(group)
+        session.flush()
+        return group
+
+    def _parse_admin_time(self, value: str | None, label: str) -> int | None:
+        if value is None or not str(value).strip():
+            return None
+        zone = ZoneInfo(self.settings.timezone)
+        try:
+            parsed = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise BillingError(f"{label}时间格式无效") from exc
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=zone)
+        return int(parsed.timestamp() * 1000)
+
+    def _replace_cycle_group_snapshots(self, session: Any, cycle: BillingCycle, group_ids: set[int]) -> None:
+        session.execute(delete(CycleGroup).where(CycleGroup.cycle_id == cycle.id))
+        groups = list(session.scalars(select(UpstreamAccountGroup).where(UpstreamAccountGroup.id.in_(group_ids))))
+        by_id = {group.id: group for group in groups}
+        missing = sorted(group_ids - set(by_id))
+        if missing:
+            raise BillingError("上游账号分组不存在")
+        for group_id in sorted(group_ids):
+            group = by_id[group_id]
+            gradient = session.get(GradientRule, group.gradient_rule_id)
+            if gradient is None:
+                raise BillingError(f"上游分组 {group.name} 的梯度规则不存在")
+            session.add(CycleGroup(
+                cycle_id=cycle.id,
+                group_id=group.id,
+                group_name=group.name,
+                gradient_rule_id=group.gradient_rule_id,
+                tiers_json=gradient.tiers_json,
+                is_default=bool(group.is_default),
+            ))
+
+    def create_upstream_group(self, name: str, gradient_rule_id: int, reason: str, operator_id: str = "admin-token") -> int:
+        normalized = name.strip()
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,80}", normalized):
+            raise BillingError("分组名称只能使用字母、数字、点、下划线或短横线")
+        if not reason.strip():
+            raise BillingError("创建上游分组必须填写原因")
+        with self.db.session() as session:
+            self._ensure_default_upstream_group(session)
+            if session.scalar(select(UpstreamAccountGroup).where(UpstreamAccountGroup.name == normalized)):
+                raise BillingError("上游分组名称已存在")
+            gradient = session.get(GradientRule, gradient_rule_id)
+            if gradient is None or not gradient.active:
+                raise BillingError("梯度规则不存在或已停用")
+            created = now_ms()
+            group = UpstreamAccountGroup(
+                name=normalized,
+                is_default=False,
+                gradient_rule_id=gradient.id,
+                created_at_ms=created,
+                updated_at_ms=created,
+            )
+            session.add(group)
+            session.flush()
+            session.add(AuditLog(
+                operator_type="web-admin", operator_id=operator_id, operation="upstream-group.create",
+                target=str(group.id), after_json=json.dumps({"name": group.name, "gradient_rule_id": gradient.id}),
+                reason=reason.strip(), created_at_ms=created,
+            ))
+            return group.id
+
+    def update_upstream_group(self, group_id: int, name: str, gradient_rule_id: int, reason: str,
+                              operator_id: str = "admin-token") -> None:
+        normalized = name.strip()
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,80}", normalized):
+            raise BillingError("分组名称只能使用字母、数字、点、下划线或短横线")
+        if not reason.strip():
+            raise BillingError("修改上游分组必须填写原因")
+        with self.db.session() as session:
+            group = session.get(UpstreamAccountGroup, group_id)
+            if group is None:
+                raise BillingError("上游分组不存在")
+            if group.is_default and normalized != group.name:
+                raise BillingError("默认上游分组不能改名")
+            duplicate = session.scalar(
+                select(UpstreamAccountGroup).where(UpstreamAccountGroup.name == normalized, UpstreamAccountGroup.id != group_id)
+            )
+            if duplicate:
+                raise BillingError("上游分组名称已存在")
+            gradient = session.get(GradientRule, gradient_rule_id)
+            if gradient is None or not gradient.active:
+                raise BillingError("梯度规则不存在或已停用")
+            before = {"name": group.name, "gradient_rule_id": group.gradient_rule_id}
+            group.name = normalized
+            group.gradient_rule_id = gradient.id
+            group.updated_at_ms = now_ms()
+            cycle_ids: set[int] = set()
+            for row in session.scalars(
+                select(CycleGroup).join(BillingCycle, BillingCycle.id == CycleGroup.cycle_id).where(
+                    CycleGroup.group_id == group.id,
+                    BillingCycle.status != "closed",
+                )
+            ):
+                row.group_name = group.name
+                row.gradient_rule_id = gradient.id
+                row.tiers_json = gradient.tiers_json
+                cycle_ids.add(row.cycle_id)
+            self._invalidate_cycle_previews(session, sorted(cycle_ids))
+            session.add(AuditLog(
+                operator_type="web-admin", operator_id=operator_id, operation="upstream-group.update",
+                target=str(group.id), before_json=json.dumps(before),
+                after_json=json.dumps({"name": group.name, "gradient_rule_id": gradient.id}),
+                reason=reason.strip(), created_at_ms=now_ms(),
+            ))
+
+    def delete_upstream_group(self, group_id: int, reason: str, operator_id: str = "admin-token") -> None:
+        if not reason.strip():
+            raise BillingError("删除上游分组必须填写原因")
+        with self.db.session() as session:
+            group = session.get(UpstreamAccountGroup, group_id)
+            if group is None:
+                raise BillingError("上游分组不存在")
+            if group.is_default:
+                raise BillingError("默认上游分组不能删除")
+            if session.scalar(select(func.count()).select_from(UpstreamAccountConfig).where(
+                UpstreamAccountConfig.group_id == group.id,
+            )):
+                raise BillingError("上游分组仍有账号，不能删除")
+            if session.scalar(
+                select(func.count()).select_from(CycleGroup).join(BillingCycle, BillingCycle.id == CycleGroup.cycle_id).where(
+                    CycleGroup.group_id == group.id,
+                    BillingCycle.status != "closed",
+                )
+            ):
+                raise BillingError("上游分组仍被未关闭账期使用")
+            session.delete(group)
+            session.add(AuditLog(
+                operator_type="web-admin", operator_id=operator_id, operation="upstream-group.delete",
+                target=str(group_id), before_json=json.dumps({"name": group.name}),
+                reason=reason.strip(), created_at_ms=now_ms(),
+            ))
+
+    def configure_account_billing(
+        self,
+        account_id: str,
+        group_id: int,
+        reason: str,
+        *,
+        subscription_mode: str | None = None,
+        period_start: str | None = None,
+        period_end: str | None = None,
+        recurring_unit: str | None = None,
+        recurring_interval: int | None = None,
+        period_cost_cents: int | None = None,
+        rate_ppm: int | None = None,
+        operator_id: str = "admin-token",
+    ) -> dict[str, Any]:
+        if not reason.strip():
+            raise BillingError("修改上游账号计费配置必须填写原因")
+        try:
+            files = self.cpa.upstream_channels()
+        except (httpx.HTTPError, BillingError) as exc:
+            raise BillingDependencyError("CPA 上游账号服务不可用") from exc
+        identity = next((item for item in files if isinstance(item, dict) and str(item.get("id") or "") == account_id), None)
+        if identity is None:
+            raise BillingError("上游账号不存在或已失效")
+        auth_type = self._upstream_auth_type(identity)
+        start_ms = self._parse_admin_time(period_start, "订阅开始")
+        end_ms = self._parse_admin_time(period_end, "订阅结束")
+        mode = (subscription_mode or "").strip() or None
+        unit = (recurring_unit or "").strip() or None
+        interval = None if recurring_interval is None else int(recurring_interval)
+        if auth_type == "oauth":
+            if rate_ppm is not None:
+                raise BillingError("OAuth 账号不能配置 API key 费率")
+            if mode not in {"one_time", "recurring"}:
+                raise BillingError("OAuth 账号必须配置一次性或循环订阅")
+            if start_ms is None or period_cost_cents is None or int(period_cost_cents) < 0:
+                raise BillingError("OAuth 账号必须配置订阅开始时间和非负周期成本")
+            period_cost_cents = int(period_cost_cents)
+            if mode == "one_time":
+                if end_ms is None or end_ms <= start_ms:
+                    raise BillingError("一次性订阅必须配置晚于开始时间的结束时间")
+                unit, interval = None, None
+            else:
+                unit = unit or "month"
+                interval = 1 if interval is None else interval
+                if unit not in {"month", "day"} or interval < 1:
+                    raise BillingError("循环订阅周期无效")
+                if end_ms is not None and end_ms <= start_ms:
+                    raise BillingError("循环订阅结束时间必须晚于开始时间")
+        else:
+            if mode is not None or start_ms is not None or end_ms is not None or period_cost_cents is not None:
+                raise BillingError("API key 账号只配置分组和人民币/USD 费率")
+            if rate_ppm is None or int(rate_ppm) < 0:
+                raise BillingError("API key 账号必须配置非负人民币/USD 费率")
+            rate_ppm = int(rate_ppm)
+            unit, interval = None, None
+        with self.db.session() as session:
+            group = session.get(UpstreamAccountGroup, group_id)
+            if group is None:
+                raise BillingError("上游分组不存在")
+            current = session.get(UpstreamAccountConfig, account_id)
+            before = None if current is None else {
+                "group_id": current.group_id,
+                "subscription_mode": current.subscription_mode,
+                "period_start_at_ms": current.period_start_at_ms,
+                "period_end_at_ms": current.period_end_at_ms,
+                "recurring_unit": current.recurring_unit,
+                "recurring_interval": current.recurring_interval,
+                "period_cost_cents": current.period_cost_cents,
+                "rate_ppm": current.rate_ppm,
+            }
+            if current is None:
+                current = UpstreamAccountConfig(account_id=account_id, group_id=group.id, updated_at_ms=now_ms())
+                session.add(current)
+            current.group_id = group.id
+            current.subscription_mode = mode
+            current.period_start_at_ms = start_ms
+            current.period_end_at_ms = end_ms
+            current.recurring_unit = unit
+            current.recurring_interval = interval
+            current.period_cost_cents = period_cost_cents
+            current.rate_ppm = rate_ppm
+            current.updated_at_ms = now_ms()
+            session.add(AuditLog(
+                operator_type="web-admin", operator_id=operator_id, operation="account.billing.configure",
+                target=account_id, before_json=None if before is None else json.dumps(before),
+                after_json=json.dumps({
+                    "group_id": group.id,
+                    "subscription_mode": mode,
+                    "period_start_at_ms": start_ms,
+                    "period_end_at_ms": end_ms,
+                    "recurring_unit": unit,
+                    "recurring_interval": interval,
+                    "period_cost_cents": period_cost_cents,
+                    "rate_ppm": rate_ppm,
+                }),
+                reason=reason.strip(), created_at_ms=now_ms(),
+            ))
+            return {
+                "account_id": account_id,
+                "group_id": group.id,
+                "group_name": group.name,
+                "subscription_mode": mode,
+                "period_cost_cents": period_cost_cents,
+                "rate_ppm": rate_ppm,
+            }
 
     @staticmethod
     def _upstream_auth_type(item: dict[str, Any]) -> str:
@@ -5725,6 +6345,9 @@ class BillingService:
         self,
         configs: list[dict[str, Any]],
         existing: list[dict[str, Any]] | None = None,
+        cycle_start_ms: int | None = None,
+        cycle_end_ms: int | None = None,
+        timezone: str | None = None,
     ) -> list[dict[str, Any]]:
         if not configs:
             raise BillingError("至少需要配置一个上游账号成本")
@@ -5749,47 +6372,107 @@ class BillingService:
         missing = sorted(expected_ids - configured_ids)
         if missing:
             raise BillingError(f"以下有效上游账号尚未配置成本：{', '.join(missing)}")
-        resolved: list[dict[str, Any]] = []
-        seen: set[str] = set()
-        for config in configs:
-            account_id = str(config.get("account_id") or "").strip()
-            identity = by_id.get(account_id)
-            if not account_id or identity is None:
-                raise BillingError(f"CPA 上游账号不存在或已失效：{account_id or '-'}")
-            if account_id not in existing_ids and bool(identity.get("disabled") or identity.get("unavailable")):
-                raise BillingError(f"已停用的上游账号不能配置新账期成本：{account_id}")
-            if account_id in seen:
-                raise BillingError(f"上游账号成本重复配置：{account_id}")
-            seen.add(account_id)
-            auth_index = str(identity.get("auth_index") or "").strip()
-            if not auth_index:
-                raise BillingError(f"CPA 上游账号缺少 auth_index：{account_id}")
-            auth_type = self._upstream_auth_type(identity)
-            fixed_cost_cents = config.get("fixed_cost_cents")
-            rate_ppm = config.get("rate_ppm")
-            if auth_type == "oauth":
-                if rate_ppm is not None:
-                    raise BillingError(f"OAuth 账号不能配置 API key 费率：{account_id}")
-                if fixed_cost_cents is None or int(fixed_cost_cents) < 0:
-                    raise BillingError(f"OAuth 账号必须配置非负固定成本：{account_id}")
-                fixed_cost_cents, rate_ppm = int(fixed_cost_cents), None
-            else:
-                if fixed_cost_cents is not None:
-                    raise BillingError(f"API key 账号不能配置 OAuth 固定成本：{account_id}")
-                if rate_ppm is None or int(rate_ppm) < 0:
-                    raise BillingError(f"API key 账号必须配置非负人民币/USD 费率：{account_id}")
-                fixed_cost_cents, rate_ppm = None, int(rate_ppm)
-            resolved.append({
-                "account_id": account_id,
-                "auth_index": auth_index,
-                "account_name": str(
-                    identity.get("label") or identity.get("name") or identity.get("account")
-                    or identity.get("email") or f"上游账号 {account_id}"
-                )[:200],
-                "auth_type": auth_type,
-                "fixed_cost_cents": fixed_cost_cents,
-                "rate_ppm": rate_ppm,
-            })
+        zone = timezone or self.settings.timezone
+        with self.db.session() as session:
+            default_group = self._ensure_default_upstream_group(session)
+            account_configs = {
+                row.account_id: row for row in session.scalars(select(UpstreamAccountConfig))
+            }
+            groups = {row.id: row for row in session.scalars(select(UpstreamAccountGroup))}
+            resolved: list[dict[str, Any]] = []
+            seen: set[str] = set()
+            for config in configs:
+                account_id = str(config.get("account_id") or "").strip()
+                identity = by_id.get(account_id)
+                if not account_id or identity is None:
+                    raise BillingError(f"CPA 上游账号不存在或已失效：{account_id or '-'}")
+                if account_id not in existing_ids and bool(identity.get("disabled") or identity.get("unavailable")):
+                    raise BillingError(f"已停用的上游账号不能配置新账期成本：{account_id}")
+                if account_id in seen:
+                    raise BillingError(f"上游账号成本重复配置：{account_id}")
+                seen.add(account_id)
+                auth_index = str(identity.get("auth_index") or "").strip()
+                if not auth_index:
+                    raise BillingError(f"CPA 上游账号缺少 auth_index：{account_id}")
+                auth_type = self._upstream_auth_type(identity)
+                stored = account_configs.get(account_id)
+                group = groups.get(int(config["group_id"])) if config.get("group_id") is not None else None
+                if group is None and stored is not None:
+                    group = groups.get(stored.group_id)
+                if group is None:
+                    group = default_group
+                fixed_cost_cents = config.get("fixed_cost_cents")
+                rate_ppm = config.get("rate_ppm")
+                subscription_mode = stored.subscription_mode if stored is not None else None
+                period_start_at_ms = stored.period_start_at_ms if stored is not None else None
+                period_end_at_ms = stored.period_end_at_ms if stored is not None else None
+                recurring_unit = stored.recurring_unit if stored is not None else None
+                recurring_interval = stored.recurring_interval if stored is not None else None
+                period_cost_cents = stored.period_cost_cents if stored is not None else None
+                if auth_type == "oauth":
+                    if rate_ppm is not None:
+                        raise BillingError(f"OAuth 账号不能配置 API key 费率：{account_id}")
+                    if subscription_mode in {"one_time", "recurring"} and period_cost_cents is not None and period_start_at_ms is not None:
+                        if cycle_start_ms is None or cycle_end_ms is None:
+                            raise BillingError("无法根据订阅周期计算账期成本")
+                        try:
+                            fixed_cost_cents = prorate_subscription_cost(
+                                mode=subscription_mode,
+                                period_cost_cents=int(period_cost_cents),
+                                start_ms=int(period_start_at_ms),
+                                end_ms=period_end_at_ms,
+                                recurring_unit=recurring_unit,
+                                recurring_interval=recurring_interval,
+                                cycle_start_ms=cycle_start_ms,
+                                cycle_end_ms=cycle_end_ms,
+                                timezone=zone,
+                            )
+                        except ValueError as exc:
+                            raise BillingError(f"上游账号 {account_id} 的订阅周期无效：{exc}") from exc
+                        rate_ppm = None
+                    else:
+                        if fixed_cost_cents is None or int(fixed_cost_cents) < 0:
+                            raise BillingError(f"OAuth 账号必须配置订阅周期或非负固定成本：{account_id}")
+                        fixed_cost_cents, rate_ppm = int(fixed_cost_cents), None
+                        subscription_mode = None
+                        period_start_at_ms = None
+                        period_end_at_ms = None
+                        recurring_unit = None
+                        recurring_interval = None
+                        period_cost_cents = None
+                else:
+                    if fixed_cost_cents is not None:
+                        raise BillingError(f"API key 账号不能配置 OAuth 固定成本：{account_id}")
+                    if rate_ppm is None and stored is not None:
+                        rate_ppm = stored.rate_ppm
+                    if rate_ppm is None or int(rate_ppm) < 0:
+                        raise BillingError(f"API key 账号必须配置非负人民币/USD 费率：{account_id}")
+                    fixed_cost_cents, rate_ppm = None, int(rate_ppm)
+                    subscription_mode = None
+                    period_start_at_ms = None
+                    period_end_at_ms = None
+                    recurring_unit = None
+                    recurring_interval = None
+                    period_cost_cents = None
+                resolved.append({
+                    "account_id": account_id,
+                    "auth_index": auth_index,
+                    "account_name": str(
+                        identity.get("label") or identity.get("name") or identity.get("account")
+                        or identity.get("email") or f"上游账号 {account_id}"
+                    )[:200],
+                    "auth_type": auth_type,
+                    "fixed_cost_cents": fixed_cost_cents,
+                    "rate_ppm": rate_ppm,
+                    "group_id": group.id,
+                    "group_name": group.name,
+                    "subscription_mode": subscription_mode,
+                    "period_start_at_ms": period_start_at_ms,
+                    "period_end_at_ms": period_end_at_ms,
+                    "recurring_unit": recurring_unit,
+                    "recurring_interval": recurring_interval,
+                    "period_cost_cents": period_cost_cents,
+                })
         return resolved
 
     @staticmethod
@@ -5798,16 +6481,20 @@ class BillingService:
             return None
         return [{key: value for key, value in item.items() if key != "auth_index"} for item in items]
 
-    def configure_cycle(self, name: str, gradient_rule_id: int, pool_costs: list[dict[str, Any]],
+    def configure_cycle(self, name: str, gradient_rule_id: int | None, pool_costs: list[dict[str, Any]],
                         reason: str, operator_id: str = "admin-token",
                         upstream_costs: list[dict[str, Any]] | None = None) -> None:
         if not reason.strip():
             raise BillingError("修改账期配置必须填写原因")
         existing_upstream: list[dict[str, Any]] = []
+        cycle_start_ms = cycle_end_ms = None
+        timezone = self.settings.timezone
         if upstream_costs is not None:
             with self.db.session() as session:
                 existing_cycle = session.scalar(select(BillingCycle).where(BillingCycle.name == name))
                 if existing_cycle is not None:
+                    cycle_start_ms, cycle_end_ms = existing_cycle.start_at_ms, existing_cycle.end_at_ms
+                    timezone = existing_cycle.timezone or timezone
                     existing_upstream = [{
                         "id": item.account_id,
                         "auth_index": item.auth_index,
@@ -5817,7 +6504,7 @@ class BillingService:
                         CycleUpstreamCost.cycle_id == existing_cycle.id
                     ))]
         resolved_upstream = None if upstream_costs is None else self._resolve_upstream_costs(
-            upstream_costs, existing_upstream
+            upstream_costs, existing_upstream, cycle_start_ms, cycle_end_ms, timezone,
         )
         normalized_costs: dict[int, int] = {}
         for item in pool_costs:
@@ -5828,9 +6515,9 @@ class BillingService:
             normalized_costs[pool_id] = cents
         with self.db.session() as session:
             cycle = session.scalar(select(BillingCycle).where(BillingCycle.name == name))
-            rule = session.get(GradientRule, gradient_rule_id)
             if cycle is None or cycle.status == "closed":
                 raise BillingError("账期不存在或已经关闭")
+            rule = session.get(GradientRule, gradient_rule_id) if gradient_rule_id else session.get(GradientRule, cycle.gradient_rule_id)
             if rule is None or not rule.active:
                 raise BillingError("梯度规则不存在或已停用")
             pools = {pool.id for pool in session.scalars(select(ResourcePool).where(ResourcePool.active.is_(True)))}
@@ -5844,12 +6531,14 @@ class BillingService:
             cycle.tiers_json = rule.tiers_json
             session.execute(delete(CyclePoolCost).where(CyclePoolCost.cycle_id == cycle.id))
             session.execute(delete(CycleUpstreamCost).where(CycleUpstreamCost.cycle_id == cycle.id))
+            session.execute(delete(CycleGroup).where(CycleGroup.cycle_id == cycle.id))
             if resolved_upstream is None:
                 for pool_id, cents in normalized_costs.items():
                     session.add(CyclePoolCost(cycle_id=cycle.id, pool_id=pool_id, fixed_cost_cents=cents))
             else:
                 for item in resolved_upstream:
                     session.add(CycleUpstreamCost(cycle_id=cycle.id, **item))
+                self._replace_cycle_group_snapshots(session, cycle, {int(item["group_id"]) for item in resolved_upstream})
             self._invalidate_cycle_previews(session, [cycle.id])
             session.add(AuditLog(
                 operator_type="web-admin", operator_id=operator_id, operation="cycle.configure",
@@ -5870,7 +6559,6 @@ class BillingService:
             raise BillingError("cycle name must use letters, numbers, dot, underscore, or hyphen")
         if fixed_cost_cents < 0:
             raise BillingError("fixed cost cannot be negative")
-        resolved_upstream = None if upstream_costs is None else self._resolve_upstream_costs(upstream_costs)
         zone = ZoneInfo(self.settings.timezone)
         try:
             start_dt, end_dt = datetime.fromisoformat(start), datetime.fromisoformat(end)
@@ -5883,11 +6571,16 @@ class BillingService:
         start_ms, end_ms = int(start_dt.timestamp() * 1000), int(end_dt.timestamp() * 1000)
         if end_ms <= start_ms:
             raise BillingError("cycle end must be after start")
+        resolved_upstream = None if upstream_costs is None else self._resolve_upstream_costs(
+            upstream_costs, cycle_start_ms=start_ms, cycle_end_ms=end_ms, timezone=self.settings.timezone,
+        )
         with self.db.session() as session:
             if session.scalar(select(BillingCycle).where(BillingCycle.name == name)):
                 raise BillingError("billing cycle already exists")
             version_id = self._active_pricing_id(session)
-            gradient = session.get(GradientRule, gradient_rule_id) if gradient_rule_id else session.scalar(
+            default_group = self._ensure_default_upstream_group(session)
+            default_gradient = session.get(GradientRule, default_group.gradient_rule_id)
+            gradient = session.get(GradientRule, gradient_rule_id) if gradient_rule_id else default_gradient or session.scalar(
                 select(GradientRule).where(GradientRule.active.is_(True)).order_by(GradientRule.id)
             )
             if gradient is None or not gradient.active:
@@ -5901,6 +6594,7 @@ class BillingService:
                 normalized_costs = {}
                 for item in resolved_upstream:
                     session.add(CycleUpstreamCost(cycle_id=cycle.id, **item))
+                self._replace_cycle_group_snapshots(session, cycle, {int(item["group_id"]) for item in resolved_upstream})
             elif pool_costs is None:
                 pool = session.scalar(select(ResourcePool).where(ResourcePool.name == "default-cpa"))
                 if pool is None:

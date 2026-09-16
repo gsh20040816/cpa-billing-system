@@ -21,6 +21,7 @@ from cpa_billing.models import (
     Adjustment,
     AuditLog,
     BillingCycle,
+    CycleGroup,
     CyclePoolCost,
     CycleUpstreamCost,
     DeadLetter,
@@ -39,6 +40,7 @@ from cpa_billing.models import (
     StatementLine,
     SyncCheckpoint,
     TelegramUser,
+    UpstreamAccountGroup,
 )
 from cpa_billing.security import cpamp_key_hash
 from cpa_billing.services import BillingError, BillingService, CPAClient
@@ -2103,3 +2105,137 @@ def test_reconciliation_does_not_warn_for_fresh_transient_sync_lag(service, sett
         checkpoint = session.scalar(select(SyncCheckpoint))
         checkpoint.last_success_at_ms = 1
     assert service.reconciliation()["sync_degraded"] is True
+
+
+
+def test_bootstrap_creates_default_upstream_group(service) -> None:
+    with service.db.session() as session:
+        groups = list(session.scalars(select(UpstreamAccountGroup)))
+    assert len(groups) == 1
+    assert groups[0].name == "default"
+    assert groups[0].is_default is True
+
+
+def test_recurring_subscription_prorates_oauth_cost_into_cycle(service, settings, monkeypatch) -> None:
+    create_owner(service, "oauth-user-key", 2, 0)
+    insert_event(
+        settings,
+        cpamp_key_hash("oauth-user-key"),
+        1000,
+        event_hash="oauth-sub",
+        input_tokens=1_000_000,
+        output_tokens=0,
+        cached_tokens=0,
+        auth_index="oauth-auth",
+    )
+    service.sync_cpamp()
+    service.rate_events()
+    monkeypatch.setattr(service.cpa, "auth_files", lambda: [{
+        "id": "oauth-account",
+        "auth_index": "oauth-auth",
+        "account_type": "oauth",
+        "name": "Team OAuth",
+    }])
+    with service.db.session() as session:
+        group_id = session.scalar(select(UpstreamAccountGroup.id).where(UpstreamAccountGroup.is_default.is_(True)))
+    service.configure_account_billing(
+        "oauth-account",
+        group_id,
+        "configure monthly plus",
+        subscription_mode="recurring",
+        period_start="1970-01-01T08:00",
+        recurring_unit="month",
+        recurring_interval=1,
+        period_cost_cents=3100,
+    )
+    service.create_cycle(
+        "prorated",
+        "1970-01-01T08:00",
+        "1970-01-16T08:00",
+        0,
+        upstream_costs=[{"account_id": "oauth-account"}],
+    )
+    dashboard = service.dashboard("prorated")
+    oauth = next(item for item in dashboard["upstream_costs"] if item["account_id"] == "oauth-account")
+    assert oauth["amount_cents"] == 1500
+    assert dashboard["totals"]["fixed_cost"] == "15.00"
+    assert dashboard["group_totals"][0]["group"] == "default"
+    assert dashboard["group_totals"][0]["fixed_cost_cents"] == 1500
+
+
+def test_upstream_groups_bill_independently_then_sum(service, settings, monkeypatch) -> None:
+    create_owner(service, "codex-key", 2, 0)
+    create_owner(service, "grok-key", 3, 0)
+    insert_event(
+        settings,
+        cpamp_key_hash("codex-key"),
+        1000,
+        event_hash="codex-use",
+        input_tokens=1_000_000,
+        output_tokens=0,
+        cached_tokens=0,
+        auth_index="codex-auth",
+    )
+    insert_event(
+        settings,
+        cpamp_key_hash("grok-key"),
+        2000,
+        event_hash="grok-use",
+        input_tokens=2_000_000,
+        output_tokens=0,
+        cached_tokens=0,
+        auth_index="grok-auth",
+    )
+    service.sync_cpamp()
+    service.rate_events()
+    monkeypatch.setattr(service.cpa, "auth_files", lambda: [{
+        "id": "codex-account",
+        "auth_index": "codex-auth",
+        "account_type": "oauth",
+        "name": "Codex OAuth",
+    }, {
+        "id": "grok-account",
+        "auth_index": "grok-auth",
+        "account_type": "api-key",
+        "name": "Grok API",
+    }])
+    with service.db.session() as session:
+        default_id = session.scalar(select(UpstreamAccountGroup.id).where(UpstreamAccountGroup.is_default.is_(True)))
+        gradient_id = session.scalar(select(GradientRule.id).where(GradientRule.active.is_(True)))
+    grok_id = service.create_upstream_group("grok", gradient_id, "split grok")
+    service.configure_account_billing(
+        "codex-account",
+        default_id,
+        "codex group",
+        subscription_mode="one_time",
+        period_start="1970-01-01T08:00",
+        period_end="1970-01-02T08:00",
+        period_cost_cents=1000,
+    )
+    service.configure_account_billing(
+        "grok-account",
+        grok_id,
+        "grok group",
+        rate_ppm=7_000_000,
+    )
+    service.create_cycle(
+        "split-groups",
+        "1970-01-01T08:00",
+        "1970-01-02T08:00",
+        0,
+        upstream_costs=[{"account_id": "codex-account"}, {"account_id": "grok-account"}],
+    )
+    dashboard = service.dashboard("split-groups")
+    groups = {item["group"]: item for item in dashboard["group_totals"]}
+    assert set(groups) == {"default", "grok"}
+    assert groups["default"]["fixed_cost_cents"] == 1000
+    assert groups["default"]["dynamic_cost_cents"] == 0
+    grok_cost = next(item for item in dashboard["upstream_costs"] if item["account_id"] == "grok-account")
+    assert groups["grok"]["dynamic_cost_cents"] == grok_cost["amount_cents"]
+    by_user = {row["telegram_user_id"]: row["amount_cents"] for row in dashboard["rows"] if not row["unowned"]}
+    assert by_user[2] == 1000
+    assert by_user[3] == grok_cost["amount_cents"]
+    assert dashboard["totals"]["member_amount"] == f"{(1000 + grok_cost['amount_cents']) / 100:,.2f}"
+    with service.db.session() as session:
+        snapshots = list(session.scalars(select(CycleGroup)))
+    assert {item.group_name for item in snapshots} == {"default", "grok"}

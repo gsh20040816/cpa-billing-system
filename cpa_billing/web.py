@@ -129,6 +129,7 @@ class PoolCostPayload(BaseModel):
 
 class UpstreamCostPayload(BaseModel):
     account_id: str = Field(min_length=1, max_length=200)
+    group_id: int | None = Field(default=None, ge=1)
     fixed_cost: str | None = Field(default=None, max_length=40)
     rate: str | None = Field(default=None, max_length=40)
 
@@ -159,6 +160,7 @@ class AdjustmentPayload(BaseModel):
 class ManualUsageAdjustmentPayload(BaseModel):
     cycle: str = Field(min_length=1, max_length=80)
     pool_id: int = Field(ge=1)
+    group_id: int | None = Field(default=None, ge=1)
     telegram_user_id: int
     amount_usd: str = Field(min_length=1, max_length=80)
     reason: str = Field(min_length=1, max_length=1000)
@@ -219,9 +221,27 @@ class ReasonPayload(BaseModel):
 
 
 class CycleConfigurationPayload(BaseModel):
-    gradient_rule_id: int = Field(ge=1)
+    gradient_rule_id: int | None = Field(default=None, ge=1)
     pool_costs: list[PoolCostPayload] = Field(default_factory=list)
     upstream_costs: list[UpstreamCostPayload] = Field(default_factory=list)
+    reason: str = Field(min_length=1, max_length=1000)
+
+
+class UpstreamGroupPayload(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    gradient_rule_id: int = Field(ge=1)
+    reason: str = Field(min_length=1, max_length=1000)
+
+
+class AccountBillingPayload(BaseModel):
+    group_id: int = Field(ge=1)
+    subscription_mode: str | None = Field(default=None, max_length=20)
+    period_start: str | None = Field(default=None, max_length=40)
+    period_end: str | None = Field(default=None, max_length=40)
+    recurring_unit: str | None = Field(default=None, max_length=20)
+    recurring_interval: int | None = Field(default=None, ge=1, le=3650)
+    period_cost: str | None = Field(default=None, max_length=40)
+    rate: str | None = Field(default=None, max_length=40)
     reason: str = Field(min_length=1, max_length=1000)
 
 
@@ -845,6 +865,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         } for item in payload.pool_costs]
         upstream_costs = [{
             "account_id": item.account_id,
+            "group_id": item.group_id,
             "fixed_cost_cents": None if item.fixed_cost is None else _money_to_cents(item.fixed_cost),
             "rate_ppm": None if item.rate is None else _rate_to_ppm(item.rate),
         } for item in payload.upstream_costs]
@@ -876,6 +897,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             payload.reason,
             upstream_costs=[{
                 "account_id": item.account_id,
+                "group_id": item.group_id,
                 "fixed_cost_cents": None if item.fixed_cost is None else _money_to_cents(item.fixed_cost),
                 "rate_ppm": None if item.rate is None else _rate_to_ppm(item.rate),
             } for item in payload.upstream_costs] or None,
@@ -927,6 +949,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             payload.reason,
             None,
             operator_type="web-admin",
+            group_id=payload.group_id,
         )
         return {"ok": True, "id": adjustment_id}
 
@@ -947,6 +970,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             payload.reason,
             None,
             operator_type="web-admin",
+            group_id=payload.group_id,
         )
         return {"ok": True, "id": updated_id}
 
@@ -1055,6 +1079,44 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             payload.reason,
         )
         return {"ok": True}
+
+    @app.post("/api/admin/upstream-groups")
+    def api_create_upstream_group(payload: UpstreamGroupPayload, request: Request,
+                                  auth: Any = Depends(admin_current)) -> dict[str, Any]:
+        verify_csrf(request, auth)
+        group_id = service.create_upstream_group(payload.name, payload.gradient_rule_id, payload.reason)
+        return {"ok": True, "id": group_id}
+
+    @app.put("/api/admin/upstream-groups/{group_id}")
+    def api_update_upstream_group(group_id: int, payload: UpstreamGroupPayload, request: Request,
+                                  auth: Any = Depends(admin_current)) -> dict[str, bool]:
+        verify_csrf(request, auth)
+        service.update_upstream_group(group_id, payload.name, payload.gradient_rule_id, payload.reason)
+        return {"ok": True}
+
+    @app.delete("/api/admin/upstream-groups/{group_id}")
+    def api_delete_upstream_group(group_id: int, payload: ReasonPayload, request: Request,
+                                  auth: Any = Depends(admin_current)) -> dict[str, bool]:
+        verify_csrf(request, auth)
+        service.delete_upstream_group(group_id, payload.reason)
+        return {"ok": True}
+
+    @app.put("/api/admin/accounts/{account_id}/billing")
+    def api_configure_account_billing(account_id: str, payload: AccountBillingPayload, request: Request,
+                                      auth: Any = Depends(admin_current)) -> dict[str, Any]:
+        verify_csrf(request, auth)
+        return service.configure_account_billing(
+            account_id,
+            payload.group_id,
+            payload.reason,
+            subscription_mode=payload.subscription_mode,
+            period_start=payload.period_start,
+            period_end=payload.period_end,
+            recurring_unit=payload.recurring_unit,
+            recurring_interval=payload.recurring_interval,
+            period_cost_cents=None if payload.period_cost is None else _money_to_cents(payload.period_cost),
+            rate_ppm=None if payload.rate is None else _rate_to_ppm(payload.rate),
+        )
 
     @app.delete("/api/admin/gradient-rules/{rule_id}")
     def api_delete_gradient(rule_id: int, payload: ReasonPayload, request: Request,

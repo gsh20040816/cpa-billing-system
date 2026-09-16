@@ -124,9 +124,31 @@ watch(cycle, (value, previous) => {
       </v-alert>
       <MetricRail :items="metrics" :columns="6" />
 
+      <section v-if="data?.group_totals?.length" class="section-band">
+        <div class="section-band__head">
+          <div><h2>分组结算进度</h2><p>每个上游分组按自己的成本和梯度独立分摊，用户账单最后加总</p></div>
+          <strong class="mono">合计 {{ money(data?.totals?.amount, '¥') }}</strong>
+        </div>
+        <div class="section-band__body section-band__body--flush">
+          <v-table density="compact">
+            <thead><tr><th>分组</th><th class="text-right">OAuth 摊销成本</th><th class="text-right">上游 API key 动态成本</th><th class="text-right">未绑定 Key 抵扣</th><th class="text-right">成员剩余成本</th><th class="text-right">成员已分摊</th></tr></thead>
+            <tbody>
+              <tr v-for="group in data.group_totals" :key="group.group_id">
+                <td>{{ group.group }}</td>
+                <td class="text-right mono">{{ money(group.fixed_cost, '¥') }}</td>
+                <td class="text-right mono">{{ money(group.dynamic_cost, '¥') }}</td>
+                <td class="text-right mono">{{ money(group.metered_amount, '¥') }}</td>
+                <td class="text-right mono">{{ money(group.residual_cost, '¥') }}</td>
+                <td class="text-right mono">{{ money(group.member_amount, '¥') }}</td>
+              </tr>
+            </tbody>
+          </v-table>
+        </div>
+      </section>
+
       <section class="section-band">
         <div class="section-band__head">
-          <div><h2>资源池结算进度</h2><p>{{ data?.billing_model === 'upstream_channels' ? 'OAuth 固定成本与上游 API key 动态成本汇入资源池，先扣除未绑定 Key 计费，再分摊余额' : '固定成本先扣除未绑定按量 Key，再分摊给 Telegram 用户' }}</p></div>
+          <div><h2>资源池结算进度</h2><p>{{ data?.billing_model === 'upstream_channels' ? 'OAuth 固定成本与上游 API key 动态成本先按分组独立计费；资源池仅反映请求归集' : '固定成本先扣除未绑定按量 Key，再分摊给 Telegram 用户' }}</p></div>
           <strong class="mono">合计 {{ money(data?.totals?.amount, '¥') }}</strong>
         </div>
         <div class="section-band__body section-band__body--flush">
@@ -149,11 +171,11 @@ watch(cycle, (value, previous) => {
       </section>
 
       <section v-if="data?.upstream_costs?.length" class="section-band">
-        <div class="section-band__head"><div><h2>上游渠道成本</h2><p>OAuth 按账期固定计入；API key 按实际等效消耗实时计入</p></div></div>
+        <div class="section-band__head"><div><h2>上游渠道成本</h2><p>OAuth 按订阅周期摊入本账期；API key 按实际等效消耗实时计入</p></div></div>
         <div class="section-band__body section-band__body--flush">
           <v-table density="compact">
-            <thead><tr><th>账号</th><th>认证类型</th><th class="text-right">请求</th><th class="text-right">等效消耗 USD</th><th class="text-right">成本参数</th><th class="text-right">成本</th></tr></thead>
-            <tbody><tr v-for="item in data.upstream_costs" :key="item.account_id"><td>{{ item.account_name }}</td><td>{{ item.auth_type === 'api_key' ? 'API key' : 'OAuth' }}</td><td class="text-right mono">{{ number(item.requests) }}</td><td class="text-right mono">{{ money(item.actual) }}</td><td class="text-right mono">{{ item.auth_type === 'api_key' ? `${item.rate} ¥/USD` : money(item.fixed_cost, '¥') }}</td><td class="text-right mono">{{ money(item.amount, '¥') }}</td></tr></tbody>
+            <thead><tr><th>账号</th><th>分组</th><th>认证类型</th><th class="text-right">请求</th><th class="text-right">等效消耗 USD</th><th class="text-right">成本参数</th><th class="text-right">成本</th></tr></thead>
+            <tbody><tr v-for="item in data.upstream_costs" :key="item.account_id"><td>{{ item.account_name }}</td><td>{{ item.group_name || '-' }}</td><td>{{ item.auth_type === 'api_key' ? 'API key' : 'OAuth' }}</td><td class="text-right mono">{{ number(item.requests) }}</td><td class="text-right mono">{{ money(item.actual) }}</td><td class="text-right mono">{{ item.auth_type === 'api_key' ? `${item.rate} ¥/USD` : money(item.fixed_cost, '¥') }}</td><td class="text-right mono">{{ money(item.amount, '¥') }}</td></tr></tbody>
           </v-table>
         </div>
       </section>

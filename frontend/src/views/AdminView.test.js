@@ -52,6 +52,8 @@ const snapshot = {
       { id: 2, name: 'target-pool', active: true, rules: [] },
     ],
     gradients: [],
+    upstream_groups: [{ id: 1, name: 'default', is_default: true, gradient_rule_id: 9, gradient_rule: 'default', account_count: 0 }],
+    account_configs: [],
     keys: [],
     ownership: [],
     pricing: [{ id: 1, name: 'cpamp-initial', status: 'active', source: 'CPAMP', activated_at: '2026-07-11T12:00:00+08:00' }],
@@ -140,6 +142,7 @@ describe('AdminView manual usage', () => {
       admin: true,
       body: {
         cycle: 'cycle-open',
+        group_id: 1,
         pool_id: 1,
         telegram_user_id: 2,
         amount_usd: '2.500000001',
@@ -196,6 +199,7 @@ describe('AdminView manual usage', () => {
       admin: true,
       body: {
         cycle: 'cycle-target',
+        group_id: 1,
         pool_id: 2,
         telegram_user_id: 3,
         amount_usd: '3.500000001',
@@ -324,14 +328,19 @@ describe('AdminView manual usage', () => {
     snapshot.accounts = previousAccounts
   })
 
-  it('creates a cycle with OAuth fixed cost and upstream API key rate', async () => {
+  it('creates a cycle from configured upstream accounts', async () => {
     const previousAccounts = snapshot.accounts
     const previousGradients = snapshot.admin.gradients
+    const previousConfigs = snapshot.admin.account_configs
     snapshot.accounts = { accounts: [
       { id: 'oauth-1', name: 'Team OAuth', auth_type: 'oauth', usage: {} },
       { id: 'api-1', name: 'Paid API', auth_type: 'api_key', usage: {} },
     ] }
     snapshot.admin.gradients = [{ id: 9, name: 'default', active: true }]
+    snapshot.admin.account_configs = [
+      { account_id: 'oauth-1', group_id: 1, group_name: 'default', subscription_mode: 'recurring', period_start: '2026-07-01T00:00:00+08:00', period_cost: '20.00' },
+      { account_id: 'api-1', group_id: 1, group_name: 'default', rate: '7.123456' },
+    ]
     const wrapper = mount(AdminView, {
       attachTo: document.body,
       global: { plugins: [vuetify] },
@@ -351,8 +360,7 @@ describe('AdminView manual usage', () => {
     await fields.find((item) => item.props('label') === '名称').setValue('new-cycle')
     await fields.find((item) => item.props('label') === '开始时间').setValue('2026-07-01T00:00')
     await fields.find((item) => item.props('label') === '结束时间').setValue('2026-08-01T00:00')
-    await fields.find((item) => item.props('label') === 'Team OAuth').setValue('20.00')
-    await fields.find((item) => item.props('label') === 'Paid API').setValue('7.123456')
+    expect(document.body.textContent).toContain('循环')
     await dialog.findAllComponents({ name: 'VBtn' })
       .find((item) => item.text().trim() === '创建').trigger('click')
     await flushPromises()
@@ -362,8 +370,8 @@ describe('AdminView manual usage', () => {
       body: expect.objectContaining({
         name: 'new-cycle',
         upstream_costs: [
-          { account_id: 'oauth-1', fixed_cost: '20.00', rate: null },
-          { account_id: 'api-1', fixed_cost: null, rate: '7.123456' },
+          { account_id: 'oauth-1' },
+          { account_id: 'api-1' },
         ],
       }),
       method: 'POST',
@@ -371,12 +379,14 @@ describe('AdminView manual usage', () => {
     wrapper.unmount()
     snapshot.accounts = previousAccounts
     snapshot.admin.gradients = previousGradients
+    snapshot.admin.account_configs = previousConfigs
   })
 
-  it('shows and edits an upstream API key rate from the management account section', async () => {
+  it('saves an upstream API key rate on the account billing config', async () => {
     const previousAccounts = snapshot.accounts
     const previousCycles = snapshot.admin.cycles
     const previousGradients = snapshot.admin.gradients
+    const previousConfigs = snapshot.admin.account_configs
     snapshot.accounts = { accounts: [{
       id: 'codex-api-key:auth-1', name: 'Codex API key sk-paid...1234',
       auth_type: 'api_key', type: 'codex-api-key', usage: {}, can_refresh: false,
@@ -392,6 +402,9 @@ describe('AdminView manual usage', () => {
       }],
     }]
     snapshot.admin.gradients = [{ id: 9, name: 'default', active: true }]
+    snapshot.admin.account_configs = [{
+      account_id: 'codex-api-key:auth-1', group_id: 1, group_name: 'default', rate: '7.000000',
+    }]
     const wrapper = mount(AdminView, {
       attachTo: document.body,
       global: { plugins: [vuetify] },
@@ -401,31 +414,29 @@ describe('AdminView manual usage', () => {
     expect(wrapper.text()).toContain('current-cycle')
     expect(wrapper.text()).toContain('7.000000 ¥/USD')
     const configureButton = wrapper.findAllComponents({ name: 'VBtn' })
-      .find((item) => item.text().includes('配置费率'))
+      .find((item) => item.text().includes('配置计费'))
     await configureButton.trigger('click')
     await flushPromises()
 
     const dialog = wrapper.findAllComponents({ name: 'VDialog' })
       .find((item) => item.props('modelValue') === true)
     const rate = dialog.findAllComponents({ name: 'VTextField' })
-      .find((item) => item.props('label') === 'Codex API key sk-paid...1234')
+      .find((item) => item.props('label') === '人民币 / USD 费率')
     const reason = dialog.findAllComponents({ name: 'VTextarea' })
       .find((item) => item.props('label') === '修改原因')
     expect(rate.props('modelValue')).toBe('7.000000')
     await rate.setValue('8.25')
     await reason.setValue('更新上游 API key 费率')
     await dialog.findAllComponents({ name: 'VBtn' })
-      .find((item) => item.text().includes('保存配置')).trigger('click')
+      .find((item) => item.text().includes('保存')).trigger('click')
     await flushPromises()
 
-    expect(api).toHaveBeenCalledWith('/api/admin/cycles/current-cycle/configuration', {
+    expect(api).toHaveBeenCalledWith('/api/admin/accounts/codex-api-key%3Aauth-1/billing', {
       admin: true,
       body: {
-        gradient_rule_id: 9,
+        group_id: 1,
         reason: '更新上游 API key 费率',
-        upstream_costs: [{
-          account_id: 'codex-api-key:auth-1', fixed_cost: null, rate: '8.25',
-        }],
+        rate: '8.25',
       },
       method: 'PUT',
     })
@@ -433,5 +444,6 @@ describe('AdminView manual usage', () => {
     snapshot.accounts = previousAccounts
     snapshot.admin.cycles = previousCycles
     snapshot.admin.gradients = previousGradients
+    snapshot.admin.account_configs = previousConfigs
   })
 })
