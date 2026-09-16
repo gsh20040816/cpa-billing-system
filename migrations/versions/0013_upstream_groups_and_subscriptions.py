@@ -88,7 +88,12 @@ def upgrade() -> None:
     manual_columns = {column["name"] for column in inspector.get_columns("manual_usage_adjustments")} if "manual_usage_adjustments" in tables else set()
     if "manual_usage_adjustments" in tables and "group_id" not in manual_columns:
         with op.batch_alter_table("manual_usage_adjustments") as batch:
-            batch.add_column(sa.Column("group_id", sa.Integer(), sa.ForeignKey("upstream_account_groups.id"), nullable=True))
+            batch.add_column(sa.Column(
+                "group_id",
+                sa.Integer(),
+                sa.ForeignKey("upstream_account_groups.id", name="fk_manual_usage_adjustments_group_id"),
+                nullable=True,
+            ))
         op.create_index(
             "idx_manual_usage_cycle_group_pool_user",
             "manual_usage_adjustments",
