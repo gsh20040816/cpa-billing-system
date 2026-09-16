@@ -403,10 +403,12 @@ def test_long_context_uses_the_active_price_rule_and_can_be_republished(service,
 
     republished = service.republish_active_pricing("rebuild current pricing")
     assert republished["rating_status"] == "queued"
-    assert service.rate_events() == 1
+    assert republished["changed_models"] == []
+    assert service.rate_events() == 0
     with service.db.session() as session:
         active = session.scalar(select(PricingVersion).where(PricingVersion.status == "active"))
         rated = session.scalar(select(RatedEvent).where(RatedEvent.pricing_version_id == active.id))
+        assert rated is not None
         assert rated.long_context_applied is False
 
 
@@ -1820,6 +1822,7 @@ def test_upstream_price_sync_rerates_open_cycles_only(service, settings, monkeyp
     result = service.sync_upstream_prices("synced-prices", "web-admin", "admin-token", "test refresh")
     assert result["rated_events"] == 0
     assert result["rating_status"] == "queued"
+    assert result["changed_models"] == ["gpt-test"]
     assert service.request_history(2)["summary"]["unpriced"] == 1
     assert service.reconciliation()["unpriced_events"] == 1
     assert service.rate_events(limit=500) == 1
@@ -1851,6 +1854,7 @@ def test_upstream_price_sync_rerates_open_cycles_only(service, settings, monkeyp
         assert session.get(PricingVersion, closed.pricing_version_id).name == "cpamp-initial"
         scope = session.get(PricingRerateScope, opened.pricing_version_id)
         assert json.loads(scope.ranges_json) == [[0, 86_400_000]]
+        assert json.loads(scope.models_json) == ["gpt-test"]
         active_hashes = set(session.scalars(
             select(RawUsageEvent.event_hash)
             .join(RatedEvent, RatedEvent.raw_event_id == RawUsageEvent.id)
@@ -1953,6 +1957,7 @@ def test_manual_price_update_creates_version_and_rerates_open_cycles_only(servic
     assert result["name"] == "manual-prices"
     assert result["rated_events"] == 0
     assert result["rating_status"] == "queued"
+    assert result["changed_models"] == ["gpt-test"]
     assert service.rate_events(limit=500) >= 1
     assert Decimal(service.dashboard("open-manual-price")["totals"]["actual"].replace(",", "")) > Decimal(before_open.replace(",", ""))
     assert service.dashboard("closed-manual-price")["totals"]["actual"] == before_closed
@@ -1961,6 +1966,76 @@ def test_manual_price_update_creates_version_and_rerates_open_cycles_only(servic
         closed = session.scalar(select(BillingCycle).where(BillingCycle.name == "closed-manual-price"))
         assert session.get(PricingVersion, opened.pricing_version_id).name == "manual-prices"
         assert session.get(PricingVersion, closed.pricing_version_id).name == "cpamp-initial"
+
+
+
+def test_price_update_rerates_only_changed_models_in_open_cycles(service, settings) -> None:
+    create_owner(service, "key", 2, 0)
+    insert_event(settings, cpamp_key_hash("key"), 1000, event_hash="changed-model-event", model="gpt-test")
+    insert_event(settings, cpamp_key_hash("key"), 1001, event_hash="unchanged-model-event", model="gpt-5.6-luna")
+    service.sync_cpamp()
+    assert service.rate_events() == 2
+    service.create_cycle("open-partial-price", "1970-01-01T08:00", "1970-01-02T08:00", 1000)
+
+    with service.db.session() as session:
+        previous = session.scalar(select(PricingVersion).where(PricingVersion.status == "active"))
+        previous_id = previous.id
+        previous_costs = {
+            event_hash: cost
+            for event_hash, cost in session.execute(
+                select(RawUsageEvent.event_hash, RatedEvent.rated_weight_nano_usd)
+                .join(RatedEvent, RatedEvent.raw_event_id == RawUsageEvent.id)
+                .where(RatedEvent.pricing_version_id == previous_id)
+            )
+        }
+
+    result = service.update_pricing_rule(
+        "gpt-test",
+        {
+            "input_nano_per_token": 2_000,
+            "output_nano_per_token": 12_000,
+            "cache_read_nano_per_token": 200,
+            "cache_creation_nano_per_token": 2_500,
+            "priority_input_nano_per_token": None,
+            "priority_output_nano_per_token": None,
+            "priority_cache_read_nano_per_token": None,
+            "priority_cache_creation_nano_per_token": None,
+            "flex_input_nano_per_token": None,
+            "flex_output_nano_per_token": None,
+            "long_threshold_tokens": None,
+            "long_input_multiplier_ppm": 1_000_000,
+            "long_output_multiplier_ppm": 1_000_000,
+        },
+        "partial-manual-prices",
+        "只调整一个模型",
+        "web-admin",
+        "admin-token",
+    )
+
+    assert result["changed_models"] == ["gpt-test"]
+    assert service.rate_events(limit=500) == 1
+    assert service.rate_events(limit=500) == 0
+    with service.db.session() as session:
+        active = session.scalar(select(PricingVersion).where(PricingVersion.status == "active"))
+        scope = session.get(PricingRerateScope, active.id)
+        assert json.loads(scope.models_json) == ["gpt-test"]
+        active_rows = {
+            event_hash: (cost, json.loads(detail)["price_model"])
+            for event_hash, cost, detail in session.execute(
+                select(
+                    RawUsageEvent.event_hash,
+                    RatedEvent.rated_weight_nano_usd,
+                    RatedEvent.calculation_json,
+                )
+                .join(RatedEvent, RatedEvent.raw_event_id == RawUsageEvent.id)
+                .where(RatedEvent.pricing_version_id == active.id)
+            )
+        }
+        assert set(active_rows) == {"changed-model-event", "unchanged-model-event"}
+        assert active_rows["unchanged-model-event"][0] == previous_costs["unchanged-model-event"]
+        assert active_rows["unchanged-model-event"][1] == "gpt-5.6-luna"
+        assert active_rows["changed-model-event"][0] > previous_costs["changed-model-event"]
+        assert active_rows["changed-model-event"][1] == "gpt-test"
 
 
 def test_read_pages_do_not_rate_events(service, settings, monkeypatch) -> None:

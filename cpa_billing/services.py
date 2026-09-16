@@ -21,7 +21,7 @@ from typing import Any, Iterator
 from zoneinfo import ZoneInfo
 
 import httpx
-from sqlalchemy import Integer, and_, case, cast, delete, func, literal, not_, or_, select, union, update
+from sqlalchemy import Integer, and_, case, cast, delete, func, insert, literal, not_, or_, select, union, update
 from sqlalchemy.exc import IntegrityError
 
 from .config import Settings
@@ -1011,19 +1011,143 @@ class BillingService:
             .values(status="open")
         )
 
+    @staticmethod
+    def _price_rule_signature(rule: ModelPriceRule) -> tuple[Any, ...]:
+        return (
+            int(rule.input_nano_per_token),
+            int(rule.output_nano_per_token),
+            int(rule.cache_read_nano_per_token),
+            int(rule.cache_creation_nano_per_token),
+            rule.priority_input_nano_per_token,
+            rule.priority_output_nano_per_token,
+            rule.priority_cache_read_nano_per_token,
+            rule.priority_cache_creation_nano_per_token,
+            rule.flex_input_nano_per_token,
+            rule.flex_output_nano_per_token,
+            rule.long_threshold_tokens,
+            int(rule.long_input_multiplier_ppm if rule.long_input_multiplier_ppm is not None else 1_000_000),
+            int(rule.long_output_multiplier_ppm if rule.long_output_multiplier_ppm is not None else 1_000_000),
+        )
+
+    @classmethod
+    def _changed_price_models(
+        cls,
+        previous_rules: list[ModelPriceRule],
+        next_rules: list[ModelPriceRule],
+    ) -> list[str]:
+        previous = {rule.model: rule for rule in previous_rules}
+        changed: list[str] = []
+        for rule in next_rules:
+            prior = previous.get(rule.model)
+            if prior is None or cls._price_rule_signature(prior) != cls._price_rule_signature(rule):
+                changed.append(rule.model)
+        return sorted(changed)
+
     def _record_pricing_rerate_scope(
         self,
         session: Any,
         version_id: int,
         cycles: list[BillingCycle],
+        changed_models: list[str] | None = None,
     ) -> None:
         ranges = sorted({(cycle.start_at_ms, cycle.end_at_ms) for cycle in cycles})
         session.add(PricingRerateScope(
             pricing_version_id=version_id,
             ranges_json=json.dumps(ranges, separators=(",", ":")),
+            models_json=(
+                None
+                if changed_models is None
+                else json.dumps(sorted(set(changed_models)), separators=(",", ":"))
+            ),
             max_raw_event_id=session.scalar(select(func.max(RawUsageEvent.id))) or 0,
             created_at_ms=now_ms(),
         ))
+
+    def _carry_forward_unchanged_rated_events(
+        self,
+        session: Any,
+        *,
+        from_version_id: int,
+        to_version_id: int,
+        cycles: list[BillingCycle],
+        unchanged_models: list[str],
+    ) -> int:
+        if not cycles or not unchanged_models:
+            return 0
+        ranges = sorted({(cycle.start_at_ms, cycle.end_at_ms) for cycle in cycles})
+        range_filters = [
+            and_(
+                RatedEvent.occurred_at_ms >= start,
+                RatedEvent.occurred_at_ms < end,
+            )
+            for start, end in ranges
+        ]
+        if not range_filters:
+            return 0
+        price_model = func.json_extract(RatedEvent.calculation_json, "$.price_model")
+        existing = select(RatedEvent.raw_event_id).where(RatedEvent.pricing_version_id == to_version_id)
+        result = session.execute(
+            insert(RatedEvent).from_select(
+                [
+                    "raw_event_id",
+                    "pricing_version_id",
+                    "pool_id",
+                    "telegram_user_id",
+                    "occurred_at_ms",
+                    "rated_weight_nano_usd",
+                    "long_context_applied",
+                    "service_tier",
+                    "calculation_json",
+                    "rated_at_ms",
+                ],
+                select(
+                    RatedEvent.raw_event_id,
+                    literal(to_version_id),
+                    RatedEvent.pool_id,
+                    RatedEvent.telegram_user_id,
+                    RatedEvent.occurred_at_ms,
+                    RatedEvent.rated_weight_nano_usd,
+                    RatedEvent.long_context_applied,
+                    RatedEvent.service_tier,
+                    RatedEvent.calculation_json,
+                    RatedEvent.rated_at_ms,
+                ).where(
+                    RatedEvent.pricing_version_id == from_version_id,
+                    or_(*range_filters),
+                    price_model.in_(unchanged_models),
+                    RatedEvent.raw_event_id.not_in(existing),
+                ),
+            )
+        )
+        return int(result.rowcount or 0)
+
+    def _activate_pricing_version_for_open_cycles(
+        self,
+        session: Any,
+        *,
+        previous_version_id: int | None,
+        version_id: int,
+        previous_rules: list[ModelPriceRule],
+        next_rules: list[ModelPriceRule],
+    ) -> tuple[list[BillingCycle], list[str], int]:
+        changed_models = self._changed_price_models(previous_rules, next_rules)
+        unchanged_models = sorted({rule.model for rule in next_rules} - set(changed_models))
+        cycles = list(session.scalars(select(BillingCycle).where(BillingCycle.status != "closed")))
+        cycle_ids = [cycle.id for cycle in cycles]
+        for cycle in cycles:
+            cycle.pricing_version_id = version_id
+        self._invalidate_cycle_previews(session, cycle_ids)
+        self._record_pricing_rerate_scope(session, version_id, cycles, changed_models)
+        carried = 0
+        if previous_version_id is not None:
+            carried = self._carry_forward_unchanged_rated_events(
+                session,
+                from_version_id=previous_version_id,
+                to_version_id=version_id,
+                cycles=cycles,
+                unchanged_models=unchanged_models,
+            )
+        return cycles, changed_models, carried
 
     def sync_upstream_prices(
         self,
@@ -1045,6 +1169,19 @@ class BillingService:
                 for value in row
                 if value and str(value).strip()
             })
+            previous = session.scalar(
+                select(PricingVersion)
+                .where(PricingVersion.status == "active")
+                .order_by(PricingVersion.id.desc())
+            )
+            previous_version_id = previous.id if previous is not None else None
+            previous_rules = []
+            if previous is not None:
+                previous_rules = list(session.scalars(
+                    select(ModelPriceRule)
+                    .where(ModelPriceRule.pricing_version_id == previous.id)
+                    .order_by(ModelPriceRule.model)
+                ))
         try:
             upstream = self.cpamp.sync_model_prices(used_models)
         except httpx.HTTPError as exc:
@@ -1058,12 +1195,18 @@ class BillingService:
                 allow_existing=False,
             )
             with self.db.session() as session:
-                cycles = list(session.scalars(select(BillingCycle).where(BillingCycle.status != "closed")))
-                cycle_ids = [cycle.id for cycle in cycles]
-                for cycle in cycles:
-                    cycle.pricing_version_id = version_id
-                self._invalidate_cycle_previews(session, cycle_ids)
-                self._record_pricing_rerate_scope(session, version_id, cycles)
+                next_rules = list(session.scalars(
+                    select(ModelPriceRule)
+                    .where(ModelPriceRule.pricing_version_id == version_id)
+                    .order_by(ModelPriceRule.model)
+                ))
+                cycles, changed_models, _carried = self._activate_pricing_version_for_open_cycles(
+                    session,
+                    previous_version_id=previous_version_id,
+                    version_id=version_id,
+                    previous_rules=previous_rules,
+                    next_rules=next_rules,
+                )
                 session.add(AuditLog(
                     operator_type=operator_type,
                     operator_id=operator_id,
@@ -1072,6 +1215,7 @@ class BillingService:
                     after_json=json.dumps({
                         "version_id": version_id,
                         "cycles": [cycle.name for cycle in cycles],
+                        "changed_models": changed_models,
                         "source": upstream.get("source"),
                         "imported": upstream.get("imported"),
                         "unmatched": upstream.get("unmatched") or [],
@@ -1087,6 +1231,7 @@ class BillingService:
             "imported": int(upstream.get("imported") or 0),
             "skipped": int(upstream.get("skipped") or 0),
             "unmatched": upstream.get("unmatched") or [],
+            "changed_models": changed_models,
             "rated_events": 0,
             "rating_status": "queued",
         }
@@ -1224,12 +1369,18 @@ class BillingService:
                     raw_json=None,
                 ))
 
-            cycles = list(session.scalars(select(BillingCycle).where(BillingCycle.status != "closed")))
-            cycle_ids = [cycle.id for cycle in cycles]
-            for cycle in cycles:
-                cycle.pricing_version_id = version.id
-            self._invalidate_cycle_previews(session, cycle_ids)
-            self._record_pricing_rerate_scope(session, version.id, cycles)
+            next_rules = list(session.scalars(
+                select(ModelPriceRule)
+                .where(ModelPriceRule.pricing_version_id == version.id)
+                .order_by(ModelPriceRule.model)
+            ))
+            cycles, changed_models, _carried = self._activate_pricing_version_for_open_cycles(
+                session,
+                previous_version_id=active.id,
+                version_id=version.id,
+                previous_rules=source_rules,
+                next_rules=next_rules,
+            )
             cycle_names = [cycle.name for cycle in cycles]
             session.add(AuditLog(
                 operator_type=operator_type,
@@ -1237,7 +1388,12 @@ class BillingService:
                 operation="pricing.manual_update",
                 target=f"{candidate_name}:{model}",
                 before_json=json.dumps(before_payload, ensure_ascii=False) if before_payload else None,
-                after_json=json.dumps({"version_id": version.id, "model": model, "values": values}, ensure_ascii=False),
+                after_json=json.dumps({
+                    "version_id": version.id,
+                    "model": model,
+                    "values": values,
+                    "changed_models": changed_models,
+                }, ensure_ascii=False),
                 reason=reason,
                 created_at_ms=created,
             ))
@@ -1248,6 +1404,7 @@ class BillingService:
             "source": "manual adjustment",
             "model": model,
             "cycles": cycle_names,
+            "changed_models": changed_models,
             "rated_events": 0,
             "rating_status": "queued",
         }
@@ -1319,19 +1476,30 @@ class BillingService:
                     **{field: getattr(source_rule, field) for field in rule_fields},
                 ))
 
-            cycles = list(session.scalars(select(BillingCycle).where(BillingCycle.status != "closed")))
-            cycle_ids = [cycle.id for cycle in cycles]
-            for cycle in cycles:
-                cycle.pricing_version_id = version.id
-            self._invalidate_cycle_previews(session, cycle_ids)
-            self._record_pricing_rerate_scope(session, version.id, cycles)
+            next_rules = list(session.scalars(
+                select(ModelPriceRule)
+                .where(ModelPriceRule.pricing_version_id == version.id)
+                .order_by(ModelPriceRule.model)
+            ))
+            cycles, changed_models, _carried = self._activate_pricing_version_for_open_cycles(
+                session,
+                previous_version_id=active.id,
+                version_id=version.id,
+                previous_rules=source_rules,
+                next_rules=next_rules,
+            )
             session.add(AuditLog(
                 operator_type=operator_type,
                 operator_id=operator_id,
                 operation="pricing.republish",
                 target=candidate_name,
                 before_json=json.dumps({"version_id": active.id, "name": active.name}),
-                after_json=json.dumps({"version_id": version.id, "name": candidate_name, "cycles": [cycle.name for cycle in cycles]}),
+                after_json=json.dumps({
+                    "version_id": version.id,
+                    "name": candidate_name,
+                    "cycles": [cycle.name for cycle in cycles],
+                    "changed_models": changed_models,
+                }),
                 reason=reason,
                 created_at_ms=created,
             ))
@@ -1341,6 +1509,7 @@ class BillingService:
                 "source": "active pricing republish",
                 "previous_version_id": active.id,
                 "cycles": [cycle.name for cycle in cycles],
+                "changed_models": changed_models,
                 "rated_events": 0,
                 "rating_status": "queued",
             }
@@ -1534,11 +1703,33 @@ class BillingService:
                     raise BillingError(
                         f"价格版本 {selected_version_id} 的重算范围无效"
                     ) from exc
+                historical = or_(*range_filters) if range_filters else literal(False)
+                if rerate_scope.models_json is not None:
+                    try:
+                        changed_models = json.loads(rerate_scope.models_json)
+                        if not isinstance(changed_models, list):
+                            raise TypeError("models_json must be a list")
+                        changed_models = [str(model) for model in changed_models]
+                    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                        raise BillingError(
+                            f"价格版本 {selected_version_id} 的重算模型范围无效"
+                        ) from exc
+                    if changed_models:
+                        historical = and_(
+                            historical,
+                            or_(
+                                RawUsageEvent.resolved_model.in_(changed_models),
+                                RawUsageEvent.requested_model.in_(changed_models),
+                                RawUsageEvent.model.in_(changed_models),
+                            ),
+                        )
+                    else:
+                        historical = literal(False)
                 # The scope limits records that existed when prices changed. Rows
                 # imported later still need their first rating under the active version.
                 filters.append(or_(
                     RawUsageEvent.id > rerate_scope.max_raw_event_id,
-                    *range_filters,
+                    historical,
                 ))
             events = session.scalars(
                 select(RawUsageEvent).outerjoin(

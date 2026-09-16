@@ -171,6 +171,7 @@ class PricingRerateScope(Base):
     __tablename__ = "pricing_rerate_scopes"
     pricing_version_id: Mapped[int] = mapped_column(ForeignKey("pricing_versions.id"), primary_key=True)
     ranges_json: Mapped[str] = mapped_column(Text)
+    models_json: Mapped[str | None] = mapped_column(Text)
     max_raw_event_id: Mapped[int] = mapped_column(BigInteger)
     created_at_ms: Mapped[int] = mapped_column(BigInteger)
 
