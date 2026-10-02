@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import time
@@ -8,7 +9,7 @@ from collections import defaultdict, deque
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
@@ -190,6 +191,15 @@ class PricingSyncPayload(BaseModel):
     reason: str = Field(min_length=1, max_length=1000)
 
 
+class ContextPricePayload(BaseModel):
+    threshold_tokens: int = Field(gt=0)
+    service_tier: Literal["default", "priority", "flex"] = "default"
+    input_usd_per_million: str = Field(min_length=1, max_length=40)
+    output_usd_per_million: str = Field(min_length=1, max_length=40)
+    cache_read_usd_per_million: str = Field(min_length=1, max_length=40)
+    cache_creation_usd_per_million: str = Field(min_length=1, max_length=40)
+
+
 class PricingRulePayload(BaseModel):
     model: str = Field(min_length=1, max_length=160)
     input_usd_per_million: str = Field(min_length=1, max_length=40)
@@ -202,6 +212,9 @@ class PricingRulePayload(BaseModel):
     priority_cache_creation_usd_per_million: str | None = Field(default=None, max_length=40)
     flex_input_usd_per_million: str | None = Field(default=None, max_length=40)
     flex_output_usd_per_million: str | None = Field(default=None, max_length=40)
+    flex_cache_read_usd_per_million: str | None = Field(default=None, max_length=40)
+    flex_cache_creation_usd_per_million: str | None = Field(default=None, max_length=40)
+    context_tiers: list[ContextPricePayload] | None = Field(default=None, max_length=100)
     long_context_threshold_tokens: int | None = Field(default=None, ge=0)
     long_context_input_multiplier: str = Field(default="1", max_length=40)
     long_context_output_multiplier: str = Field(default="1", max_length=40)
@@ -1042,10 +1055,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "priority_cache_creation_nano_per_token": _usd_per_million_to_nano(payload.priority_cache_creation_usd_per_million, "Priority Cache creation 价格", True),
             "flex_input_nano_per_token": _usd_per_million_to_nano(payload.flex_input_usd_per_million, "Flex Input 价格", True),
             "flex_output_nano_per_token": _usd_per_million_to_nano(payload.flex_output_usd_per_million, "Flex Output 价格", True),
+            "flex_cache_read_nano_per_token": _usd_per_million_to_nano(payload.flex_cache_read_usd_per_million, "Flex Cache read 价格", True),
+            "flex_cache_creation_nano_per_token": _usd_per_million_to_nano(payload.flex_cache_creation_usd_per_million, "Flex Cache creation 价格", True),
             "long_threshold_tokens": payload.long_context_threshold_tokens,
             "long_input_multiplier_ppm": _multiplier_to_ppm(payload.long_context_input_multiplier, "长上下文 Input 倍率"),
             "long_output_multiplier_ppm": _multiplier_to_ppm(payload.long_context_output_multiplier, "长上下文 Output 倍率"),
         }
+        if payload.context_tiers is not None:
+            values["context_tiers_json"] = json.dumps([
+                {"threshold_tokens": band.threshold_tokens, "service_tier": band.service_tier,
+                 **{field: _usd_per_million_to_nano(getattr(band, field + "_usd_per_million"), "上下文区间价格")
+                    for field in ("input", "output", "cache_read", "cache_creation")}}
+                for band in payload.context_tiers
+            ])
+            values.update(long_threshold_tokens=None, long_input_multiplier_ppm=1_000_000, long_output_multiplier_ppm=1_000_000)
         return service.update_pricing_rule(
             payload.model,
             values,

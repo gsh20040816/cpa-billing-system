@@ -10,6 +10,31 @@ from cpa_billing.security import cpamp_key_hash, login_fingerprint, mask_api_key
 from cpa_billing.web import LoginLimiter, create_app
 
 
+def test_admin_edits_multiple_explicit_context_prices(settings, monkeypatch):
+    app = create_app(settings)
+    monkeypatch.setattr(app.state.service, "accounts_snapshot", lambda: {"accounts": [], "inspection": {}})
+    client = TestClient(app, base_url="https://billing.example")
+    login = client.post("/auth/admin/login", json={"management_token": settings.admin_token})
+    headers = {"X-CSRF-Token": login.json()["csrf_token"]}
+    payload = {
+        "model": "gpt-test", "input_usd_per_million": "1", "output_usd_per_million": "6",
+        "cache_read_usd_per_million": "0.1", "cache_creation_usd_per_million": "1.25",
+        "reason": "Explicit context price update", "context_tiers": [
+            {"threshold_tokens": threshold, "service_tier": "default", "input_usd_per_million": price,
+             "output_usd_per_million": "9", "cache_read_usd_per_million": "0", "cache_creation_usd_per_million": "0.4"}
+            for threshold, price in [(200, "3"), (100, "2")]
+        ],
+    }
+    assert client.put("/api/admin/pricing-rules", headers=headers, json=payload).status_code == 200
+    models = client.get("/api/admin/snapshot").json()["admin"]["pricing_rules"]["models"]
+    rule = next(item for item in models if item["model"] == "gpt-test")
+    assert [band["threshold_tokens"] for band in rule["context_tiers"]] == [100, 200]
+    assert rule["context_tiers"][0]["cache_read"]["usd_per_million"] == "0"
+    assert rule["long_context"]["threshold_tokens"] is None
+    payload["context_tiers"].append(payload["context_tiers"][0])
+    assert client.put("/api/admin/pricing-rules", headers=headers, json=payload).status_code == 400
+
+
 def add_user(app, settings, user_id: int, raw_key: str, *, is_admin: bool = False) -> None:
     service = app.state.service
     with service.db.session() as session:

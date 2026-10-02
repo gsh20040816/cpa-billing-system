@@ -6,7 +6,7 @@ import LoadingState from '../components/LoadingState.vue'
 import PageHeader from '../components/PageHeader.vue'
 import { useAutoRefresh } from '../lib/autoRefresh'
 import { dateTime, money, number } from '../lib/format'
-import { effectiveRate, priceSourceText } from '../lib/pricing'
+import { contextPrices, effectiveRate, priceSourceText } from '../lib/pricing'
 import { toQuery } from '../lib/query'
 
 const loading = ref(true)
@@ -28,8 +28,7 @@ const modelHeaders = [
   { title: 'Cache creation / 1M', key: 'cache_creation', align: 'end' },
   { title: 'Output / 1M', key: 'output', align: 'end' },
   { title: '价格来源', key: 'price_source' },
-  { title: '长上下文阈值', key: 'threshold', align: 'end' },
-  { title: '长上下文倍率', key: 'multipliers', align: 'end' },
+  { title: 'Input 上下文区间', key: 'threshold', align: 'end' },
 ]
 
 function rateText(item, field) {
@@ -39,18 +38,20 @@ function rateText(item, field) {
 
 const models = computed(() => {
   const needle = search.value.trim().toLowerCase()
-  return (data.value?.models || []).filter((item) => !needle || item.model.toLowerCase().includes(needle)).map((item) => ({
-    ...item,
-    input: rateText(item, 'input'),
-    output: rateText(item, 'output'),
-    cache_read: rateText(item, 'cache_read'),
-    cache_creation: rateText(item, 'cache_creation'),
-    price_source: priceSourceText(item),
-    threshold: item.long_context.threshold_tokens ? number(item.long_context.threshold_tokens) : '-',
-    multipliers: item.long_context.threshold_tokens
-      ? `${(item.long_context.input_multiplier_ppm / 1_000_000).toFixed(2)}x / ${(item.long_context.output_multiplier_ppm / 1_000_000).toFixed(2)}x`
-      : '-',
-  }))
+  return (data.value?.models || []).filter((item) => !needle || item.model.toLowerCase().includes(needle)).flatMap((item) => {
+    const bands = contextPrices(item, tier.value)
+    const thresholds = [0, ...bands.map((band) => band.threshold_tokens)]
+    return thresholds.map((threshold, index) => {
+      const rates = index === 0 ? item : { ...item, [tier.value]: bands[index - 1] }
+      return {
+        model: item.model,
+        input: rateText(rates, 'input'), output: rateText(rates, 'output'),
+        cache_read: rateText(rates, 'cache_read'), cache_creation: rateText(rates, 'cache_creation'),
+        price_source: priceSourceText(item),
+        threshold: `${index === 0 ? '0' : '> ' + number(threshold)} — ${thresholds[index + 1] ? '≤ ' + number(thresholds[index + 1]) : '∞'}`,
+      }
+    })
+  })
 })
 
 async function load(silent = false) {
@@ -154,7 +155,6 @@ watch(cycle, (value, previous) => { if (previous && value !== previous) autoRefr
             <template #item.cache_creation="{ item }"><span class="mono">{{ item.cache_creation }}</span></template>
             <template #item.output="{ item }"><span class="mono">{{ item.output }}</span></template>
             <template #item.threshold="{ item }"><span class="mono">{{ item.threshold }}</span></template>
-            <template #item.multipliers="{ item }"><span class="mono">{{ item.multipliers }}</span></template>
           </v-data-table>
         </div>
       </section>
@@ -164,7 +164,7 @@ watch(cycle, (value, previous) => { if (previous && value !== previous) autoRefr
         <div class="section-band__body semantics-grid">
           <div><span>Cached tokens</span><strong>Input 子集</strong></div>
           <div><span>Reasoning tokens</span><strong>Output 子集</strong></div>
-          <div><span>长上下文判定</span><strong>总 Input</strong></div>
+          <div><span>上下文区间选择</span><strong>总 Input，整次请求单价</strong></div>
           <div><span>未归属普通 Key</span><strong>不计费</strong></div>
           <div><span>上游 OAuth</span><strong>账号固定成本</strong></div>
           <div><span>上游 API key</span><strong>实际 USD × ¥/USD 费率</strong></div>

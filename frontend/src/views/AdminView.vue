@@ -69,9 +69,9 @@ const pricingRuleDialog = reactive({
   priority_cache_creation_usd_per_million: '',
   flex_input_usd_per_million: '',
   flex_output_usd_per_million: '',
-  long_context_threshold_tokens: '',
-  long_context_input_multiplier: '1',
-  long_context_output_multiplier: '1',
+  flex_cache_read_usd_per_million: '',
+  flex_cache_creation_usd_per_million: '',
+  context_tiers: [],
   version_name: '',
   reason: '',
 })
@@ -453,18 +453,11 @@ function pricingLine(rule, tier) {
 }
 
 function pricingContext(rule) {
-  const context = rule?.long_context || {}
-  if (!context.threshold_tokens) return '-'
-  return `${number(context.threshold_tokens)} · ${(Number(context.input_multiplier_ppm || 1_000_000) / 1_000_000).toFixed(2)}x / ${(Number(context.output_multiplier_ppm || 1_000_000) / 1_000_000).toFixed(2)}x`
+  return (rule?.context_tiers || []).map((band) => `${band.service_tier} > ${number(band.threshold_tokens)}: I ${band.input?.usd_per_million} · R ${band.cache_read?.usd_per_million} · C+ ${band.cache_creation?.usd_per_million} · O ${band.output?.usd_per_million}`).join('；') || '-'
 }
 
 function ruleField(rule, tier, field) {
   return rule?.[tier]?.[field]?.usd_per_million || ''
-}
-
-function multiplierField(rule, field) {
-  const value = rule?.long_context?.[field]
-  return value === undefined || value === null ? '1' : String(Number(value) / 1_000_000)
 }
 
 function openPricingRule(rule = null) {
@@ -482,9 +475,12 @@ function openPricingRule(rule = null) {
     priority_cache_creation_usd_per_million: ruleField(rule, 'priority', 'cache_creation'),
     flex_input_usd_per_million: ruleField(rule, 'flex', 'input'),
     flex_output_usd_per_million: ruleField(rule, 'flex', 'output'),
-    long_context_threshold_tokens: rule?.long_context?.threshold_tokens ? String(rule.long_context.threshold_tokens) : '',
-    long_context_input_multiplier: multiplierField(rule, 'input_multiplier_ppm'),
-    long_context_output_multiplier: multiplierField(rule, 'output_multiplier_ppm'),
+    flex_cache_read_usd_per_million: ruleField(rule, 'flex', 'cache_read'),
+    flex_cache_creation_usd_per_million: ruleField(rule, 'flex', 'cache_creation'),
+    context_tiers: (rule?.context_tiers || []).map((band) => ({
+      threshold_tokens: band.threshold_tokens, service_tier: band.service_tier,
+      ...Object.fromEntries(['input', 'output', 'cache_read', 'cache_creation'].map((field) => [field + '_usd_per_million', band[field]?.usd_per_million ?? '0'])),
+    })),
     version_name: '',
     reason: '',
   })
@@ -504,10 +500,9 @@ async function savePricingRule() {
     priority_cache_creation_usd_per_million: optional(pricingRuleDialog.priority_cache_creation_usd_per_million),
     flex_input_usd_per_million: optional(pricingRuleDialog.flex_input_usd_per_million),
     flex_output_usd_per_million: optional(pricingRuleDialog.flex_output_usd_per_million),
-    long_context_threshold_tokens: optional(pricingRuleDialog.long_context_threshold_tokens) === null
-      ? null : Number(pricingRuleDialog.long_context_threshold_tokens),
-    long_context_input_multiplier: pricingRuleDialog.long_context_input_multiplier,
-    long_context_output_multiplier: pricingRuleDialog.long_context_output_multiplier,
+    flex_cache_read_usd_per_million: optional(pricingRuleDialog.flex_cache_read_usd_per_million),
+    flex_cache_creation_usd_per_million: optional(pricingRuleDialog.flex_cache_creation_usd_per_million),
+    context_tiers: pricingRuleDialog.context_tiers.map((band) => ({ ...band, threshold_tokens: Number(band.threshold_tokens) })),
     version_name: optional(pricingRuleDialog.version_name),
     reason: pricingRuleDialog.reason,
   }, '手动计费规则已保存，未关闭账期已提交后台重算', 'PUT')
@@ -868,7 +863,7 @@ const autoRefresh = useAutoRefresh((silent) => load(silent), { interval: 30_000 
                   {title:'模型',key:'model',minWidth:190},
                   {title:'Default USD / 1M（I · R · C+ · O）',key:'default',minWidth:300},
                   {title:'Priority USD / 1M（I · R · C+ · O）',key:'priority',minWidth:300},
-                  {title:'长上下文',key:'long_context',minWidth:170},
+                  {title:'上下文区间单价',key:'long_context',minWidth:260},
                   {title:'操作',key:'actions',sortable:false,width:110},
                 ]"
                 :items="pricingModels"
@@ -987,9 +982,19 @@ const autoRefresh = useAutoRefresh((silent) => load(silent), { interval: 30_000 
             <v-text-field v-model="pricingRuleDialog.priority_cache_creation_usd_per_million" label="Priority Cache creation（空=Default）" type="number" min="0" step="0.001" prefix="$" />
             <v-text-field v-model="pricingRuleDialog.flex_input_usd_per_million" label="Flex Input（空=Default）" type="number" min="0" step="0.001" prefix="$" />
             <v-text-field v-model="pricingRuleDialog.flex_output_usd_per_million" label="Flex Output（空=Default）" type="number" min="0" step="0.001" prefix="$" />
-            <v-text-field v-model="pricingRuleDialog.long_context_threshold_tokens" label="长上下文阈值 tokens（空=不启用）" type="number" min="0" />
-            <v-text-field v-model="pricingRuleDialog.long_context_input_multiplier" label="长上下文 Input 倍率" type="number" min="0" step="0.000001" suffix="x" />
-            <v-text-field v-model="pricingRuleDialog.long_context_output_multiplier" label="长上下文 Output 倍率" type="number" min="0" step="0.000001" suffix="x" />
+            <v-text-field v-model="pricingRuleDialog.flex_cache_read_usd_per_million" label="Flex Cache read（空=Default）" type="number" min="0" step="0.001" prefix="$" />
+            <v-text-field v-model="pricingRuleDialog.flex_cache_creation_usd_per_million" label="Flex Cache creation（空=Default）" type="number" min="0" step="0.001" prefix="$" />
+            <div class="dialog-wide">
+              <h3>上下文区间价格</h3>
+              <p>总 Input 超过阈值时，整次请求按最高匹配区间单价计费。单位 USD / 1M tokens。</p>
+              <div v-for="(band, index) in pricingRuleDialog.context_tiers" :key="index" class="form-grid mt-3">
+                <v-select v-model="band.service_tier" :items="['default', 'priority', 'flex']" label="Service tier" />
+                <v-text-field v-model="band.threshold_tokens" label="Input 阈值（超过时生效）" type="number" min="1" />
+                <v-text-field v-for="field in ['input', 'output', 'cache_read', 'cache_creation']" :key="field" v-model="band[field + '_usd_per_million']" :label="field" type="number" min="0" step="0.001" prefix="$" />
+                <v-btn variant="text" color="error" @click="pricingRuleDialog.context_tiers.splice(index, 1)">删除区间</v-btn>
+              </div>
+              <v-btn class="mt-3" variant="outlined" @click="pricingRuleDialog.context_tiers.push({ service_tier: 'default', threshold_tokens: '', input_usd_per_million: pricingRuleDialog.input_usd_per_million, output_usd_per_million: pricingRuleDialog.output_usd_per_million, cache_read_usd_per_million: pricingRuleDialog.cache_read_usd_per_million, cache_creation_usd_per_million: pricingRuleDialog.cache_creation_usd_per_million })">添加区间</v-btn>
+            </div>
             <v-text-field v-model="pricingRuleDialog.version_name" label="价格版本名称（选填）" />
             <v-textarea v-model="pricingRuleDialog.reason" label="变更原因" rows="2" class="dialog-wide" />
           </div>
