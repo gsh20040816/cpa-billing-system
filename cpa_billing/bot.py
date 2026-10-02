@@ -509,6 +509,10 @@ class BillingBot:
             return
         try:
             reply = await self.dispatch(message)
+            sender_id = int((message.get("from") or {}).get("id") or 0)
+            command = str(message.get("text") or "").split(maxsplit=1)[0] if message.get("text") else ""
+            if sender_id in self.settings.admin_user_ids and command.split("@", 1)[0] == "/start":
+                await self.configure_commands()
         except BillingError as exc:
             LOG.warning("command rejected: %s", exc)
             reply = f"执行失败：<code>{esc(exc)}</code>"
@@ -560,10 +564,19 @@ class BillingBot:
         await self.tg.call("setMyCommands", {"commands": common, "scope": {"type": "default"}})
         await self.tg.call("setMyCommands", {"commands": private, "scope": {"type": "all_private_chats"}})
         for user_id in sorted(self.settings.admin_user_ids):
-            await self.tg.call("setMyCommands", {
-                "commands": admin,
-                "scope": {"type": "chat", "chat_id": user_id},
-            })
+            try:
+                await self.tg.call("setMyCommands", {
+                    "commands": admin,
+                    "scope": {"type": "chat", "chat_id": user_id},
+                })
+            except httpx.HTTPStatusError as exc:
+                try:
+                    description = exc.response.json().get("description", "")
+                except ValueError:
+                    description = ""
+                if exc.response.status_code != 400 or description != "Bad Request: chat not found":
+                    raise
+                LOG.warning("admin command menu deferred until first /start user=%s", user_id)
 
     async def run(self) -> None:
         me = await self.tg.me()

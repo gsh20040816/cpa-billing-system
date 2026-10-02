@@ -1734,9 +1734,11 @@ def cpamp_tier_prices(settings):
                  "tiers": [{"input": 6, "output": 21, "cache_read": .6, "cache_write": 1.5,
                             "tier": {"type": "context", "size": 12345}}]},
         "experimental": {"modes": {
-            "fast": {"cost": {"input": 9, "output": 14, "cache_read": .9, "cache_write": 2.25},
+            "fast": {"cost": {"input": 9, "output": 14, "cache_read": .9, "cache_write": 2.25,
+                               "tiers": [{"tier": {"type": "context", "size": 12345}, "input": 18, "output": 42, "cache_read": 1.8, "cache_write": 4.5}]},
                      "provider": {"body": {"service_tier": "priority"}}},
-            "flex": {"cost": {"input": 0, "output": 3.5},
+            "flex": {"cost": {"input": 0, "output": 3.5,
+                               "tiers": [{"tier": {"type": "context", "size": 12345}, "input": 0, "output": 10.5, "cache_read": .6, "cache_write": 1.5}]},
                      "provider": {"body": {"service_tier": "flex"}}},
         }},
     }
@@ -1753,7 +1755,7 @@ def cpamp_tier_prices(settings):
     ("fast", [9000, 900, 2250, 14000], [18000, 1800, 4500, 42000]),
     ("flex", [0, 300, 750, 3500], [0, 600, 1500, 10500]),
 ])
-def test_cpamp_tiers_and_context_stack_without_model_hardcoding(
+def test_cpamp_explicit_service_context_prices_without_multipliers(
     service, settings, cpamp_tier_prices, tier, short_rates, long_rates,
 ):
     service.import_cpamp_prices("upstream-tiers")
@@ -1773,13 +1775,13 @@ def test_cpamp_tiers_and_context_stack_without_model_hardcoding(
             )
 
 
-@pytest.mark.parametrize("invalid", ["threshold", "cache_multiplier", "multiple", "negative", "missing_threshold"])
+@pytest.mark.parametrize("invalid", ["threshold", "negative_cache", "multiple", "negative", "missing_threshold"])
 def test_invalid_cpamp_tiers_do_not_replace_active_prices(service, settings, cpamp_tier_prices, invalid):
     raw = cpamp_tier_prices
     if invalid == "threshold":
         raw["cost"]["tiers"][0]["tier"]["size"] = -1
-    elif invalid == "cache_multiplier":
-        raw["cost"]["tiers"][0]["cache_read"] = .9
+    elif invalid == "negative_cache":
+        raw["cost"]["tiers"][0]["cache_read"] = -.9
     elif invalid == "multiple":
         raw["cost"]["tiers"] *= 2
     elif invalid == "negative":

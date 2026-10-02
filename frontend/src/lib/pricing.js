@@ -8,7 +8,6 @@ const priceFieldNames = {
 function selectedRate(item, field, tier) {
   if (tier === 'default') return item.default[field]
   if (tier === 'priority') return item.priority[field] || item.default[field]
-  if (field === 'cache_read' || field === 'cache_creation') return item.default[field]
   return item.flex[field] || item.default[field]
 }
 
@@ -23,4 +22,11 @@ export function priceSourceText(item) {
   if (!missing.length) return '上游完整价格'
 
   return `${missing.map((field) => priceFieldNames[field]).join('、')} 上游未配置，保留 CPAMP 价格表数值`
+}
+
+export function contextPrices(item, tier = 'default') {
+  const bands = item.context_tiers || []
+  const own = bands.filter((band) => band.service_tier === tier)
+  if (tier === 'default' || own.length || Object.values(item[tier] || {}).some((value) => value != null)) return own
+  return bands.filter((band) => band.service_tier === 'default')
 }

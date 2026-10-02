@@ -25,6 +25,7 @@ from sqlalchemy import Integer, and_, case, cast, delete, func, insert, literal,
 from sqlalchemy.exc import IntegrityError
 
 from .config import Settings
+from .context_prices import cpamp_rules, context_prices_for_rule, normalize_context_prices, select_context_price
 from .database import Database, now_ms
 from .domain import (
     NANO_USD,
@@ -480,10 +481,6 @@ def _nano_per_token(value: Any) -> int:
     return int((price * Decimal(1000)).to_integral_value(rounding=ROUND_HALF_UP))
 
 
-def _ppm(value: Decimal) -> int:
-    return int((value * Decimal(1_000_000)).to_integral_value(rounding=ROUND_HALF_UP))
-
-
 def _model_slug(value: str) -> str:
     return value.strip().lower().rsplit("/", 1)[-1]
 
@@ -493,70 +490,7 @@ def _model_family(value: str, family: str) -> bool:
     return slug == family or slug.startswith(family + "-")
 
 
-def _scaled_rate(rate: int, multiplier_ppm: int) -> int:
-    return (rate * multiplier_ppm + 500_000) // 1_000_000
-
-
-def _cpamp_tier_rules(row: sqlite3.Row) -> dict[str, Any]:
-    rules: dict[str, Any] = {
-        "long_threshold_tokens": None,
-        "long_input_multiplier_ppm": 1_000_000,
-        "long_output_multiplier_ppm": 1_000_000,
-    }
-    if row["source"] != "models.dev":
-        return rules
-    raw = json.loads(row["raw_json"])
-    fields = {"input": "prompt_per_1m", "output": "completion_per_1m",
-              "cache_read": "cache_read_per_1m", "cache_write": "cache_creation_per_1m"}
-    modes = raw.get("experimental", {}).get("modes", {})
-    seen = set()
-    for mode in modes.values():
-        tier = mode.get("provider", {}).get("body", {}).get("service_tier")
-        if tier not in {"priority", "flex"} or "cost" not in mode:
-            continue
-        if tier in seen:
-            raise ValueError(f"multiple prices for service tier {tier}")
-        seen.add(tier)
-        for field in fields:
-            if field not in mode["cost"]:
-                continue
-            if tier == "flex" and field in {"cache_read", "cache_write"}:
-                if _nano_per_token(mode["cost"][field]) != _nano_per_token(row[fields[field]]):
-                    raise ValueError("distinct Flex cache prices are not supported")
-                continue
-            target = "cache_creation" if field == "cache_write" else field
-            rules[f"{tier}_{target}_nano_per_token"] = _nano_per_token(mode["cost"][field])
-    cost = raw.get("cost", {})
-    tiers = cost.get("tiers", [])
-    if not tiers:
-        if "context_over_200k" in cost:
-            raise ValueError("long-context prices have no explicit context threshold")
-        return rules
-    if len(tiers) != 1 or tiers[0]["tier"]["type"] != "context":
-        raise ValueError("expected one context pricing tier")
-    context = tiers[0]
-    threshold = context["tier"]["size"]
-    if type(threshold) is not int or threshold <= 0:
-        raise ValueError("context threshold must be a positive integer")
-    rules["long_threshold_tokens"] = threshold
-    for field in ("input", "output"):
-        base = _nano_per_token(row[fields[field]])
-        price = _nano_per_token(context[field])
-        if base == 0:
-            raise ValueError(f"cannot derive context multiplier from zero {field} price")
-        multiplier = _ppm(Decimal(price) / Decimal(base))
-        if _scaled_rate(base, multiplier) != price:
-            raise ValueError(f"context {field} multiplier loses price precision")
-        rules[f"long_{field}_multiplier_ppm"] = multiplier
-    # The stored rule shares the input multiplier with both cache categories.
-    # Reject an upstream tier that cannot be represented exactly by this schema.
-    for field in ("cache_read", "cache_write"):
-        base = _nano_per_token(row[fields[field]])
-        expected = _scaled_rate(base, rules["long_input_multiplier_ppm"])
-        actual = _nano_per_token(context[field]) if field in context else base
-        if actual != expected:
-            raise ValueError(f"context {field} price does not share the input multiplier")
-    return rules
+_cpamp_tier_rules = cpamp_rules
 
 
 def _metered_amount_cents(actual_nano_usd: int, multiplier_ppm: int) -> int:
@@ -1024,6 +958,9 @@ class BillingService:
             rule.priority_cache_creation_nano_per_token,
             rule.flex_input_nano_per_token,
             rule.flex_output_nano_per_token,
+            rule.flex_cache_read_nano_per_token,
+            rule.flex_cache_creation_nano_per_token,
+            json.dumps(context_prices_for_rule(rule), sort_keys=True),
             rule.long_threshold_tokens,
             int(rule.long_input_multiplier_ppm if rule.long_input_multiplier_ppm is not None else 1_000_000),
             int(rule.long_output_multiplier_ppm if rule.long_output_multiplier_ppm is not None else 1_000_000),
@@ -1265,6 +1202,7 @@ class BillingService:
             "priority_input_nano_per_token", "priority_output_nano_per_token",
             "priority_cache_read_nano_per_token", "priority_cache_creation_nano_per_token",
             "flex_input_nano_per_token", "flex_output_nano_per_token",
+            "flex_cache_read_nano_per_token", "flex_cache_creation_nano_per_token",
         )
         for field in optional_values:
             value = values.get(field)
@@ -1277,6 +1215,13 @@ class BillingService:
             value = values.get(field)
             if not isinstance(value, int) or value < 0:
                 raise BillingError(f"{field} 必须是非负整数")
+
+        if "context_tiers_json" in values:
+            try:
+                prices = normalize_context_prices(json.loads(values["context_tiers_json"]))
+            except (ValueError, TypeError, KeyError) as exc:
+                raise BillingError(f"上下文价格无效：{exc}") from exc
+            values = {**values, "context_tiers_json": json.dumps(prices, separators=(",", ":"))}
 
         requested_name = (version_name or "").strip()
         if requested_name and not re.fullmatch(r"[A-Za-z0-9._-]{1,80}", requested_name):
@@ -1331,7 +1276,8 @@ class BillingService:
                 "priority_input_nano_per_token", "priority_output_nano_per_token",
                 "priority_cache_read_nano_per_token", "priority_cache_creation_nano_per_token",
                 "flex_input_nano_per_token", "flex_output_nano_per_token",
-                "long_threshold_tokens", "long_input_multiplier_ppm", "long_output_multiplier_ppm", "raw_json",
+                "flex_cache_read_nano_per_token", "flex_cache_creation_nano_per_token",
+                "long_threshold_tokens", "long_input_multiplier_ppm", "long_output_multiplier_ppm", "context_tiers_json", "raw_json",
             )
             for source_rule in source_rules:
                 copied = {field: getattr(source_rule, field) for field in rule_fields}
@@ -1363,6 +1309,9 @@ class BillingService:
                     priority_cache_creation_nano_per_token=values.get("priority_cache_creation_nano_per_token"),
                     flex_input_nano_per_token=values.get("flex_input_nano_per_token"),
                     flex_output_nano_per_token=values.get("flex_output_nano_per_token"),
+                    flex_cache_read_nano_per_token=values.get("flex_cache_read_nano_per_token"),
+                    flex_cache_creation_nano_per_token=values.get("flex_cache_creation_nano_per_token"),
+                    context_tiers_json=values.get("context_tiers_json"),
                     long_threshold_tokens=values.get("long_threshold_tokens"),
                     long_input_multiplier_ppm=values["long_input_multiplier_ppm"],
                     long_output_multiplier_ppm=values["long_output_multiplier_ppm"],
@@ -1467,7 +1416,8 @@ class BillingService:
                 "priority_input_nano_per_token", "priority_output_nano_per_token",
                 "priority_cache_read_nano_per_token", "priority_cache_creation_nano_per_token",
                 "flex_input_nano_per_token", "flex_output_nano_per_token",
-                "long_threshold_tokens", "long_input_multiplier_ppm", "long_output_multiplier_ppm", "raw_json",
+                "flex_cache_read_nano_per_token", "flex_cache_creation_nano_per_token",
+                "long_threshold_tokens", "long_input_multiplier_ppm", "long_output_multiplier_ppm", "context_tiers_json", "raw_json",
             )
             for source_rule in source_rules:
                 session.add(ModelPriceRule(
@@ -1618,18 +1568,16 @@ class BillingService:
             input_rate = rule.flex_input_nano_per_token if rule.flex_input_nano_per_token is not None else input_rate
             output_rate = rule.flex_output_nano_per_token if rule.flex_output_nano_per_token is not None else output_rate
 
-        long_threshold = rule.long_threshold_tokens
-        long_context = bool(
-            long_threshold is not None
-            and event.input_tokens > long_threshold
-        )
-        if long_context:
-            input_multiplier = rule.long_input_multiplier_ppm if rule.long_input_multiplier_ppm is not None else 1_000_000
-            output_multiplier = rule.long_output_multiplier_ppm if rule.long_output_multiplier_ppm is not None else 1_000_000
-            input_rate = _scaled_rate(input_rate, input_multiplier)
-            cache_read_rate = _scaled_rate(cache_read_rate, input_multiplier)
-            cache_creation_rate = _scaled_rate(cache_creation_rate, input_multiplier)
-            output_rate = _scaled_rate(output_rate, output_multiplier)
+            cache_read_rate = rule.flex_cache_read_nano_per_token if rule.flex_cache_read_nano_per_token is not None else cache_read_rate
+            cache_creation_rate = rule.flex_cache_creation_nano_per_token if rule.flex_cache_creation_nano_per_token is not None else cache_creation_rate
+
+        context_price = select_context_price(rule, max(int(event.input_tokens or 0), 0), tier)
+        long_context = context_price is not None
+        if context_price is not None:
+            input_rate = context_price["input"]
+            output_rate = context_price["output"]
+            cache_read_rate = context_price["cache_read"]
+            cache_creation_rate = context_price["cache_creation"]
 
         compatible_cached = self._compatible_cached_tokens(event)
         cache_read = max(int(event.cache_read_tokens or 0), 0)
@@ -1654,6 +1602,7 @@ class BillingService:
             "cache_creation": cache_creation,
             "output": output_tokens,
             "rates": [input_rate, cache_read_rate, cache_creation_rate, output_rate],
+            "context_threshold_tokens": context_price["threshold_tokens"] if context_price else None,
         }
         return cost, long_context, detail
 
@@ -3811,6 +3760,8 @@ class BillingService:
             "flex": {
                 "input": cls._price_rate(rule.flex_input_nano_per_token),
                 "output": cls._price_rate(rule.flex_output_nano_per_token),
+                "cache_read": cls._price_rate(rule.flex_cache_read_nano_per_token),
+                "cache_creation": cls._price_rate(rule.flex_cache_creation_nano_per_token),
             },
             "configured": {
                 "input": bool(rule.input_configured),
@@ -3818,6 +3769,11 @@ class BillingService:
                 "cache_read": bool(rule.cache_read_configured),
                 "cache_creation": bool(rule.cache_creation_configured),
             },
+            "context_tiers": [
+                {"service_tier": price["service_tier"], "threshold_tokens": price["threshold_tokens"],
+                 **{field: cls._price_rate(price[field]) for field in ("input", "output", "cache_read", "cache_creation")}}
+                for price in context_prices_for_rule(rule)
+            ],
             "long_context": {
                 "threshold_tokens": rule.long_threshold_tokens,
                 "input_multiplier_ppm": rule.long_input_multiplier_ppm,
