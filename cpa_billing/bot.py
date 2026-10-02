@@ -27,6 +27,10 @@ from .services import BillingError, BillingService, DEFAULT_TIERS
 
 LOG = logging.getLogger("cpa_billing.bot")
 MEMBER = {"creator", "administrator", "member"}
+API_BASE_URL_HINT = (
+    "Base URL（Claude Desktop / Claude Code）：<code>https://cccpa.shgao.top</code>\n"
+    "Base URL（OpenAI 兼容客户端）：<code>https://cccpa.shgao.top/v1</code>"
+)
 COMMAND_MESSAGE_LIMIT = 3900
 MEMBERSHIP_CACHE_TTL_MS = 5 * 60_000
 UPDATE_QUEUE_SIZE = 32
@@ -251,18 +255,18 @@ class BillingBot:
             if not await self.eligible(user):
                 return "你不在合法用户组内，不能自助注册。"
             key = await asyncio.to_thread(self.service.register_key, user)
-            return f"注册完成，已新增并绑定到你的 Telegram 用户：\n\n<code>{esc(key)}</code>\n\n请立即保存。系统不会再次显示完整 Key。\nBase URL：<code>https://cpa.shgao.top/v1</code>"
+            return f"注册完成，已新增并绑定到你的 Telegram 用户：\n\n<code>{esc(key)}</code>\n\n请立即保存。系统不会再次显示完整 Key。\n{API_BASE_URL_HINT}"
         if command == "/mykey":
             keys = await asyncio.to_thread(self.service.active_keys, int(user["id"]))
             if not keys:
                 return "你还没有注册。发送 /register 注册。"
-            return "你当前绑定的 API Key：\n" + "\n".join(f"KEY_ID=<code>{key.id}</code> <code>{esc(key.masked_value)}</code>" for key in keys)
+            return "你当前绑定的 API Key：\n" + "\n".join(f"KEY_ID=<code>{key.id}</code> <code>{esc(key.masked_value)}</code>" for key in keys) + "\n\n" + API_BASE_URL_HINT
         if command == "/confirm":
             if not args.strip():
                 return "用法：<code>/confirm TOKEN</code>"
             raw = await asyncio.to_thread(self.service.confirm_key_action, int(user["id"]), args.strip())
             if raw:
-                return f"操作已确认。新 API Key：\n\n<code>{esc(raw)}</code>\n\n请立即保存，系统不会再次显示完整 Key。"
+                return f"操作已确认。新 API Key：\n\n<code>{esc(raw)}</code>\n\n请立即保存，系统不会再次显示完整 Key。\n{API_BASE_URL_HINT}"
             return "操作已确认并完成。"
         if command in {"/resetkey", "/revoke"}:
             keys = await asyncio.to_thread(self.service.active_keys, int(user["id"]))
@@ -276,7 +280,7 @@ class BillingBot:
                 return "找不到指定 KEY_ID。"
             raw = await asyncio.to_thread(self.service.telegram_key_action, int(user["id"]), "reset" if command == "/resetkey" else "revoke", target.id)
             if raw:
-                return f"已重置指定 API Key：\n\n<code>{esc(raw)}</code>\n\n请立即保存，系统不会再次显示完整 Key。"
+                return f"已重置指定 API Key：\n\n<code>{esc(raw)}</code>\n\n请立即保存，系统不会再次显示完整 Key。\n{API_BASE_URL_HINT}"
             return "已吊销指定 API Key。"
         if command in {"/createuser", "/bindemail"}:
             return "CPA 版不再按邮箱创建/绑定用户。请使用 /register 自助注册并绑定 Telegram 用户。"
@@ -414,7 +418,7 @@ class BillingBot:
     def help(self, is_admin: bool) -> str:
         lines = ["CPA 自助 API Key Bot", "", "用户命令：", "/register - 首次注册或新增 API Key", "/mykey - 查看已绑定的掩码 Key",
                  "/resetkey /revoke - 重置或吊销指定 Key", "/confirm - 确认待处理操作", "/cancel - 取消当前操作",
-                 "/usage /models /ranking /chart /billing /sub2billing /accounts", "/id /help", "", f"Web：<code>{esc(self.settings.public_base_url)}</code>"]
+                 "/usage /models /ranking /chart /billing /sub2billing /accounts", "/id /help", "", API_BASE_URL_HINT, f"Web：<code>{esc(self.settings.public_base_url)}</code>"]
         if is_admin:
             lines += ["", "管理员命令：", "/billconfig /billcycle /billcycles", "/stats /users /allowuser /revokeuser /checkuser", "/namekey /allowchat /delchat /listchats"]
         return "\n".join(lines)
