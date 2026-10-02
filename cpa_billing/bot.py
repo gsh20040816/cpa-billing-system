@@ -6,6 +6,7 @@ import json
 import logging
 import re
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
@@ -28,6 +29,7 @@ LOG = logging.getLogger("cpa_billing.bot")
 MEMBER = {"creator", "administrator", "member"}
 COMMAND_MESSAGE_LIMIT = 3900
 MEMBERSHIP_CACHE_TTL_MS = 5 * 60_000
+UPDATE_QUEUE_SIZE = 32
 HTML_TAG = re.compile(r"<(/?)([A-Za-z][A-Za-z0-9-]*)(?:\s[^>]*)?>")
 
 
@@ -324,11 +326,11 @@ class BillingBot:
         if not self.is_admin(user):
             return "没有权限。"
         if command == "/users":
-            rows = await asyncio.to_thread(self.service.list_users)
-            return "最近注册用户：\n" + "\n".join(f"<code>{r['id']}</code> {esc(r['username'])} API Key=<code>{r['keys']}</code>" for r in rows[:30])
+            rows = await asyncio.to_thread(self.service.list_users, 30)
+            return "最近注册用户：\n" + "\n".join(f"<code>{r['id']}</code> {esc(r['username'])} API Key=<code>{r['keys']}</code>" for r in rows)
         if command == "/stats":
-            rows = await asyncio.to_thread(self.service.list_users)
-            return f"当前状态：\n用户：<code>{len(rows)}</code>\n有效注册：<code>{sum(1 for r in rows if r['registered'])}</code>"
+            stats = await asyncio.to_thread(self.service.user_stats)
+            return f"当前状态：\n用户：<code>{stats['users']}</code>\n有效注册：<code>{stats['registered']}</code>"
         if command == "/allowuser":
             target = parse_user_id(args)
             if target is None:
@@ -578,37 +580,55 @@ class BillingBot:
                     raise
                 LOG.warning("admin command menu deferred until first /start user=%s", user_id)
 
+    async def _consume_updates(self, queue: asyncio.Queue[dict[str, Any]]) -> None:
+        while True:
+            update = await queue.get()
+            try:
+                await self.handle(update)
+            except Exception:
+                LOG.exception("update handling failed")
+            finally:
+                queue.task_done()
+
     async def run(self) -> None:
-        me = await self.tg.me()
-        self.bot_username = str(me.get("username") or "").strip()
-        if not self.bot_username:
-            raise BillingError("Telegram getMe 未返回 bot username")
-        await self.configure_commands()
-        offset = None
-        tasks: set[asyncio.Task[None]] = set()
+        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=UPDATE_QUEUE_SIZE)
+        worker: asyncio.Task[None] | None = None
         try:
+            me = await self.tg.me()
+            self.bot_username = str(me.get("username") or "").strip()
+            if not self.bot_username:
+                raise BillingError("Telegram getMe 未返回 bot username")
+            await self.configure_commands()
+            worker = asyncio.create_task(self._consume_updates(queue))
+            offset = None
             while True:
                 try:
-                    updates = await self.tg.call("getUpdates", {"offset": offset, "timeout": 30, "allowed_updates": ["message", "chat_member"]}) or []
+                    updates = await self.tg.call("getUpdates", {
+                        "offset": offset, "timeout": 30, "limit": UPDATE_QUEUE_SIZE,
+                        "allowed_updates": ["message", "chat_member"],
+                    }) or []
                     for update in updates:
+                        # Backpressure stops polling when the queue is full.
+                        # Advance the offset only after the update is accepted.
+                        await queue.put(update)
                         offset = int(update["update_id"]) + 1
-                        task = asyncio.create_task(self.handle(update))
-                        tasks.add(task)
-                        task.add_done_callback(tasks.discard)
                 except Exception:
                     LOG.exception("polling failed")
                     await asyncio.sleep(3)
         finally:
-            for task in tasks:
-                task.cancel()
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
+            if worker is not None:
+                worker.cancel()
+                await asyncio.gather(worker, return_exceptions=True)
             await self.tg.client.aclose()
 
 
 async def run_bot() -> None:
     settings = Settings.from_env()
-    db = Database(settings.database_path)
+    asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=1, thread_name_prefix="billing-bot"))
+    db = Database(settings.database_path, pool_size=1, max_overflow=0)
     service = BillingService(settings, db)
-    service.bootstrap()
-    await BillingBot(settings, service).run()
+    try:
+        service.bootstrap()
+        await BillingBot(settings, service).run()
+    finally:
+        db.engine.dispose()
