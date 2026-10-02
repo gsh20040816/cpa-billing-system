@@ -126,3 +126,23 @@ def test_select_active_sub2_cycle_returns_selected_dates() -> None:
     assert cycle is cycles["newer"]
     assert start.isoformat() == "2026-07-10T00:00:00+08:00"
     assert end.isoformat() == "2026-07-20T00:00:00+08:00"
+
+
+def test_unknown_admin_chat_does_not_prevent_bot_startup(settings, service, monkeypatch):
+    import httpx
+    import pytest
+
+    async def scenario(description):
+        bot = BillingBot(settings, service)
+        async def fake_call(method, payload=None):
+            if payload["scope"]["type"] == "chat":
+                response = httpx.Response(400, json={"description": description}, request=httpx.Request("POST", "https://example.invalid"))
+                response.raise_for_status()
+        monkeypatch.setattr(bot.tg, "call", fake_call)
+        try:
+            await bot.configure_commands()
+        finally:
+            await bot.tg.client.aclose()
+    asyncio.run(scenario("Bad Request: chat not found"))
+    with pytest.raises(httpx.HTTPStatusError):
+        asyncio.run(scenario("Bad Request: unrelated configuration error"))
