@@ -21,7 +21,7 @@ from typing import Any, Iterator
 from zoneinfo import ZoneInfo
 
 import httpx
-from sqlalchemy import Integer, and_, case, cast, delete, func, insert, literal, not_, or_, select, union, update
+from sqlalchemy import Integer, String, and_, case, cast, delete, func, insert, literal, not_, or_, select, union, update
 from sqlalchemy.exc import IntegrityError
 
 from .config import Settings
@@ -6058,8 +6058,11 @@ class BillingService:
                 item.pop("cost_nano")
             return result
 
-    def hourly_usage(self, hours: int = 24) -> tuple[list[str], list[dict[str, Any]]]:
+    def hourly_usage(self, hours: int = 24, limit: int = 12) -> tuple[list[str], list[dict[str, Any]]]:
+        if not 1 <= hours <= 168 or not 1 <= limit <= 100:
+            raise ValueError("chart hours must be 1..168 and series limit must be 1..100")
         start = now_ms() - hours * 3_600_000
+        labels = [datetime.fromtimestamp((start + index * 3_600_000) / 1000, ZoneInfo(self.settings.timezone)).strftime("%m-%d %H") for index in range(hours + 1)]
         with self.db.session() as session:
             ownership_source = (
                 RawUsageEvent.__table__
@@ -6072,40 +6075,54 @@ class BillingService:
                         KeyOwnershipPeriod.valid_to_ms > RawUsageEvent.occurred_at_ms,
                     ),
                 ))
+                .outerjoin(TelegramUser.__table__, TelegramUser.telegram_user_id == KeyOwnershipPeriod.telegram_user_id)
             )
-            rows = session.execute(
-                select(
-                    KeyOwnershipPeriod.telegram_user_id,
-                    APIKey.id,
-                    APIKey.masked_value,
-                    APIKey.display_name,
-                    RawUsageEvent.api_key_hash,
-                    RawUsageEvent.occurred_at_ms,
-                    RawUsageEvent.total_tokens,
-                )
+            # Aggregate request rows in SQLite. Only the selected series and
+            # hourly totals cross into Python, including historical ownership.
+            kind = case((KeyOwnershipPeriod.telegram_user_id.is_not(None), "user"),
+                        (APIKey.id.is_not(None), "key"), else_="hash")
+            identity = case(
+                (KeyOwnershipPeriod.telegram_user_id.is_not(None), cast(KeyOwnershipPeriod.telegram_user_id, String)),
+                (APIKey.id.is_not(None), cast(APIKey.id, String)),
+                else_=func.coalesce(func.nullif(RawUsageEvent.api_key_hash, ""), "unknown"),
+            )
+            name = case(
+                (KeyOwnershipPeriod.telegram_user_id.is_not(None), case(
+                    (func.nullif(TelegramUser.username, "").is_not(None), literal("@") + TelegramUser.username),
+                    else_=cast(KeyOwnershipPeriod.telegram_user_id, String),
+                )),
+                else_=func.coalesce(func.nullif(APIKey.display_name, ""), func.nullif(APIKey.masked_value, "")),
+            )
+            bucket = func.min(hours, cast((RawUsageEvent.occurred_at_ms - start) / literal(3_600_000), Integer))
+            hourly = (
+                select(kind.label("kind"), identity.label("identity"), name.label("name"),
+                       bucket.label("bucket"), func.sum(RawUsageEvent.total_tokens).label("tokens"))
                 .select_from(ownership_source)
                 .where(RawUsageEvent.occurred_at_ms >= start)
-            ).all()
-            users = {u.telegram_user_id: u for u in session.scalars(select(TelegramUser))}
-        labels = [datetime.fromtimestamp((start + index * 3_600_000) / 1000, ZoneInfo(self.settings.timezone)).strftime("%m-%d %H") for index in range(hours + 1)]
-        grouped: dict[tuple[str, int | str], dict[str, int]] = defaultdict(lambda: defaultdict(int))
-        names: dict[tuple[str, int | str], str] = {}
-        for user_id, key_id, masked, display_name, key_hash, occurred_at, tokens in rows:
-            index = min(hours, max(0, int((int(occurred_at) - start) // 3_600_000)))
-            if user_id is not None:
-                group_key = ("user", int(user_id))
-                user = users.get(user_id)
-                names[group_key] = f"@{user.username}" if user and user.username else str(user_id)
-            else:
-                stable_key = int(key_id) if key_id is not None else str(key_hash or "unknown")
-                group_key = ("key", stable_key)
-                names[group_key] = display_name or masked or (mask_hash(str(key_hash)) if key_hash else "未知 API Key")
-            grouped[group_key][labels[index]] += int(tokens or 0)
-        series = []
-        for group_key, values in grouped.items():
-            series.append({"name": names[group_key], "values": dict(values), "total": sum(values.values())})
-        series.sort(key=lambda item: item["total"], reverse=True)
-        return labels, series
+                .group_by(kind, identity, name, bucket)
+                .cte("hourly")
+            )
+            top = (
+                select(hourly.c.kind, hourly.c.identity, func.sum(hourly.c.tokens).label("total"))
+                .group_by(hourly.c.kind, hourly.c.identity)
+                .order_by(func.sum(hourly.c.tokens).desc(), hourly.c.kind, hourly.c.identity)
+                .limit(limit).cte("top_series")
+            )
+            query = (
+                select(hourly.c.kind, hourly.c.identity, hourly.c.name, hourly.c.bucket, hourly.c.tokens, top.c.total)
+                .join(top, and_(top.c.kind == hourly.c.kind, top.c.identity == hourly.c.identity))
+                .order_by(top.c.total.desc(), hourly.c.kind, hourly.c.identity, hourly.c.bucket)
+            )
+            series: dict[tuple[str, str], dict[str, Any]] = {}
+            for kind_value, identity_value, display_name, index, tokens, total in session.execute(query):
+                group_key = (kind_value, identity_value)
+                item = series.setdefault(group_key, {
+                    "name": display_name or (mask_hash(identity_value) if identity_value != "unknown" else "未知 API Key"),
+                    "values": {}, "total": int(total),
+                })
+                label = labels[int(index)]
+                item["values"][label] = item["values"].get(label, 0) + int(tokens or 0)
+        return labels, list(series.values())
 
     def model_usage(self, limit: int = 20) -> list[dict[str, Any]]:
         with self.db.session() as session:
@@ -6233,12 +6250,28 @@ class BillingService:
         self.set_manual_allowed(user_id, False)
         return len(keys)
 
-    def list_users(self) -> list[dict[str, Any]]:
+    def list_users(self, limit: int | None = None) -> list[dict[str, Any]]:
         with self.db.session() as session:
-            users = session.scalars(select(TelegramUser).order_by(TelegramUser.last_seen_at_ms.desc())).all()
-            return [{"id": user.telegram_user_id, "username": user.username or "-", "registered": bool(user.registered_at_ms),
-                     "keys": session.scalar(select(func.count()).select_from(APIKey).where(APIKey.current_owner_id == user.telegram_user_id, APIKey.status == "active")) or 0}
-                    for user in users]
+            key_counts = (select(APIKey.current_owner_id.label("user_id"), func.count().label("keys"))
+                          .where(APIKey.status == "active").group_by(APIKey.current_owner_id).subquery())
+            query = (select(TelegramUser.telegram_user_id, TelegramUser.username, TelegramUser.registered_at_ms,
+                            func.coalesce(key_counts.c["keys"], 0))
+                     .outerjoin(key_counts, key_counts.c.user_id == TelegramUser.telegram_user_id)
+                     .order_by(TelegramUser.last_seen_at_ms.desc(), TelegramUser.telegram_user_id))
+            if limit is not None:
+                if limit < 1:
+                    raise ValueError("user limit must be positive")
+                query = query.limit(limit)
+            return [{"id": user_id, "username": username or "-", "registered": bool(registered), "keys": int(keys)}
+                    for user_id, username, registered, keys in session.execute(query)]
+
+    def user_stats(self) -> dict[str, int]:
+        with self.db.session() as session:
+            total, registered = session.execute(select(
+                func.count(TelegramUser.telegram_user_id),
+                func.count(func.nullif(TelegramUser.registered_at_ms, 0)),
+            )).one()
+            return {"users": int(total), "registered": int(registered)}
 
     def reconciliation(self, cycle_name: str | None = None, record: bool = False) -> dict[str, Any]:
         with self._cpamp() as cpamp:

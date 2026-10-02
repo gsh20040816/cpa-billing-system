@@ -26,6 +26,10 @@ services:
     pull_policy: always
     restart: unless-stopped
     command: ["bot"]
+    mem_limit: 512m
+    environment:
+      MALLOC_ARENA_MAX: "2"
+      MALLOC_TRIM_THRESHOLD_: "131072"
     env_file: [".env"]
     volumes:
       - ./data:/data

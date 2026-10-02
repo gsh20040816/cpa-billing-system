@@ -17,12 +17,13 @@ def now_ms() -> int:
 
 
 class Database:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, pool_size: int = 5, max_overflow: int = 10, pool_timeout: float = 30) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         self.path = path
         self.engine = create_engine(
             f"sqlite:///{path}",
             connect_args={"check_same_thread": False, "timeout": 15},
+            pool_size=pool_size, max_overflow=max_overflow, pool_timeout=pool_timeout,
         )
 
         @event.listens_for(self.engine, "connect")
@@ -32,6 +33,8 @@ class Database:
             cursor.execute("pragma foreign_keys=on")
             cursor.execute("pragma busy_timeout=15000")
             cursor.execute("pragma synchronous=normal")
+            # Large GROUP BY / ORDER BY intermediates can spill to disk.
+            cursor.execute("pragma temp_store=file")
             cursor.close()
 
         self.sessions = sessionmaker(self.engine, expire_on_commit=False)

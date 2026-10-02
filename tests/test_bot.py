@@ -146,3 +146,76 @@ def test_unknown_admin_chat_does_not_prevent_bot_startup(settings, service, monk
     asyncio.run(scenario("Bad Request: chat not found"))
     with pytest.raises(httpx.HTTPStatusError):
         asyncio.run(scenario("Bad Request: unrelated configuration error"))
+
+
+def test_update_queue_applies_backpressure_and_processes_serially(settings, service, monkeypatch):
+    import cpa_billing.bot as bot_module
+
+    async def scenario():
+        monkeypatch.setattr(bot_module, "UPDATE_QUEUE_SIZE", 2)
+        bot = BillingBot(settings, service)
+        started, release, drained = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        handled, polling, queues = [], [], []
+        active = peak = 0
+        real_queue = asyncio.Queue
+
+        class ObservedQueue(real_queue):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.peak = 0
+                queues.append(self)
+
+            async def put(self, item):
+                await super().put(item)
+                self.peak = max(self.peak, self.qsize())
+
+        monkeypatch.setattr(bot_module.asyncio, "Queue", ObservedQueue)
+
+        async def handle(update):
+            nonlocal active, peak
+            active += 1
+            peak = max(peak, active)
+            started.set()
+            try:
+                await release.wait()
+                handled.append(update["update_id"])
+                if len(handled) == 6:
+                    drained.set()
+            finally:
+                active -= 1
+
+        async def call(method, payload=None):
+            if method == "getMe":
+                return {"username": "cpa_bot"}
+            if method != "getUpdates":
+                return None
+            polling.append(payload.copy())
+            offset = payload["offset"] or 0
+            assert payload["limit"] == 2
+            if offset >= 6:
+                await asyncio.Event().wait()
+            return [{"update_id": offset + i} for i in range(2)]
+
+        monkeypatch.setattr(bot, "handle", handle)
+        monkeypatch.setattr(bot.tg, "call", call)
+        task = asyncio.create_task(bot.run())
+        try:
+            await asyncio.wait_for(started.wait(), 2)
+            for _ in range(10):
+                await asyncio.sleep(0)
+            assert peak == 1
+            assert queues[0].qsize() == 2
+            assert len(polling) == 2  # Polling stopped on a full queue.
+            release.set()
+            await asyncio.wait_for(drained.wait(), 2)
+            assert handled == list(range(6))
+            assert peak == 1
+            assert queues[0].peak <= 2
+            assert [payload["offset"] for payload in polling[:3]] == [None, 2, 4]
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        assert bot.tg.client.is_closed
+        assert active == 0
+
+    asyncio.run(scenario())
