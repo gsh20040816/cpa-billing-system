@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 import json
-from decimal import Decimal, ROUND_HALF_UP
 from typing import Any
+
+from .domain import decimal_units
 
 FIELDS = ("input", "output", "cache_read", "cache_creation")
 UPSTREAM_FIELDS = {"input": "input", "output": "output", "cache_read": "cache_read", "cache_creation": "cache_write"}
@@ -11,10 +12,8 @@ ROW_FIELDS = {"input": "prompt_per_1m", "output": "completion_per_1m", "cache_re
 
 
 def nano_rate(value: Any) -> int:
-    price = Decimal(str(value))
-    if not price.is_finite() or price < 0:
-        raise ValueError("price must be finite and non-negative")
-    return int((price * 1000).to_integral_value(rounding=ROUND_HALF_UP))
+    """USD per million tokens to nano-USD per token."""
+    return decimal_units(str(value), 3)
 
 
 def normalize_context_prices(prices: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -92,29 +91,29 @@ def context_prices_for_rule(rule: Any) -> list[dict[str, Any]]:
         return json.loads(rule.context_tiers_json or "[]")
     # Old snapshots are converted to explicit prices for historical compatibility.
     # Fresh CPAMP imports and the editor never create multiplier rules.
-    if rule.long_threshold_tokens is None:
-        return []
     result = []
     for tier in ("default", "priority", "flex"):
         rates = {}
         for field in FIELDS:
             rate = getattr(rule, f"{field}_nano_per_token")
             if tier != "default":
-                override = getattr(rule, f"{tier}_{field}_nano_per_token", None)
+                override = getattr(rule, f"{tier}_{field}_nano_per_token")
                 if override is not None:
                     rate = override
             multiplier = rule.long_output_multiplier_ppm if field == "output" else rule.long_input_multiplier_ppm
-            rates[field] = (rate * (multiplier if multiplier is not None else 1_000_000) + 500_000) // 1_000_000
+            rates[field] = (rate * multiplier + 500_000) // 1_000_000
         result.append({"service_tier": tier, "threshold_tokens": rule.long_threshold_tokens, **rates})
     return result
 
 
-def select_context_price(rule: Any, input_tokens: int, tier: str) -> dict[str, Any] | None:
+def select_context_price(rule: Any, input_tokens: int, tier: str,
+                         prices: list[dict[str, Any]] | None = None) -> dict[str, Any] | None:
     tier = "priority" if tier == "fast" else tier
     tier = tier if tier in {"priority", "flex"} else "default"
-    prices = context_prices_for_rule(rule)
+    if prices is None:
+        prices = context_prices_for_rule(rule)
     if tier != "default" and not any(price["service_tier"] == tier for price in prices) and not any(
-        getattr(rule, f"{tier}_{field}_nano_per_token", None) is not None for field in FIELDS
+        getattr(rule, f"{tier}_{field}_nano_per_token") is not None for field in FIELDS
     ):
         tier = "default"
     matches = [price for price in prices

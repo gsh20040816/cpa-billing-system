@@ -3,12 +3,38 @@ from __future__ import annotations
 import calendar
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Iterable, Iterator
 from zoneinfo import ZoneInfo
 
 
 NANO_USD = 1_000_000_000
+
+
+class DecimalInputError(ValueError):
+    MESSAGES = {"format": "invalid number", "range": "number is not finite or out of range", "precision": "too many decimal places"}
+
+    def __init__(self, kind: str) -> None:
+        super().__init__(self.MESSAGES[kind])
+        self.kind = kind
+
+
+def decimal_units(value: str, places: int, *, exact: bool = False,
+                  minimum: int | None = 0, maximum: int | None = None) -> int:
+    """Parse a decimal string as an integer count of 10**-places units, rounding half up unless exact."""
+    try:
+        amount = Decimal(value)
+    except InvalidOperation:
+        raise DecimalInputError("format") from None
+    # More than 28 integer digits after scaling would exceed the default decimal precision.
+    if (not amount.is_finite() or (minimum is not None and amount < minimum) or (maximum is not None and amount > maximum)
+            or (amount and amount.adjusted() + places >= 28)):
+        raise DecimalInputError("range")
+    scaled = amount.scaleb(places)
+    rounded = scaled.to_integral_value(rounding=ROUND_HALF_UP)
+    if exact and scaled != rounded:
+        raise DecimalInputError("precision")
+    return int(rounded)
 
 
 @dataclass(frozen=True)
@@ -160,7 +186,7 @@ def prorate_subscription_cost(
         periods = [(start_ms, end_ms)]
     elif mode == "recurring":
         unit = recurring_unit or "month"
-        interval = int(recurring_interval or 1)
+        interval = recurring_interval or 1
         if unit not in {"month", "day"} or interval < 1:
             raise ValueError("recurring subscription period is invalid")
         periods = [

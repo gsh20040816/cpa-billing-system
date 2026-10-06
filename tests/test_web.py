@@ -547,3 +547,37 @@ def test_admin_can_add_exact_manual_usage_with_independent_auth_and_csrf(setting
     )
     assert invalid_precision.status_code == 400
     assert "九位小数" in invalid_precision.json()["error"]
+
+
+def test_security_headers_and_decimal_inputs(settings) -> None:
+    from cpa_billing.services import BillingError
+    from cpa_billing.web import (
+        _manual_usage_to_nano, _money_to_cents, _multiplier_to_ppm, _rate_to_ppm, _usd_per_million_to_nano,
+    )
+
+    client = TestClient(create_app(settings), base_url="https://billing.example")
+    for path, cache in (("/healthz", "no-store"), ("/assets/missing.js", "public, max-age=31536000, immutable")):
+        response = client.get(path, follow_redirects=False)
+        assert response.headers["x-frame-options"] == "DENY"
+        assert response.headers["x-content-type-options"] == "nosniff"
+        assert response.headers["content-security-policy"].startswith("default-src 'self'")
+        assert response.headers["cache-control"] == cache
+
+    assert _money_to_cents("12.30") == 1230
+    assert _rate_to_ppm("7.123456") == 7_123_456
+    assert _manual_usage_to_nano("-0.000000001") == -1
+    assert _usd_per_million_to_nano("1.25", "x") == 1250
+    assert _usd_per_million_to_nano(" ", "x", True) is None
+    assert _multiplier_to_ppm("1.5", "x") == 1_500_000
+    for call, message in (
+        (lambda: _money_to_cents("1.234"), "两位小数"),
+        (lambda: _money_to_cents("-1"), "非负金额"),
+        (lambda: _money_to_cents("x"), "格式无效"),
+        (lambda: _rate_to_ppm("1000.5"), "0 到 1000"),
+        (lambda: _manual_usage_to_nano("NaN"), "有限数值"),
+        (lambda: _usd_per_million_to_nano("", "x"), "不能为空"),
+        (lambda: _usd_per_million_to_nano("1.0001", "x"), "三位小数"),
+        (lambda: _multiplier_to_ppm("-1", "x"), "非负有限数值"),
+    ):
+        with pytest.raises(BillingError, match=message):
+            call()

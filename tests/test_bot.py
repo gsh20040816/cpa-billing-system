@@ -219,3 +219,77 @@ def test_update_queue_applies_backpressure_and_processes_serially(settings, serv
         assert active == 0
 
     asyncio.run(scenario())
+
+
+def test_help_and_id_do_not_write_users_and_membership_checks_run_concurrently(settings, service, monkeypatch) -> None:
+    from dataclasses import replace
+
+    upserts, memberships = [], []
+    monkeypatch.setattr(service, "upsert_user", lambda user: upserts.append(user))
+    monkeypatch.setattr(service, "set_membership", lambda user, group_id, status, legal: memberships.append((group_id, legal)))
+    settings = replace(settings, allowed_group_ids=frozenset({-100, -200}))
+
+    async def scenario():
+        bot = BillingBot(settings, service)
+        in_flight = peak = 0
+
+        async def member(group_id, user_id):
+            nonlocal in_flight, peak
+            in_flight += 1
+            peak = max(peak, in_flight)
+            await asyncio.sleep(0.01)
+            in_flight -= 1
+            return {"status": "member" if group_id == -200 else "left"}
+
+        monkeypatch.setattr(bot.tg, "member", member)
+        try:
+            user = {"id": 5, "username": "member", "is_bot": False}
+            for text in ("/help", "/id", "/start"):
+                await bot.dispatch({"chat": {"id": 5, "type": "private"}, "from": user, "text": text})
+            assert upserts == []
+            assert await bot.eligible(user) is True
+            return peak
+        finally:
+            await bot.tg.client.aclose()
+
+    assert asyncio.run(scenario()) == 2
+    assert sorted(memberships) == [(-200, True), (-100, False)]
+
+
+def test_deferred_admin_menu_is_configured_on_admin_start(settings, service, monkeypatch) -> None:
+    import httpx
+
+    calls = []
+
+    async def scenario():
+        bot = BillingBot(settings, service)
+        chat_exists = False
+
+        async def fake_call(method, payload=None):
+            calls.append((method, payload["scope"]["type"]))
+            if payload["scope"]["type"] == "chat" and not chat_exists:
+                response = httpx.Response(400, json={"description": "Bad Request: chat not found"},
+                                          request=httpx.Request("POST", "https://example.invalid"))
+                response.raise_for_status()
+
+        async def send(chat_id, text):
+            return None
+
+        monkeypatch.setattr(bot.tg, "call", fake_call)
+        monkeypatch.setattr(bot.tg, "send", send)
+        message = {"message": {"chat": {"id": 1, "type": "private"}, "from": {"id": 1, "is_bot": False}, "text": "/start"}}
+        try:
+            await bot.configure_commands()
+            assert bot.deferred_admin_menus == {1}
+            chat_exists = True
+            calls.clear()
+            await bot.handle(message)
+            assert calls == [("setMyCommands", "chat")]
+            assert bot.deferred_admin_menus == set()
+            calls.clear()
+            await bot.handle(message)
+            assert calls == []
+        finally:
+            await bot.tg.client.aclose()
+
+    asyncio.run(scenario())

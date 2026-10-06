@@ -16,16 +16,16 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
-from pathlib import Path
 from typing import Any, Iterator
 from zoneinfo import ZoneInfo
 
 import httpx
 from sqlalchemy import Integer, String, and_, case, cast, delete, func, insert, literal, not_, or_, select, union, update
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
 
 from .config import Settings
-from .context_prices import cpamp_rules, context_prices_for_rule, normalize_context_prices, select_context_price
+from .context_prices import context_prices_for_rule, cpamp_rules, nano_rate, normalize_context_prices, select_context_price
 from .database import Database, now_ms
 from .domain import (
     NANO_USD,
@@ -143,6 +143,23 @@ CPAMP_USAGE_REQUIRED_COLUMNS = (
     "header_quota_recover_at_ms",
     "header_quota_plan_type",
 )
+CPAMP_TOKEN_COLUMNS = (
+    "input_tokens", "output_tokens", "reasoning_tokens", "cached_tokens",
+    "cache_tokens", "cache_read_tokens", "cache_creation_tokens", "total_tokens",
+)
+CPAMP_OPTIONAL_COLUMNS = ("reasoning_effort", "request_service_tier", "response_service_tier")
+CPAMP_BACKFILL_BATCH = 5000
+VERSION_NAME_PATTERN = re.compile(r"[A-Za-z0-9._-]{1,80}")
+PRICE_RULE_FIELDS = (
+    "input_nano_per_token", "output_nano_per_token",
+    "cache_read_nano_per_token", "cache_creation_nano_per_token",
+    "input_configured", "output_configured", "cache_read_configured", "cache_creation_configured",
+    "priority_input_nano_per_token", "priority_output_nano_per_token",
+    "priority_cache_read_nano_per_token", "priority_cache_creation_nano_per_token",
+    "flex_input_nano_per_token", "flex_output_nano_per_token",
+    "flex_cache_read_nano_per_token", "flex_cache_creation_nano_per_token",
+    "long_threshold_tokens", "long_input_multiplier_ppm", "long_output_multiplier_ppm", "context_tiers_json", "raw_json",
+)
 
 
 class BillingError(RuntimeError):
@@ -160,12 +177,12 @@ class CPAClient:
         self.lock_path = settings.database_path.parent / "cpa-api-keys.lock"
         self._reset_credit_cache: dict[tuple[str, str | None], tuple[float, dict[str, Any] | None, str | None]] = {}
         self._reset_credit_cache_lock = threading.Lock()
+        self._client = httpx.Client(timeout=15)
 
     def _request(self, method: str, path: str, **kwargs: Any) -> Any:
         headers = dict(kwargs.pop("headers", {}))
         headers["Authorization"] = f"Bearer {self.key}"
-        with httpx.Client(timeout=15) as client:
-            response = client.request(method, f"{self.base_url}{path}", headers=headers, **kwargs)
+        response = self._client.request(method, f"{self.base_url}{path}", headers=headers, **kwargs)
         response.raise_for_status()
         return response.json() if response.content else None
 
@@ -345,10 +362,7 @@ class CPAClient:
 
     @staticmethod
     def _copy_reset_credit_payload(payload: dict[str, Any]) -> dict[str, Any]:
-        return {
-            "available_count": payload.get("available_count"),
-            "credits": [dict(item) for item in payload.get("credits", []) if isinstance(item, dict)],
-        }
+        return {"available_count": payload["available_count"], "credits": [dict(item) for item in payload["credits"]]}
 
     def codex_reset_credits(
         self,
@@ -456,14 +470,14 @@ class CPAMPClient:
     def __init__(self, settings: Settings) -> None:
         self.base_url = settings.cpamp_base_url
         self.key = settings.cpamp_admin_key
+        self._client = httpx.Client(timeout=httpx.Timeout(45, connect=5))
 
     def _request(self, method: str, path: str, **kwargs: Any) -> Any:
         if not self.key:
             raise BillingDependencyError("CPAMP 管理密钥未配置")
         headers = dict(kwargs.pop("headers", {}))
         headers["Authorization"] = f"Bearer {self.key}"
-        with httpx.Client(timeout=httpx.Timeout(45, connect=5)) as client:
-            response = client.request(method, f"{self.base_url}{path}", headers=headers, **kwargs)
+        response = self._client.request(method, f"{self.base_url}{path}", headers=headers, **kwargs)
         response.raise_for_status()
         return response.json() if response.content else None
 
@@ -474,23 +488,8 @@ class CPAMPClient:
         return result
 
 
-def _nano_per_token(value: Any) -> int:
-    price = Decimal(str(value))
-    if not price.is_finite() or price < 0:
-        raise ValueError("price must be finite and nonnegative")
-    return int((price * Decimal(1000)).to_integral_value(rounding=ROUND_HALF_UP))
-
-
 def _model_slug(value: str) -> str:
     return value.strip().lower().rsplit("/", 1)[-1]
-
-
-def _model_family(value: str, family: str) -> bool:
-    slug = _model_slug(value)
-    return slug == family or slug.startswith(family + "-")
-
-
-_cpamp_tier_rules = cpamp_rules
 
 
 def _metered_amount_cents(actual_nano_usd: int, multiplier_ppm: int) -> int:
@@ -520,33 +519,27 @@ class BillingService:
         self._quota_window_lock = threading.Lock()
         self._manual_usage_lock = threading.Lock()
         self._db_write_thread_lock = threading.RLock()
-        self._db_write_lock_state = threading.local()
+        self._db_write_locked = False
         self._db_write_lock_path = settings.database_path.parent / "billing-write.lock"
+        # Per pricing version: every eligible raw event with id <= value is rated.
+        self._rated_through: dict[int, int] = {}
 
     @contextmanager
     def _db_write_lock(self) -> Iterator[None]:
-        self._db_write_thread_lock.acquire()
-        depth = int(getattr(self._db_write_lock_state, "depth", 0))
-        handle = None
-        try:
-            if depth == 0:
-                self._db_write_lock_path.parent.mkdir(parents=True, exist_ok=True)
-                handle = self._db_write_lock_path.open("a+", encoding="ascii")
+        # The RLock makes nesting reentrant per thread; only the outermost holder takes the flock.
+        with self._db_write_thread_lock:
+            if self._db_write_locked:
+                yield
+                return
+            self._db_write_lock_path.parent.mkdir(parents=True, exist_ok=True)
+            with self._db_write_lock_path.open("a+", encoding="ascii") as handle:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-                self._db_write_lock_state.handle = handle
-            self._db_write_lock_state.depth = depth + 1
-            yield
-        finally:
-            next_depth = int(getattr(self._db_write_lock_state, "depth", 1)) - 1
-            self._db_write_lock_state.depth = next_depth
-            if next_depth == 0:
-                lock_handle = getattr(self._db_write_lock_state, "handle", handle)
-                if lock_handle is not None:
-                    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
-                    lock_handle.close()
-                if hasattr(self._db_write_lock_state, "handle"):
-                    del self._db_write_lock_state.handle
-            self._db_write_thread_lock.release()
+                self._db_write_locked = True
+                try:
+                    yield
+                finally:
+                    self._db_write_locked = False
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
     def bootstrap(self) -> None:
         self.db.initialize()
@@ -587,7 +580,7 @@ class BillingService:
         connection.execute("pragma busy_timeout=15000")
         return connection
 
-    def _schema_fingerprint(self, connection: sqlite3.Connection) -> str:
+    def _schema_fingerprint(self, connection: sqlite3.Connection) -> tuple[str, set[str]]:
         exists = connection.execute(
             "select 1 from sqlite_master where type='table' and name='usage_events'"
         ).fetchone()
@@ -601,126 +594,62 @@ class BillingService:
         if missing:
             raise BillingError("CPAMP schema missing columns: " + ", ".join(sorted(missing)))
         contract = [(name, columns[name]) for name in sorted(CPAMP_USAGE_REQUIRED_COLUMNS)]
-        return hashlib.sha256(json.dumps(contract, separators=(",", ":")).encode()).hexdigest()
+        return hashlib.sha256(json.dumps(contract, separators=(",", ":")).encode()).hexdigest(), set(columns)
 
-    def _backfill_cpamp_reasoning_effort(
-        self,
-        source_db: sqlite3.Connection,
-        session: Any,
-        source_id: int,
-        batch_size: int,
-        has_reasoning_effort: bool,
-    ) -> int:
-        if not has_reasoning_effort:
-            return 0
-        pending = session.scalars(
-            select(RawUsageEvent)
-            .where(
-                RawUsageEvent.source_id == source_id,
-                RawUsageEvent.reasoning_effort.is_(None),
-            )
+    def _backfill_cpamp_column(self, source_db: sqlite3.Connection, session: Any, source_id: int, column: str) -> int:
+        # Partial indexes keep the NULL lookup cheap once every row has been checked.
+        pending = session.execute(
+            select(RawUsageEvent.id, RawUsageEvent.source_event_id)
+            .where(RawUsageEvent.source_id == source_id, getattr(RawUsageEvent, column).is_(None))
             .order_by(RawUsageEvent.source_event_id)
-            .limit(min(batch_size, 5000))
+            .limit(CPAMP_BACKFILL_BATCH)
         ).all()
         if not pending:
             return 0
-        source_rows = source_db.execute(
-            "select id, reasoning_effort from usage_events where id between ? and ?",
+        source_values = dict(source_db.execute(
+            f"select id,{column} from usage_events where id between ? and ?",
             (pending[0].source_event_id, pending[-1].source_event_id),
-        ).fetchall()
-        effort_by_source_id = {
-            int(row["id"]): str(row["reasoning_effort"] or "").strip()
-            for row in source_rows
-        }
-        for event in pending:
-            # Empty string means the source was checked and had no effort value.
-            event.reasoning_effort = effort_by_source_id.get(event.source_event_id, "")
-        return len(pending)
-
-    def _backfill_cpamp_service_tiers(
-        self,
-        source_db: sqlite3.Connection,
-        session: Any,
-        source_id: int,
-        batch_size: int,
-        has_request_service_tier: bool,
-        has_response_service_tier: bool,
-    ) -> int:
-        missing: list[Any] = []
-        if has_request_service_tier:
-            missing.append(RawUsageEvent.request_service_tier.is_(None))
-        if has_response_service_tier:
-            missing.append(RawUsageEvent.response_service_tier.is_(None))
-        if not missing:
-            return 0
-        pending = session.scalars(
-            select(RawUsageEvent)
-            .where(
-                RawUsageEvent.source_id == source_id,
-                or_(*missing),
-            )
-            .order_by(RawUsageEvent.source_event_id)
-            .limit(min(batch_size, 5000))
-        ).all()
-        if not pending:
-            return 0
-
-        request_column = "request_service_tier" if has_request_service_tier else "NULL AS request_service_tier"
-        response_column = "response_service_tier" if has_response_service_tier else "NULL AS response_service_tier"
-        source_rows = source_db.execute(
-            f"select id,{request_column},{response_column} from usage_events where id between ? and ?",
-            (pending[0].source_event_id, pending[-1].source_event_id),
-        ).fetchall()
-        tiers_by_source_id = {int(row["id"]): row for row in source_rows}
-        for event in pending:
-            row = tiers_by_source_id.get(event.source_event_id)
-            if has_request_service_tier:
-                event.request_service_tier = str(row["request_service_tier"] or "").strip() if row else ""
-            if has_response_service_tier:
-                event.response_service_tier = str(row["response_service_tier"] or "").strip() if row else ""
+        ).fetchall())
+        # Empty string means the source was checked and had no value.
+        session.execute(update(RawUsageEvent), [
+            {"id": event_id, column: str(source_values.get(source_event_id) or "").strip()}
+            for event_id, source_event_id in pending
+        ])
         return len(pending)
 
     @staticmethod
-    def _raw_event_from_cpamp_row(source_id: int, row: sqlite3.Row) -> RawUsageEvent:
-        return RawUsageEvent(
-            source_id=source_id,
-            source_event_id=int(row["id"]),
-            event_hash=str(row["event_hash"]),
-            request_id=row["request_id"],
-            occurred_at_ms=int(row["timestamp_ms"]),
-            timestamp=str(row["timestamp"]),
-            provider=row["provider"],
-            executor_type=row["executor_type"],
-            model=str(row["model"]),
-            requested_model=row["requested_model"],
-            resolved_model=row["resolved_model"],
-            reasoning_effort=str(row["reasoning_effort"] or "").strip(),
-            service_tier=row["service_tier"],
-            request_service_tier=row["request_service_tier"],
-            response_service_tier=row["response_service_tier"],
-            api_key_hash=row["api_key_hash"],
-            source_hash=row["source_hash"],
-            source_label=row["source"],
-            account_snapshot=row["account_snapshot"],
-            auth_index=row["auth_index"],
-            input_tokens=int(row["input_tokens"] or 0),
-            output_tokens=int(row["output_tokens"] or 0),
-            reasoning_tokens=int(row["reasoning_tokens"] or 0),
-            cached_tokens=int(row["cached_tokens"] or 0),
-            cache_tokens=int(row["cache_tokens"] or 0),
-            cache_read_tokens=int(row["cache_read_tokens"] or 0),
-            cache_creation_tokens=int(row["cache_creation_tokens"] or 0),
-            total_tokens=int(row["total_tokens"] or 0),
-            failed=bool(row["failed"]),
-            fail_status_code=row["fail_status_code"],
-            latency_ms=row["latency_ms"],
-            ttft_ms=row["ttft_ms"],
-            response_metadata_json=row["response_metadata_json"],
-            quota_used_percent=None if row["header_quota_used_percent"] is None else int(Decimal(str(row["header_quota_used_percent"])) * 1_000_000),
-            quota_recover_at_ms=row["header_quota_recover_at_ms"],
-            quota_plan_type=row["header_quota_plan_type"],
-            imported_at_ms=now_ms(),
-        )
+    def _raw_event_from_cpamp_row(source_id: int, row: sqlite3.Row, columns: set[str]) -> dict[str, Any]:
+        return {
+            "source_id": source_id,
+            "source_event_id": int(row["id"]),
+            "event_hash": str(row["event_hash"]),
+            "request_id": row["request_id"],
+            "occurred_at_ms": int(row["timestamp_ms"]),
+            "timestamp": str(row["timestamp"]),
+            "provider": row["provider"],
+            "executor_type": row["executor_type"],
+            "model": str(row["model"]),
+            "requested_model": row["requested_model"],
+            "resolved_model": row["resolved_model"],
+            "service_tier": row["service_tier"],
+            # NULL marks optional columns that CPAMP did not provide yet; backfills fill them later.
+            **{name: str(row[name] or "").strip() if name in columns else None for name in CPAMP_OPTIONAL_COLUMNS},
+            "api_key_hash": row["api_key_hash"],
+            "source_hash": row["source_hash"],
+            "source_label": row["source"],
+            "account_snapshot": row["account_snapshot"],
+            "auth_index": row["auth_index"],
+            **{name: max(int(row[name] or 0), 0) for name in CPAMP_TOKEN_COLUMNS},
+            "failed": bool(row["failed"]),
+            "fail_status_code": row["fail_status_code"],
+            "latency_ms": row["latency_ms"],
+            "ttft_ms": row["ttft_ms"],
+            "response_metadata_json": row["response_metadata_json"],
+            "quota_used_percent": None if row["header_quota_used_percent"] is None else int(Decimal(str(row["header_quota_used_percent"])) * 1_000_000),
+            "quota_recover_at_ms": row["header_quota_recover_at_ms"],
+            "quota_plan_type": row["header_quota_plan_type"],
+            "imported_at_ms": now_ms(),
+        }
 
     def _retry_cpamp_dead_letters(
         self,
@@ -728,9 +657,8 @@ class BillingService:
         session: Any,
         source_id: int,
         batch_size: int,
-        reasoning_effort_column: str,
-        request_service_tier_column: str,
-        response_service_tier_column: str,
+        columns: set[str],
+        select_columns: str,
     ) -> int:
         dead_letters = session.scalars(
             select(DeadLetter)
@@ -738,41 +666,30 @@ class BillingService:
             .order_by(DeadLetter.id)
             .limit(batch_size)
         ).all()
-        source_ids = [int(item.source_event_id) for item in dead_letters if item.source_event_id is not None]
-        if not source_ids:
+        if not dead_letters:
             return 0
-        placeholders = ",".join("?" for _ in source_ids)
+        source_ids = [item.source_event_id for item in dead_letters]
         rows = source_db.execute(
-            f"""
-            select id,event_hash,request_id,timestamp_ms,timestamp,provider,executor_type,model,
-                   requested_model,resolved_model,service_tier,api_key_hash,source_hash,source,
-                   account_snapshot,auth_index,input_tokens,output_tokens,reasoning_tokens,
-                   cached_tokens,cache_tokens,cache_read_tokens,cache_creation_tokens,total_tokens,failed,
-                   fail_status_code,latency_ms,ttft_ms,response_metadata_json,header_quota_used_percent,
-                   header_quota_recover_at_ms,header_quota_plan_type,{reasoning_effort_column},
-                   {request_service_tier_column},{response_service_tier_column}
-            from usage_events where id in ({placeholders})
-            """,
+            f"select {select_columns} from usage_events where id in ({','.join('?' for _ in source_ids)})",
             source_ids,
         ).fetchall()
-        rows_by_id = {int(row["id"]): row for row in rows}
+        rows_by_id = {row["id"]: row for row in rows}
         retried = 0
         for dead_letter in dead_letters:
-            source_event_id = int(dead_letter.source_event_id)
-            row = rows_by_id.get(source_event_id)
+            row = rows_by_id.get(dead_letter.source_event_id)
             if row is None:
                 dead_letter.error = "source event is no longer present in CPAMP"
                 continue
             try:
                 with session.begin_nested():
-                    session.add(self._raw_event_from_cpamp_row(source_id, row))
+                    session.add(RawUsageEvent(**self._raw_event_from_cpamp_row(source_id, row, columns)))
                     session.flush()
                 dead_letter.resolved_at_ms = now_ms()
                 retried += 1
             except IntegrityError as exc:
                 existing = session.scalar(select(RawUsageEvent).where(
                     RawUsageEvent.source_id == source_id,
-                    or_(RawUsageEvent.source_event_id == source_event_id, RawUsageEvent.event_hash == str(row["event_hash"])),
+                    or_(RawUsageEvent.source_event_id == dead_letter.source_event_id, RawUsageEvent.event_hash == str(row["event_hash"])),
                 ))
                 if existing is not None:
                     dead_letter.resolved_at_ms = now_ms()
@@ -792,16 +709,10 @@ class BillingService:
     def _sync_cpamp_locked(self, batch_size: int = 1000) -> int:
         imported = 0
         with self._cpamp() as source_db:
-            fingerprint = self._schema_fingerprint(source_db)
-            usage_columns = {str(item[1]) for item in source_db.execute("pragma table_info(usage_events)")}
-            reasoning_effort_column = (
-                "reasoning_effort" if "reasoning_effort" in usage_columns else "NULL AS reasoning_effort"
-            )
-            request_service_tier_column = (
-                "request_service_tier" if "request_service_tier" in usage_columns else "NULL AS request_service_tier"
-            )
-            response_service_tier_column = (
-                "response_service_tier" if "response_service_tier" in usage_columns else "NULL AS response_service_tier"
+            fingerprint, columns = self._schema_fingerprint(source_db)
+            select_columns = ",".join(
+                CPAMP_USAGE_REQUIRED_COLUMNS
+                + tuple(name if name in columns else f"NULL AS {name}" for name in CPAMP_OPTIONAL_COLUMNS)
             )
             with self.db.session() as session:
                 source = session.scalar(select(CPAMPSource).where(CPAMPSource.name == self.settings.cpamp_source_name))
@@ -814,71 +725,47 @@ class BillingService:
                     checkpoint.last_error = "CPAMP schema fingerprint changed; review required"
                     raise BillingError(checkpoint.last_error)
                 source.schema_fingerprint = fingerprint
-                imported += self._retry_cpamp_dead_letters(
-                    source_db,
-                    session,
-                    source.id,
-                    batch_size,
-                    reasoning_effort_column,
-                    request_service_tier_column,
-                    response_service_tier_column,
-                )
+                imported += self._retry_cpamp_dead_letters(source_db, session, source.id, batch_size, columns, select_columns)
                 rows = source_db.execute(
-                    f"""
-                    select id,event_hash,request_id,timestamp_ms,timestamp,provider,executor_type,model,
-                           requested_model,resolved_model,service_tier,api_key_hash,source_hash,source,
-                           account_snapshot,auth_index,input_tokens,output_tokens,reasoning_tokens,
-                           cached_tokens,cache_tokens,cache_read_tokens,cache_creation_tokens,total_tokens,failed,
-                           fail_status_code,latency_ms,ttft_ms,response_metadata_json,header_quota_used_percent,
-                           header_quota_recover_at_ms,header_quota_plan_type,{reasoning_effort_column},
-                           {request_service_tier_column},{response_service_tier_column}
-                    from usage_events where id > ? order by id limit ?
-                    """,
+                    f"select {select_columns} from usage_events where id > ? order by id limit ?",
                     (checkpoint.last_event_id, batch_size),
                 ).fetchall()
+                events = []
                 for row in rows:
                     try:
-                        event = self._raw_event_from_cpamp_row(source.id, row)
-                        with session.begin_nested():
-                            session.add(event)
-                            session.flush()
-                        imported += 1
-                    except IntegrityError:
-                        pass
+                        events.append(self._raw_event_from_cpamp_row(source.id, row, columns))
                     except Exception as exc:
-                        session.add(DeadLetter(source_id=source.id, source_event_id=int(row["id"]), error=str(exc), payload_json="{}", created_at_ms=now_ms()))
-                    checkpoint.last_event_id = int(row["id"])
-                    checkpoint.last_event_at_ms = int(row["timestamp_ms"])
+                        session.add(DeadLetter(source_id=source.id, source_event_id=row["id"], error=str(exc), payload_json="{}", created_at_ms=now_ms()))
+                if events:
+                    # Rows already imported (same source id or event hash) are skipped, as before.
+                    imported += session.execute(insert(RawUsageEvent.__table__).prefix_with("OR IGNORE"), events).rowcount
+                if rows:
+                    checkpoint.last_event_id = rows[-1]["id"]
+                    checkpoint.last_event_at_ms = int(rows[-1]["timestamp_ms"])
                 maximum = int(source_db.execute("select coalesce(max(id),0) from usage_events").fetchone()[0])
                 checkpoint.backlog = max(0, maximum - checkpoint.last_event_id)
                 checkpoint.last_success_at_ms = now_ms()
                 checkpoint.last_error = None
-                backfilled = self._backfill_cpamp_reasoning_effort(
-                    source_db, session, source.id, max(batch_size, 5000), "reasoning_effort" in usage_columns,
-                )
-                if backfilled:
-                    LOGGER.info("worker backfilled reasoning_effort=%s", backfilled)
-                tier_backfilled = self._backfill_cpamp_service_tiers(
-                    source_db,
-                    session,
-                    source.id,
-                    max(batch_size, 5000),
-                    "request_service_tier" in usage_columns,
-                    "response_service_tier" in usage_columns,
-                )
-                if tier_backfilled:
-                    LOGGER.info("worker backfilled service tier provenance=%s", tier_backfilled)
+                for column in CPAMP_OPTIONAL_COLUMNS:
+                    if column in columns:
+                        backfilled = self._backfill_cpamp_column(source_db, session, source.id, column)
+                        if backfilled:
+                            LOGGER.info("worker backfilled %s=%s", column, backfilled)
         return imported
 
     def import_cpamp_prices(self, name: str, operator_type: str | None = None, operator_id: str | None = None,
                             allow_existing: bool = True) -> int:
-        if not re.fullmatch(r"[A-Za-z0-9._-]{1,80}", name):
+        return self._import_cpamp_prices(name, operator_type, operator_id, allow_existing)[0].id
+
+    def _import_cpamp_prices(self, name: str, operator_type: str | None, operator_id: str | None,
+                             allow_existing: bool) -> tuple[PricingVersion, list[ModelPriceRule]]:
+        if not VERSION_NAME_PATTERN.fullmatch(name):
             raise BillingError("pricing version name must use letters, numbers, dot, underscore, or hyphen")
         with self.db.session() as session:
             existing = session.scalar(select(PricingVersion).where(PricingVersion.name == name))
             if existing is not None:
                 if allow_existing:
-                    return existing.id
+                    return existing, []
                 raise BillingError("pricing version already exists")
         with self._cpamp() as source_db:
             rows = source_db.execute("select * from model_prices order by model").fetchall()
@@ -886,51 +773,77 @@ class BillingService:
             raise BillingError("CPAMP model_prices is empty")
         created = now_ms()
         with self._db_write_lock(), self.db.session() as session:
-            for active in session.scalars(select(PricingVersion).where(PricingVersion.status == "active")):
-                active.status = "retired"
-            version = PricingVersion(
-                name=name,
-                status="active",
-                source="CPAMP model_prices snapshot",
-                created_at_ms=created,
-                activated_at_ms=created,
-            )
-            session.add(version)
-            session.flush()
+            version = self._create_active_version(session, name, "CPAMP model_prices snapshot", created)
+            rules = []
             for row in rows:
-                raw_text = str(row["raw_json"] or "")
                 keys = set(row.keys())
                 model = str(row["model"])
                 try:
-                    input_rate = _nano_per_token(row["prompt_per_1m"])
-                    output_rate = _nano_per_token(row["completion_per_1m"])
-                    cache_read_rate = _nano_per_token(row["cache_read_per_1m"])
-                    cache_creation_rate = _nano_per_token(row["cache_creation_per_1m"])
-                    tier_rules = _cpamp_tier_rules(row)
+                    input_rate = nano_rate(row["prompt_per_1m"])
+                    output_rate = nano_rate(row["completion_per_1m"])
+                    cache_read_rate = nano_rate(row["cache_read_per_1m"])
+                    cache_creation_rate = nano_rate(row["cache_creation_per_1m"])
+                    tier_rules = cpamp_rules(row)
                 except (ValueError, TypeError, KeyError, AttributeError, InvalidOperation) as exc:
                     raise BillingError(f"CPAMP 模型 {model} 价格无效：{exc}") from exc
-                input_configured = bool(row["prompt_configured"]) if "prompt_configured" in keys else True
-                output_configured = bool(row["completion_configured"]) if "completion_configured" in keys else True
-                cache_read_configured = bool(row["cache_read_configured"]) if "cache_read_configured" in keys else cache_read_rate > 0
-                cache_creation_configured = bool(row["cache_creation_configured"]) if "cache_creation_configured" in keys else cache_creation_rate > 0
-                session.add(ModelPriceRule(
+                rules.append(ModelPriceRule(
                     pricing_version_id=version.id,
                     model=model,
                     input_nano_per_token=input_rate,
                     output_nano_per_token=output_rate,
                     cache_read_nano_per_token=cache_read_rate,
                     cache_creation_nano_per_token=cache_creation_rate,
-                    input_configured=input_configured,
-                    output_configured=output_configured,
-                    cache_read_configured=cache_read_configured,
-                    cache_creation_configured=cache_creation_configured,
+                    input_configured=bool(row["prompt_configured"]) if "prompt_configured" in keys else True,
+                    output_configured=bool(row["completion_configured"]) if "completion_configured" in keys else True,
+                    cache_read_configured=bool(row["cache_read_configured"]) if "cache_read_configured" in keys else cache_read_rate > 0,
+                    cache_creation_configured=bool(row["cache_creation_configured"]) if "cache_creation_configured" in keys else cache_creation_rate > 0,
                     **tier_rules,
-                    raw_json=raw_text or None,
+                    raw_json=str(row["raw_json"] or "") or None,
                 ))
+            session.add_all(rules)
             if operator_type and operator_id:
                 session.add(AuditLog(operator_type=operator_type, operator_id=operator_id, operation="pricing.import",
                                      target=name, after_json=json.dumps({"models": len(rows)}), created_at_ms=now_ms()))
-            return version.id
+            return version, rules
+
+    @staticmethod
+    def _create_active_version(session: Any, name: str, source: str, created: int) -> PricingVersion:
+        session.execute(update(PricingVersion).where(PricingVersion.status == "active").values(status="retired"))
+        version = PricingVersion(name=name, status="active", source=source, created_at_ms=created, activated_at_ms=created)
+        session.add(version)
+        session.flush()
+        return version
+
+    @staticmethod
+    def _requested_version_name(version_name: str | None) -> str:
+        requested = (version_name or "").strip()
+        if requested and not VERSION_NAME_PATTERN.fullmatch(requested):
+            raise BillingError("价格版本名称只能包含字母、数字、点、下划线或短横线")
+        return requested
+
+    def _unique_version_name(self, session: Any, requested: str, prefix: str) -> str:
+        base = requested or f"{prefix}-{datetime.now(ZoneInfo(self.settings.timezone)):%Y%m%d-%H%M%S}"
+        candidate, suffix = base, 2
+        while session.scalar(select(PricingVersion.id).where(PricingVersion.name == candidate)) is not None:
+            if requested:
+                raise BillingError("价格版本名称已存在")
+            candidate, suffix = f"{base}-{suffix}", suffix + 1
+        return candidate
+
+    @staticmethod
+    def _active_version_rules(session: Any) -> tuple[PricingVersion | None, list[ModelPriceRule]]:
+        active = session.scalar(
+            select(PricingVersion)
+            .where(PricingVersion.status == "active")
+            .order_by(PricingVersion.id.desc())
+        )
+        if active is None:
+            return None, []
+        return active, list(session.scalars(
+            select(ModelPriceRule)
+            .where(ModelPriceRule.pricing_version_id == active.id)
+            .order_by(ModelPriceRule.model)
+        ))
 
     def _invalidate_cycle_previews(self, session: Any, cycle_ids: list[int]) -> None:
         if not cycle_ids:
@@ -948,10 +861,10 @@ class BillingService:
     @staticmethod
     def _price_rule_signature(rule: ModelPriceRule) -> tuple[Any, ...]:
         return (
-            int(rule.input_nano_per_token),
-            int(rule.output_nano_per_token),
-            int(rule.cache_read_nano_per_token),
-            int(rule.cache_creation_nano_per_token),
+            rule.input_nano_per_token,
+            rule.output_nano_per_token,
+            rule.cache_read_nano_per_token,
+            rule.cache_creation_nano_per_token,
             rule.priority_input_nano_per_token,
             rule.priority_output_nano_per_token,
             rule.priority_cache_read_nano_per_token,
@@ -962,8 +875,8 @@ class BillingService:
             rule.flex_cache_creation_nano_per_token,
             json.dumps(context_prices_for_rule(rule), sort_keys=True),
             rule.long_threshold_tokens,
-            int(rule.long_input_multiplier_ppm if rule.long_input_multiplier_ppm is not None else 1_000_000),
-            int(rule.long_output_multiplier_ppm if rule.long_output_multiplier_ppm is not None else 1_000_000),
+            rule.long_input_multiplier_ppm,
+            rule.long_output_multiplier_ppm,
         )
 
     @classmethod
@@ -980,111 +893,46 @@ class BillingService:
                 changed.append(rule.model)
         return sorted(changed)
 
-    def _record_pricing_rerate_scope(
-        self,
-        session: Any,
-        version_id: int,
-        cycles: list[BillingCycle],
-        changed_models: list[str] | None = None,
-    ) -> None:
-        ranges = sorted({(cycle.start_at_ms, cycle.end_at_ms) for cycle in cycles})
-        session.add(PricingRerateScope(
-            pricing_version_id=version_id,
-            ranges_json=json.dumps(ranges, separators=(",", ":")),
-            models_json=(
-                None
-                if changed_models is None
-                else json.dumps(sorted(set(changed_models)), separators=(",", ":"))
-            ),
-            max_raw_event_id=session.scalar(select(func.max(RawUsageEvent.id))) or 0,
-            created_at_ms=now_ms(),
-        ))
-
-    def _carry_forward_unchanged_rated_events(
-        self,
-        session: Any,
-        *,
-        from_version_id: int,
-        to_version_id: int,
-        cycles: list[BillingCycle],
-        unchanged_models: list[str],
-    ) -> int:
-        if not cycles or not unchanged_models:
-            return 0
-        ranges = sorted({(cycle.start_at_ms, cycle.end_at_ms) for cycle in cycles})
-        range_filters = [
-            and_(
-                RatedEvent.occurred_at_ms >= start,
-                RatedEvent.occurred_at_ms < end,
-            )
-            for start, end in ranges
-        ]
-        if not range_filters:
-            return 0
-        price_model = func.json_extract(RatedEvent.calculation_json, "$.price_model")
-        existing = select(RatedEvent.raw_event_id).where(RatedEvent.pricing_version_id == to_version_id)
-        result = session.execute(
-            insert(RatedEvent).from_select(
-                [
-                    "raw_event_id",
-                    "pricing_version_id",
-                    "pool_id",
-                    "telegram_user_id",
-                    "occurred_at_ms",
-                    "rated_weight_nano_usd",
-                    "long_context_applied",
-                    "service_tier",
-                    "calculation_json",
-                    "rated_at_ms",
-                ],
-                select(
-                    RatedEvent.raw_event_id,
-                    literal(to_version_id),
-                    RatedEvent.pool_id,
-                    RatedEvent.telegram_user_id,
-                    RatedEvent.occurred_at_ms,
-                    RatedEvent.rated_weight_nano_usd,
-                    RatedEvent.long_context_applied,
-                    RatedEvent.service_tier,
-                    RatedEvent.calculation_json,
-                    RatedEvent.rated_at_ms,
-                ).where(
-                    RatedEvent.pricing_version_id == from_version_id,
-                    or_(*range_filters),
-                    price_model.in_(unchanged_models),
-                    RatedEvent.raw_event_id.not_in(existing),
-                ),
-            )
-        )
-        return int(result.rowcount or 0)
-
     def _activate_pricing_version_for_open_cycles(
         self,
         session: Any,
         *,
         previous_version_id: int | None,
         version_id: int,
-        previous_rules: list[ModelPriceRule],
-        next_rules: list[ModelPriceRule],
-    ) -> tuple[list[BillingCycle], list[str], int]:
-        changed_models = self._changed_price_models(previous_rules, next_rules)
-        unchanged_models = sorted({rule.model for rule in next_rules} - set(changed_models))
+        models: list[str],
+        changed_models: list[str],
+    ) -> list[BillingCycle]:
         cycles = list(session.scalars(select(BillingCycle).where(BillingCycle.status != "closed")))
-        cycle_ids = [cycle.id for cycle in cycles]
         for cycle in cycles:
             cycle.pricing_version_id = version_id
-        self._invalidate_cycle_previews(session, cycle_ids)
-        self._record_pricing_rerate_scope(session, version_id, cycles, changed_models)
-        carried = 0
-        if previous_version_id is not None:
-            carried = self._carry_forward_unchanged_rated_events(
-                session,
-                from_version_id=previous_version_id,
-                to_version_id=version_id,
-                cycles=cycles,
-                unchanged_models=unchanged_models,
-            )
-        return cycles, changed_models, carried
+        self._invalidate_cycle_previews(session, [cycle.id for cycle in cycles])
+        ranges = sorted({(cycle.start_at_ms, cycle.end_at_ms) for cycle in cycles})
+        session.add(PricingRerateScope(
+            pricing_version_id=version_id,
+            ranges_json=json.dumps(ranges, separators=(",", ":")),
+            models_json=json.dumps(sorted(set(changed_models)), separators=(",", ":")),
+            max_raw_event_id=session.scalar(select(func.max(RawUsageEvent.id))) or 0,
+            created_at_ms=now_ms(),
+        ))
+        unchanged_models = sorted(set(models) - set(changed_models))
+        if previous_version_id is None or not ranges or not unchanged_models:
+            return cycles
+        # The target version was created in this transaction, so it has no rated events yet.
+        price_model = func.json_extract(RatedEvent.calculation_json, "$.price_model")
+        columns = (
+            "raw_event_id", "pricing_version_id", "pool_id", "telegram_user_id", "occurred_at_ms",
+            "rated_weight_nano_usd", "long_context_applied", "service_tier", "calculation_json", "rated_at_ms",
+        )
+        session.execute(insert(RatedEvent).from_select(
+            columns,
+            select(*(literal(version_id) if name == "pricing_version_id" else getattr(RatedEvent, name) for name in columns))
+            .where(
+                RatedEvent.pricing_version_id == previous_version_id,
+                or_(*(and_(RatedEvent.occurred_at_ms >= start, RatedEvent.occurred_at_ms < end) for start, end in ranges)),
+                price_model.in_(unchanged_models),
+            ),
+        ))
+        return cycles
 
     def sync_upstream_prices(
         self,
@@ -1097,52 +945,31 @@ class BillingService:
             raise BillingError("价格同步必须填写原因")
         with self.db.session() as session:
             used_models = sorted({
-                str(value).strip()
-                for row in session.execute(select(
-                    RawUsageEvent.resolved_model,
-                    RawUsageEvent.requested_model,
-                    RawUsageEvent.model,
+                value.strip()
+                for value in session.scalars(union(
+                    select(RawUsageEvent.resolved_model),
+                    select(RawUsageEvent.requested_model),
+                    select(RawUsageEvent.model),
                 ))
-                for value in row
-                if value and str(value).strip()
+                if value and value.strip()
             })
-            previous = session.scalar(
-                select(PricingVersion)
-                .where(PricingVersion.status == "active")
-                .order_by(PricingVersion.id.desc())
-            )
-            previous_version_id = previous.id if previous is not None else None
-            previous_rules = []
-            if previous is not None:
-                previous_rules = list(session.scalars(
-                    select(ModelPriceRule)
-                    .where(ModelPriceRule.pricing_version_id == previous.id)
-                    .order_by(ModelPriceRule.model)
-                ))
         try:
             upstream = self.cpamp.sync_model_prices(used_models)
         except httpx.HTTPError as exc:
             raise BillingDependencyError("CPAMP 上游价格同步失败") from exc
         version_name = (name or "").strip() or f"cpamp-{datetime.now(ZoneInfo(self.settings.timezone)):%Y%m%d-%H%M%S}"
         with self._db_write_lock():
-            version_id = self.import_cpamp_prices(
-                version_name,
-                operator_type=operator_type,
-                operator_id=operator_id,
-                allow_existing=False,
-            )
             with self.db.session() as session:
-                next_rules = list(session.scalars(
-                    select(ModelPriceRule)
-                    .where(ModelPriceRule.pricing_version_id == version_id)
-                    .order_by(ModelPriceRule.model)
-                ))
-                cycles, changed_models, _carried = self._activate_pricing_version_for_open_cycles(
+                previous, previous_rules = self._active_version_rules(session)
+            version, next_rules = self._import_cpamp_prices(version_name, operator_type, operator_id, False)
+            changed_models = self._changed_price_models(previous_rules, next_rules)
+            with self.db.session() as session:
+                cycles = self._activate_pricing_version_for_open_cycles(
                     session,
-                    previous_version_id=previous_version_id,
-                    version_id=version_id,
-                    previous_rules=previous_rules,
-                    next_rules=next_rules,
+                    previous_version_id=None if previous is None else previous.id,
+                    version_id=version.id,
+                    models=[rule.model for rule in next_rules],
+                    changed_models=changed_models,
                 )
                 session.add(AuditLog(
                     operator_type=operator_type,
@@ -1150,7 +977,7 @@ class BillingService:
                     operation="pricing.sync",
                     target=version_name,
                     after_json=json.dumps({
-                        "version_id": version_id,
+                        "version_id": version.id,
                         "cycles": [cycle.name for cycle in cycles],
                         "changed_models": changed_models,
                         "source": upstream.get("source"),
@@ -1161,7 +988,7 @@ class BillingService:
                     created_at_ms=now_ms(),
                 ))
         return {
-            "version_id": version_id,
+            "version_id": version.id,
             "name": version_name,
             "source": upstream.get("source"),
             "sources": upstream.get("sources") or [],
@@ -1190,119 +1017,48 @@ class BillingService:
             raise BillingError("模型名称过长")
         if not reason:
             raise BillingError("手动调整价格必须填写原因")
-        required_values = (
-            "input_nano_per_token", "output_nano_per_token",
-            "cache_read_nano_per_token", "cache_creation_nano_per_token",
-        )
-        for field in required_values:
-            value = values.get(field)
-            if not isinstance(value, int) or value < 0:
-                raise BillingError(f"{field} 必须是非负整数")
-        optional_values = (
-            "priority_input_nano_per_token", "priority_output_nano_per_token",
-            "priority_cache_read_nano_per_token", "priority_cache_creation_nano_per_token",
-            "flex_input_nano_per_token", "flex_output_nano_per_token",
-            "flex_cache_read_nano_per_token", "flex_cache_creation_nano_per_token",
-        )
-        for field in optional_values:
-            value = values.get(field)
-            if value is not None and (not isinstance(value, int) or value < 0):
-                raise BillingError(f"{field} 必须是非负整数或空值")
-        threshold = values.get("long_threshold_tokens")
-        if threshold is not None and (not isinstance(threshold, int) or threshold < 0):
-            raise BillingError("长上下文阈值必须是非负整数或空值")
-        for field in ("long_input_multiplier_ppm", "long_output_multiplier_ppm"):
-            value = values.get(field)
-            if not isinstance(value, int) or value < 0:
-                raise BillingError(f"{field} 必须是非负整数")
-
-        if "context_tiers_json" in values:
+        if "context_tiers" in values:
             try:
-                prices = normalize_context_prices(json.loads(values["context_tiers_json"]))
+                prices = normalize_context_prices(values["context_tiers"])
             except (ValueError, TypeError, KeyError) as exc:
                 raise BillingError(f"上下文价格无效：{exc}") from exc
-            values = {**values, "context_tiers_json": json.dumps(prices, separators=(",", ":"))}
+            values = {key: value for key, value in values.items() if key != "context_tiers"}
+            values["context_tiers_json"] = json.dumps(prices, separators=(",", ":"))
+        requested_name = self._requested_version_name(version_name)
 
-        requested_name = (version_name or "").strip()
-        if requested_name and not re.fullmatch(r"[A-Za-z0-9._-]{1,80}", requested_name):
-            raise BillingError("价格版本名称只能包含字母、数字、点、下划线或短横线")
-
-        version_id: int
-        cycle_names: list[str]
         before_payload: dict[str, Any] | None = None
         with self._db_write_lock(), self.db.session() as session:
-            active = session.scalar(
-                select(PricingVersion)
-                .where(PricingVersion.status == "active")
-                .order_by(PricingVersion.id.desc())
-            )
+            active, source_rules = self._active_version_rules(session)
             if active is None:
                 raise BillingError("没有 active 价格版本")
-            source_rules = list(session.scalars(
-                select(ModelPriceRule)
-                .where(ModelPriceRule.pricing_version_id == active.id)
-                .order_by(ModelPriceRule.model)
-            ))
             target_rule = next((rule for rule in source_rules if rule.model == model), None)
             if target_rule is not None:
                 before_payload = self._model_price_payload(target_rule)
-
-            base_name = requested_name or f"manual-{datetime.now(ZoneInfo(self.settings.timezone)):%Y%m%d-%H%M%S}"
-            candidate_name = base_name
-            suffix = 2
-            while session.scalar(select(PricingVersion).where(PricingVersion.name == candidate_name)) is not None:
-                if requested_name:
-                    raise BillingError("价格版本名称已存在")
-                candidate_name = f"{base_name}-{suffix}"
-                suffix += 1
-
-            for item in session.scalars(select(PricingVersion).where(PricingVersion.status == "active")):
-                item.status = "retired"
+            candidate_name = self._unique_version_name(session, requested_name, "manual")
             created = now_ms()
-            version = PricingVersion(
-                name=candidate_name,
-                status="active",
-                source="manual adjustment",
-                created_at_ms=created,
-                activated_at_ms=created,
-            )
-            session.add(version)
-            session.flush()
+            version = self._create_active_version(session, candidate_name, "manual adjustment", created)
 
-            rule_fields = (
-                "input_nano_per_token", "output_nano_per_token",
-                "cache_read_nano_per_token", "cache_creation_nano_per_token",
-                "input_configured", "output_configured", "cache_read_configured", "cache_creation_configured",
-                "priority_input_nano_per_token", "priority_output_nano_per_token",
-                "priority_cache_read_nano_per_token", "priority_cache_creation_nano_per_token",
-                "flex_input_nano_per_token", "flex_output_nano_per_token",
-                "flex_cache_read_nano_per_token", "flex_cache_creation_nano_per_token",
-                "long_threshold_tokens", "long_input_multiplier_ppm", "long_output_multiplier_ppm", "context_tiers_json", "raw_json",
-            )
+            manual = {
+                "input_configured": True,
+                "output_configured": True,
+                "cache_read_configured": True,
+                "cache_creation_configured": True,
+                "raw_json": None,
+            }
+            next_rules = []
             for source_rule in source_rules:
-                copied = {field: getattr(source_rule, field) for field in rule_fields}
+                copied = {field: getattr(source_rule, field) for field in PRICE_RULE_FIELDS}
                 if source_rule.model == model:
-                    copied.update({field: values.get(field) for field in rule_fields if field in values})
-                    copied.update({
-                        "input_configured": True,
-                        "output_configured": True,
-                        "cache_read_configured": True,
-                        "cache_creation_configured": True,
-                        "raw_json": None,
-                    })
-                session.add(ModelPriceRule(pricing_version_id=version.id, model=source_rule.model, **copied))
+                    copied.update({field: values[field] for field in PRICE_RULE_FIELDS if field in values}, **manual)
+                next_rules.append(ModelPriceRule(pricing_version_id=version.id, model=source_rule.model, **copied))
             if target_rule is None:
-                session.add(ModelPriceRule(
+                next_rules.append(ModelPriceRule(
                     pricing_version_id=version.id,
                     model=model,
                     input_nano_per_token=values["input_nano_per_token"],
                     output_nano_per_token=values["output_nano_per_token"],
                     cache_read_nano_per_token=values["cache_read_nano_per_token"],
                     cache_creation_nano_per_token=values["cache_creation_nano_per_token"],
-                    input_configured=True,
-                    output_configured=True,
-                    cache_read_configured=True,
-                    cache_creation_configured=True,
                     priority_input_nano_per_token=values.get("priority_input_nano_per_token"),
                     priority_output_nano_per_token=values.get("priority_output_nano_per_token"),
                     priority_cache_read_nano_per_token=values.get("priority_cache_read_nano_per_token"),
@@ -1315,22 +1071,17 @@ class BillingService:
                     long_threshold_tokens=values.get("long_threshold_tokens"),
                     long_input_multiplier_ppm=values["long_input_multiplier_ppm"],
                     long_output_multiplier_ppm=values["long_output_multiplier_ppm"],
-                    raw_json=None,
+                    **manual,
                 ))
-
-            next_rules = list(session.scalars(
-                select(ModelPriceRule)
-                .where(ModelPriceRule.pricing_version_id == version.id)
-                .order_by(ModelPriceRule.model)
-            ))
-            cycles, changed_models, _carried = self._activate_pricing_version_for_open_cycles(
+            session.add_all(next_rules)
+            changed_models = self._changed_price_models(source_rules, next_rules)
+            cycles = self._activate_pricing_version_for_open_cycles(
                 session,
                 previous_version_id=active.id,
                 version_id=version.id,
-                previous_rules=source_rules,
-                next_rules=next_rules,
+                models=[rule.model for rule in next_rules],
+                changed_models=changed_models,
             )
-            cycle_names = [cycle.name for cycle in cycles]
             session.add(AuditLog(
                 operator_type=operator_type,
                 operator_id=operator_id,
@@ -1346,13 +1097,12 @@ class BillingService:
                 reason=reason,
                 created_at_ms=created,
             ))
-            version_id = version.id
         return {
-            "version_id": version_id,
+            "version_id": version.id,
             "name": candidate_name,
             "source": "manual adjustment",
             "model": model,
-            "cycles": cycle_names,
+            "cycles": [cycle.name for cycle in cycles],
             "changed_models": changed_models,
             "rated_events": 0,
             "rating_status": "queued",
@@ -1368,76 +1118,34 @@ class BillingService:
         reason = reason.strip()
         if not reason:
             raise BillingError("重新发布价格版本必须填写原因")
-        requested_name = (version_name or "").strip()
-        if requested_name and not re.fullmatch(r"[A-Za-z0-9._-]{1,80}", requested_name):
-            raise BillingError("价格版本名称只能包含字母、数字、点、下划线或短横线")
+        requested_name = self._requested_version_name(version_name)
 
         with self._db_write_lock(), self.db.session() as session:
-            active = session.scalar(
-                select(PricingVersion)
-                .where(PricingVersion.status == "active")
-                .order_by(PricingVersion.id.desc())
-            )
+            active, source_rules = self._active_version_rules(session)
             if active is None:
                 raise BillingError("没有 active 价格版本")
-            source_rules = list(session.scalars(
-                select(ModelPriceRule)
-                .where(ModelPriceRule.pricing_version_id == active.id)
-                .order_by(ModelPriceRule.model)
-            ))
             if not source_rules:
                 raise BillingError("active 价格版本没有模型规则")
-
-            base_name = requested_name or f"reprice-{datetime.now(ZoneInfo(self.settings.timezone)):%Y%m%d-%H%M%S}"
-            candidate_name = base_name
-            suffix = 2
-            while session.scalar(select(PricingVersion).where(PricingVersion.name == candidate_name)) is not None:
-                if requested_name:
-                    raise BillingError("价格版本名称已存在")
-                candidate_name = f"{base_name}-{suffix}"
-                suffix += 1
-
+            candidate_name = self._unique_version_name(session, requested_name, "reprice")
             created = now_ms()
-            for item in session.scalars(select(PricingVersion).where(PricingVersion.status == "active")):
-                item.status = "retired"
-            version = PricingVersion(
-                name=candidate_name,
-                status="active",
-                source="active pricing republish",
-                created_at_ms=created,
-                activated_at_ms=created,
-            )
-            session.add(version)
-            session.flush()
-            rule_fields = (
-                "input_nano_per_token", "output_nano_per_token",
-                "cache_read_nano_per_token", "cache_creation_nano_per_token",
-                "input_configured", "output_configured", "cache_read_configured", "cache_creation_configured",
-                "priority_input_nano_per_token", "priority_output_nano_per_token",
-                "priority_cache_read_nano_per_token", "priority_cache_creation_nano_per_token",
-                "flex_input_nano_per_token", "flex_output_nano_per_token",
-                "flex_cache_read_nano_per_token", "flex_cache_creation_nano_per_token",
-                "long_threshold_tokens", "long_input_multiplier_ppm", "long_output_multiplier_ppm", "context_tiers_json", "raw_json",
-            )
-            for source_rule in source_rules:
-                session.add(ModelPriceRule(
+            version = self._create_active_version(session, candidate_name, "active pricing republish", created)
+            session.add_all(
+                ModelPriceRule(
                     pricing_version_id=version.id,
                     model=source_rule.model,
-                    **{field: getattr(source_rule, field) for field in rule_fields},
-                ))
-
-            next_rules = list(session.scalars(
-                select(ModelPriceRule)
-                .where(ModelPriceRule.pricing_version_id == version.id)
-                .order_by(ModelPriceRule.model)
-            ))
-            cycles, changed_models, _carried = self._activate_pricing_version_for_open_cycles(
+                    **{field: getattr(source_rule, field) for field in PRICE_RULE_FIELDS},
+                )
+                for source_rule in source_rules
+            )
+            # Rules are identical copies, so no model changed and open cycles carry every rated event forward.
+            cycles = self._activate_pricing_version_for_open_cycles(
                 session,
                 previous_version_id=active.id,
                 version_id=version.id,
-                previous_rules=source_rules,
-                next_rules=next_rules,
+                models=[rule.model for rule in source_rules],
+                changed_models=[],
             )
+            cycle_names = [cycle.name for cycle in cycles]
             session.add(AuditLog(
                 operator_type=operator_type,
                 operator_id=operator_id,
@@ -1447,8 +1155,8 @@ class BillingService:
                 after_json=json.dumps({
                     "version_id": version.id,
                     "name": candidate_name,
-                    "cycles": [cycle.name for cycle in cycles],
-                    "changed_models": changed_models,
+                    "cycles": cycle_names,
+                    "changed_models": [],
                 }),
                 reason=reason,
                 created_at_ms=created,
@@ -1458,8 +1166,8 @@ class BillingService:
                 "name": candidate_name,
                 "source": "active pricing republish",
                 "previous_version_id": active.id,
-                "cycles": [cycle.name for cycle in cycles],
-                "changed_models": changed_models,
+                "cycles": cycle_names,
+                "changed_models": [],
                 "rated_events": 0,
                 "rating_status": "queued",
             }
@@ -1470,58 +1178,59 @@ class BillingService:
             raise BillingError("no active pricing version")
         return version.id
 
-    def _owner_at(self, session: Any, key_hash: str | None, occurred_at_ms: int) -> int | None:
-        if not key_hash:
-            return None
-        key = session.scalar(select(APIKey).where(APIKey.cpamp_hash == key_hash))
-        if key is None:
-            return None
-        period = session.scalar(
-            select(KeyOwnershipPeriod).where(
-                KeyOwnershipPeriod.api_key_id == key.id,
-                KeyOwnershipPeriod.valid_from_ms <= occurred_at_ms,
-                or_(KeyOwnershipPeriod.valid_to_ms.is_(None), KeyOwnershipPeriod.valid_to_ms > occurred_at_ms),
-            ).order_by(KeyOwnershipPeriod.valid_from_ms.desc())
-        )
-        return period.telegram_user_id if period else None
+    @staticmethod
+    def _ownership_periods(session: Any, key_hashes: set[str]) -> dict[str, list[tuple[int, int | None, int]]]:
+        periods: dict[str, list[tuple[int, int | None, int]]] = defaultdict(list)
+        if not key_hashes:
+            return periods
+        for key_hash, valid_from, valid_to, user_id in session.execute(
+            select(APIKey.cpamp_hash, KeyOwnershipPeriod.valid_from_ms, KeyOwnershipPeriod.valid_to_ms,
+                   KeyOwnershipPeriod.telegram_user_id)
+            .join(KeyOwnershipPeriod, KeyOwnershipPeriod.api_key_id == APIKey.id)
+            .where(APIKey.cpamp_hash.in_(key_hashes))
+            .order_by(KeyOwnershipPeriod.valid_from_ms.desc(), KeyOwnershipPeriod.valid_to_ms.desc(), KeyOwnershipPeriod.id.desc())
+        ):
+            periods[key_hash].append((valid_from, valid_to, user_id))
+        return periods
 
-    def _pool_for(self, session: Any, event: RawUsageEvent) -> int | None:
-        rules = session.scalars(select(PoolAssignmentRule).where(PoolAssignmentRule.active.is_(True)).order_by(PoolAssignmentRule.priority)).all()
-        for rule in rules:
-            if rule.auth_index_pattern and not re.search(rule.auth_index_pattern, event.auth_index or ""):
+    @staticmethod
+    def _owner_at(periods: dict[str, list[tuple[int, int | None, int]]], key_hash: str | None, occurred_at_ms: int) -> int | None:
+        # Latest period that started at or before the event and had not ended yet.
+        return next((
+            user_id for valid_from, valid_to, user_id in periods.get(key_hash or "", ())
+            if valid_from <= occurred_at_ms and (valid_to is None or valid_to > occurred_at_ms)
+        ), None)
+
+    @staticmethod
+    def _pool_rules(session: Any) -> list[tuple[int, re.Pattern[str] | None, re.Pattern[str] | None]]:
+        return [
+            (rule.pool_id, re.compile(rule.auth_index_pattern) if rule.auth_index_pattern else None,
+             re.compile(rule.model_pattern) if rule.model_pattern else None)
+            for rule in session.scalars(select(PoolAssignmentRule).where(PoolAssignmentRule.active.is_(True)).order_by(PoolAssignmentRule.priority))
+        ]
+
+    @staticmethod
+    def _pool_for(rules: list[tuple[int, re.Pattern[str] | None, re.Pattern[str] | None]], event: RawUsageEvent) -> int | None:
+        for pool_id, auth_pattern, model_pattern in rules:
+            if auth_pattern and not auth_pattern.search(event.auth_index or ""):
                 continue
-            if rule.model_pattern and not re.search(rule.model_pattern, event.resolved_model or event.model):
+            if model_pattern and not model_pattern.search(event.resolved_model or event.model):
                 continue
-            return rule.pool_id
+            return pool_id
         return None
 
     @staticmethod
-    def _compatible_cached_token_values(
-        cached_tokens: Any,
-        cache_tokens: Any,
-        cache_read_tokens: Any,
-        cache_creation_tokens: Any,
-    ) -> int:
-        cached = max(int(cached_tokens or 0), int(cache_tokens or 0))
-        fine_grained = max(int(cache_read_tokens or 0), 0) + max(int(cache_creation_tokens or 0), 0)
-        return max(cached - fine_grained, 0)
-
-    @classmethod
-    def _compatible_cached_tokens(cls, event: RawUsageEvent) -> int:
-        return cls._compatible_cached_token_values(
-            event.cached_tokens,
-            event.cache_tokens,
-            event.cache_read_tokens,
-            event.cache_creation_tokens,
-        )
+    def _compatible_cached_tokens(event: RawUsageEvent) -> int:
+        cached = max(event.cached_tokens, event.cache_tokens)
+        return max(cached - event.cache_read_tokens - event.cache_creation_tokens, 0)
 
     @classmethod
     def _effective_cache_read_tokens(cls, event: RawUsageEvent) -> int:
-        return cls._compatible_cached_tokens(event) + max(int(event.cache_read_tokens or 0), 0)
+        return cls._compatible_cached_tokens(event) + event.cache_read_tokens
 
     @staticmethod
     def _normalize_service_tier(value: str | None) -> str:
-        return str(value or "").strip().lower()
+        return (value or "").strip().lower()
 
     @classmethod
     def _billing_service_tier(cls, event: RawUsageEvent) -> str:
@@ -1553,7 +1262,7 @@ class BillingService:
     def _effective_service_tier_expression(cls) -> Any:
         return func.coalesce(RatedEvent.service_tier, cls._raw_billing_service_tier_expression())
 
-    def _rate_event(self, behavior_model: str, price_model: str, rule: ModelPriceRule,
+    def _rate_event(self, behavior_model: str, price_model: str, rule: ModelPriceRule, context_prices: list[dict[str, Any]],
                     event: RawUsageEvent, tier: str) -> tuple[int, bool, dict[str, Any]]:
         input_rate = rule.input_nano_per_token
         output_rate = rule.output_nano_per_token
@@ -1567,11 +1276,12 @@ class BillingService:
         elif tier == "flex":
             input_rate = rule.flex_input_nano_per_token if rule.flex_input_nano_per_token is not None else input_rate
             output_rate = rule.flex_output_nano_per_token if rule.flex_output_nano_per_token is not None else output_rate
-
             cache_read_rate = rule.flex_cache_read_nano_per_token if rule.flex_cache_read_nano_per_token is not None else cache_read_rate
             cache_creation_rate = rule.flex_cache_creation_nano_per_token if rule.flex_cache_creation_nano_per_token is not None else cache_creation_rate
 
-        context_price = select_context_price(rule, max(int(event.input_tokens or 0), 0), tier)
+        # Token columns are non-negative integers, enforced when importing from CPAMP.
+        input_tokens = event.input_tokens
+        context_price = select_context_price(rule, input_tokens, tier, context_prices)
         long_context = context_price is not None
         if context_price is not None:
             input_rate = context_price["input"]
@@ -1580,10 +1290,9 @@ class BillingService:
             cache_creation_rate = context_price["cache_creation"]
 
         compatible_cached = self._compatible_cached_tokens(event)
-        cache_read = max(int(event.cache_read_tokens or 0), 0)
-        cache_creation = max(int(event.cache_creation_tokens or 0), 0)
-        input_tokens = max(int(event.input_tokens or 0), 0)
-        output_tokens = max(int(event.output_tokens or 0), 0)
+        cache_read = event.cache_read_tokens
+        cache_creation = event.cache_creation_tokens
+        output_tokens = event.output_tokens
         read_tokens = compatible_cached + cache_read
         uncached = max(input_tokens - read_tokens - cache_creation, 0)
         cost = (
@@ -1614,6 +1323,7 @@ class BillingService:
     def _rate_events_locked(self, limit: int = 500, version_id: int | None = None,
                             start_ms: int | None = None, end_ms: int | None = None) -> int:
         rated = 0
+        rated_through: int | None = None
         with self.db.session() as session:
             selected_version_id = version_id or self._active_pricing_id(session)
             rerate_scope = session.get(PricingRerateScope, selected_version_id)
@@ -1623,11 +1333,13 @@ class BillingService:
                     select(ModelPriceRule).where(ModelPriceRule.pricing_version_id == selected_version_id)
                 )
             }
-            if not prices:
+            price_models = [model for model in prices if model]
+            if not price_models:
                 return 0
-            price_models = list(prices)
+            # Raw ids only grow and are written under the same lock, so already-covered history is skipped.
             filters = [
                 RatedEvent.id.is_(None),
+                RawUsageEvent.id > self._rated_through.get(selected_version_id, 0),
                 or_(
                     RawUsageEvent.resolved_model.in_(price_models),
                     RawUsageEvent.requested_model.in_(price_models),
@@ -1639,41 +1351,18 @@ class BillingService:
             if end_ms is not None:
                 filters.append(RawUsageEvent.occurred_at_ms < end_ms)
             if rerate_scope is not None:
-                try:
-                    ranges = json.loads(rerate_scope.ranges_json)
-                    range_filters = [
-                        and_(
-                            RawUsageEvent.occurred_at_ms >= int(start),
-                            RawUsageEvent.occurred_at_ms < int(end),
-                        )
-                        for start, end in ranges
-                    ]
-                except (TypeError, ValueError, json.JSONDecodeError) as exc:
-                    raise BillingError(
-                        f"价格版本 {selected_version_id} 的重算范围无效"
-                    ) from exc
-                historical = or_(*range_filters) if range_filters else literal(False)
+                ranges = json.loads(rerate_scope.ranges_json)
+                historical = or_(*(
+                    and_(RawUsageEvent.occurred_at_ms >= start, RawUsageEvent.occurred_at_ms < end)
+                    for start, end in ranges
+                )) if ranges else literal(False)
                 if rerate_scope.models_json is not None:
-                    try:
-                        changed_models = json.loads(rerate_scope.models_json)
-                        if not isinstance(changed_models, list):
-                            raise TypeError("models_json must be a list")
-                        changed_models = [str(model) for model in changed_models]
-                    except (TypeError, ValueError, json.JSONDecodeError) as exc:
-                        raise BillingError(
-                            f"价格版本 {selected_version_id} 的重算模型范围无效"
-                        ) from exc
-                    if changed_models:
-                        historical = and_(
-                            historical,
-                            or_(
-                                RawUsageEvent.resolved_model.in_(changed_models),
-                                RawUsageEvent.requested_model.in_(changed_models),
-                                RawUsageEvent.model.in_(changed_models),
-                            ),
-                        )
-                    else:
-                        historical = literal(False)
+                    changed_models = json.loads(rerate_scope.models_json)
+                    historical = and_(historical, or_(
+                        RawUsageEvent.resolved_model.in_(changed_models),
+                        RawUsageEvent.requested_model.in_(changed_models),
+                        RawUsageEvent.model.in_(changed_models),
+                    )) if changed_models else literal(False)
                 # The scope limits records that existed when prices changed. Rows
                 # imported later still need their first rating under the active version.
                 filters.append(or_(
@@ -1686,31 +1375,44 @@ class BillingService:
                     and_(RatedEvent.raw_event_id == RawUsageEvent.id, RatedEvent.pricing_version_id == selected_version_id),
                 ).where(*filters).order_by(RawUsageEvent.id).limit(limit)
             ).all()
-            for event in events:
-                candidates = []
-                for candidate in (event.resolved_model, event.requested_model, event.model):
-                    if candidate and candidate not in candidates:
-                        candidates.append(candidate)
-                behavior_model = candidates[0] if candidates else event.model
-                price_model = next((candidate for candidate in candidates if candidate in prices), None)
-                rule = prices.get(price_model) if price_model else None
-                if rule is None:
-                    continue
-                tier = self._billing_service_tier(event)
-                cost, long_context, detail = self._rate_event(behavior_model, price_model, rule, event, tier)
-                rated_event = RatedEvent(
-                    raw_event_id=event.id, pricing_version_id=selected_version_id, pool_id=self._pool_for(session, event),
-                    telegram_user_id=self._owner_at(session, event.api_key_hash, event.occurred_at_ms),
-                    occurred_at_ms=event.occurred_at_ms, rated_weight_nano_usd=cost,
-                    long_context_applied=long_context, service_tier=tier, calculation_json=json.dumps(detail, separators=(",", ":")), rated_at_ms=now_ms(),
-                )
-                try:
-                    with session.begin_nested():
-                        session.add(rated_event)
-                        session.flush()
-                except IntegrityError:
-                    continue
-                rated += 1
+            if start_ms is None and end_ms is None and limit > 0:
+                # Every eligible event up to this id is now rated: the batch is ordered by id.
+                rated_through = events[-1].id if len(events) >= limit else session.scalar(select(func.max(RawUsageEvent.id))) or 0
+            if events:
+                pool_rules = self._pool_rules(session)
+                ownership = self._ownership_periods(session, {event.api_key_hash for event in events if event.api_key_hash})
+                context_prices: dict[str, list[dict[str, Any]]] = {}
+                rows = []
+                for event in events:
+                    candidates = list(dict.fromkeys(
+                        candidate for candidate in (event.resolved_model, event.requested_model, event.model) if candidate
+                    ))
+                    price_model = next(candidate for candidate in candidates if candidate in prices)
+                    rule = prices[price_model]
+                    if price_model not in context_prices:
+                        context_prices[price_model] = context_prices_for_rule(rule)
+                    tier = self._billing_service_tier(event)
+                    cost, long_context, detail = self._rate_event(
+                        candidates[0], price_model, rule, context_prices[price_model], event, tier,
+                    )
+                    rows.append({
+                        "raw_event_id": event.id,
+                        "pricing_version_id": selected_version_id,
+                        "pool_id": self._pool_for(pool_rules, event),
+                        "telegram_user_id": self._owner_at(ownership, event.api_key_hash, event.occurred_at_ms),
+                        "occurred_at_ms": event.occurred_at_ms,
+                        "rated_weight_nano_usd": cost,
+                        "long_context_applied": long_context,
+                        "service_tier": tier,
+                        "calculation_json": json.dumps(detail, separators=(",", ":")),
+                        "rated_at_ms": now_ms(),
+                    })
+                rated = session.execute(
+                    sqlite_insert(RatedEvent.__table__).on_conflict_do_nothing(index_elements=["raw_event_id", "pricing_version_id"]),
+                    rows,
+                ).rowcount
+        if rated_through is not None:
+            self._rated_through[selected_version_id] = max(self._rated_through.get(selected_version_id, 0), rated_through)
         return rated
 
     def upsert_user(self, user: dict[str, Any], registered: bool = False) -> TelegramUser:

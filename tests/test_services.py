@@ -2431,3 +2431,168 @@ def test_upstream_groups_bill_independently_then_sum(service, settings, monkeypa
     with service.db.session() as session:
         snapshots = list(session.scalars(select(CycleGroup)))
     assert {item.group_name for item in snapshots} == {"default", "grok"}
+
+
+def _rated_by_hash(service, version_id: int) -> dict[str, RatedEvent]:
+    with service.db.session() as session:
+        return {
+            event_hash: rated
+            for event_hash, rated in session.execute(
+                select(RawUsageEvent.event_hash, RatedEvent)
+                .join(RatedEvent, RatedEvent.raw_event_id == RawUsageEvent.id)
+                .where(RatedEvent.pricing_version_id == version_id)
+            )
+        }
+
+
+def test_batched_rating_resolves_owner_and_pool_per_event(service, settings) -> None:
+    from cpa_billing.models import PoolAssignmentRule
+
+    now = 1
+    with service.db.session() as session:
+        for user_id in (2, 3):
+            session.add(TelegramUser(telegram_user_id=user_id, username=f"u{user_id}", registered_at_ms=now, last_seen_at_ms=now))
+        session.flush()
+        key = APIKey(cpamp_hash=cpamp_key_hash("moved"), login_fingerprint="moved", masked_value="masked", status="active",
+                     current_owner_id=3, created_at_ms=now)
+        session.add(key)
+        session.flush()
+        session.add(KeyOwnershipPeriod(api_key_id=key.id, telegram_user_id=2, valid_from_ms=0, valid_to_ms=1500, source="test", created_at_ms=now))
+        session.add(KeyOwnershipPeriod(api_key_id=key.id, telegram_user_id=3, valid_from_ms=1500, source="test", created_at_ms=now))
+        pool = ResourcePool(name="special", active=True, created_at_ms=now)
+        session.add(pool)
+        session.flush()
+        special_pool_id = pool.id
+        default_pool_id = session.scalar(select(ResourcePool.id).where(ResourcePool.name == "default-cpa"))
+        session.add(PoolAssignmentRule(pool_id=pool.id, priority=1, auth_index_pattern="^special", active=True))
+    insert_event(settings, cpamp_key_hash("moved"), 1000, event_hash="before-transfer", auth_index="special-1")
+    insert_event(settings, cpamp_key_hash("moved"), 1500, event_hash="at-transfer")
+    insert_event(settings, cpamp_key_hash("moved"), 2000, event_hash="after-transfer")
+    insert_event(settings, cpamp_key_hash("unknown"), 1000, event_hash="unknown-key", auth_index="special-2")
+    insert_event(settings, None, 1000, event_hash="no-key")
+    service.sync_cpamp()
+    assert service.rate_events() == 5
+    with service.db.session() as session:
+        active_id = service._active_pricing_id(session)
+    rated = _rated_by_hash(service, active_id)
+    assert {name: row.telegram_user_id for name, row in rated.items()} == {
+        "before-transfer": 2, "at-transfer": 3, "after-transfer": 3, "unknown-key": None, "no-key": None,
+    }
+    assert rated["before-transfer"].pool_id == special_pool_id
+    assert rated["unknown-key"].pool_id == special_pool_id
+    assert rated["after-transfer"].pool_id == default_pool_id
+
+
+def test_rating_cursor_skips_rated_history_without_missing_events(service, settings) -> None:
+    for index in range(5):
+        insert_event(settings, "key", 1000 + index, event_hash=f"cursor-{index}")
+    insert_event(settings, "key", 1005, event_hash="unpriced", model="unknown-model")
+    service.sync_cpamp()
+    assert [service.rate_events(limit=2) for _ in range(4)] == [2, 2, 1, 0]
+    with service.db.session() as session:
+        active_id = service._active_pricing_id(session)
+        max_raw_id = session.scalar(select(func.max(RawUsageEvent.id)))
+    assert service._rated_through[active_id] == max_raw_id
+
+    insert_event(settings, "key", 2000, event_hash="cursor-new")
+    service.sync_cpamp()
+    assert service.rate_events(limit=2) == 1
+    assert set(_rated_by_hash(service, active_id)) == {f"cursor-{index}" for index in range(5)} | {"cursor-new"}
+    # A service without a cursor rescans from the start and finds nothing left to rate.
+    assert BillingService(settings, Database(settings.database_path)).rate_events() == 0
+
+
+def test_rating_cursor_covers_scoped_rerate_and_new_events(service, settings) -> None:
+    create_owner(service, "key", 2, 0)
+    for index in range(3):
+        insert_event(settings, cpamp_key_hash("key"), 1000 + index, event_hash=f"changed-{index}", model="gpt-test")
+        insert_event(settings, cpamp_key_hash("key"), 1100 + index, event_hash=f"unchanged-{index}", model="gpt-5.6-luna")
+    insert_event(settings, cpamp_key_hash("key"), 90_000_000, event_hash="outside-cycle", model="gpt-test")
+    service.sync_cpamp()
+    assert service.rate_events() == 7
+    service.create_cycle("cursor-rerate", "1970-01-01T08:00", "1970-01-02T08:00", 1000)
+    values = {
+        "input_nano_per_token": 2_000, "output_nano_per_token": 12_000,
+        "cache_read_nano_per_token": 200, "cache_creation_nano_per_token": 2_500,
+        "long_threshold_tokens": None, "long_input_multiplier_ppm": 1_000_000, "long_output_multiplier_ppm": 1_000_000,
+    }
+    result = service.update_pricing_rule("gpt-test", values, "cursor-prices", "cursor test", "test", "test")
+    insert_event(settings, cpamp_key_hash("key"), 2000, event_hash="after-price-change", model="gpt-test")
+    service.sync_cpamp()
+
+    batches = []
+    while batch := service.rate_events(limit=1):
+        batches.append(batch)
+    assert batches == [1, 1, 1, 1]
+    rated = _rated_by_hash(service, result["version_id"])
+    assert set(rated) == {f"changed-{i}" for i in range(3)} | {f"unchanged-{i}" for i in range(3)} | {"after-price-change"}
+    assert all(json.loads(rated[f"changed-{i}"].calculation_json)["rates"][0] == 2_000 for i in range(3))
+    assert BillingService(settings, Database(settings.database_path)).rate_events() == 0
+
+
+def test_cpamp_import_dead_letters_bad_rows_and_clamps_tokens(service, settings) -> None:
+    insert_event(settings, "key", 1000, event_hash="good-1", input_tokens=-5, cache_read_tokens=-3)
+    insert_event(settings, "key", 1001, event_hash="bad")
+    insert_event(settings, "key", 1002, event_hash="good-2")
+    db = sqlite3.connect(settings.cpamp_database_path)
+    db.execute("update usage_events set timestamp_ms=NULL where event_hash='bad'")
+    db.commit(); db.close()
+    assert service.sync_cpamp() == 2
+    assert service.sync_cpamp() == 0
+    with service.db.session() as session:
+        checkpoint = session.scalar(select(SyncCheckpoint))
+        assert checkpoint.last_event_id == 3
+        assert checkpoint.last_event_at_ms == 1002
+        assert session.scalar(select(DeadLetter.source_event_id)) == 2
+        good = session.scalar(select(RawUsageEvent).where(RawUsageEvent.event_hash == "good-1"))
+        assert (good.input_tokens, good.cache_read_tokens) == (0, 0)
+
+
+def test_service_tier_import_matches_backfill_and_backfills_finish(service, settings, monkeypatch) -> None:
+    insert_event(settings, "key", 1000, event_hash="before-columns")
+    assert service.sync_cpamp() == 1
+    with service.db.session() as session:
+        before = session.scalar(select(RawUsageEvent))
+        assert (before.request_service_tier, before.response_service_tier) == (None, None)
+
+    db = sqlite3.connect(settings.cpamp_database_path)
+    db.execute("alter table usage_events add column request_service_tier text")
+    db.execute("alter table usage_events add column response_service_tier text")
+    db.execute("update usage_events set request_service_tier=' Priority ' where event_hash='before-columns'")
+    db.commit(); db.close()
+    insert_event(settings, "key", 2000, event_hash="after-columns")
+
+    backfilled = []
+    original = service._backfill_cpamp_column
+    monkeypatch.setattr(service, "_backfill_cpamp_column", lambda *args: backfilled.append(original(*args)) or backfilled[-1])
+    assert service.sync_cpamp() == 1
+    assert sum(backfilled) == 2
+    with service.db.session() as session:
+        tiers = {
+            event.event_hash: (event.request_service_tier, event.response_service_tier)
+            for event in session.scalars(select(RawUsageEvent))
+        }
+    assert tiers == {"before-columns": ("Priority", ""), "after-columns": ("", "")}
+    backfilled.clear()
+    assert service.sync_cpamp() == 0
+    assert backfilled == [0, 0, 0]
+
+
+def test_db_write_lock_is_reentrant_and_exclusive(service) -> None:
+    entered = threading.Event()
+
+    def other_thread() -> None:
+        with service._db_write_lock():
+            entered.set()
+
+    with service._db_write_lock():
+        with service._db_write_lock():
+            pass
+        thread = threading.Thread(target=other_thread)
+        thread.start()
+        assert not entered.wait(0.2)
+    assert entered.wait(2)
+    thread.join()
+    with service._db_write_lock():
+        assert service._db_write_locked
+    assert not service._db_write_locked

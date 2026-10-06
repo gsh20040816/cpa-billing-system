@@ -2,9 +2,8 @@ from __future__ import annotations
 
 import sqlite3
 import time
-from contextlib import contextmanager
+from contextlib import AbstractContextManager
 from pathlib import Path
-from typing import Iterator
 
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import Session, sessionmaker
@@ -17,11 +16,14 @@ def now_ms() -> int:
 
 
 class Database:
-    def __init__(self, path: Path, *, pool_size: int = 5, max_overflow: int = 10, pool_timeout: float = 30) -> None:
+    # Overflow covers the web threadpool (anyio defaults to 40 threads) plus asyncio.to_thread workers;
+    # SQLite connections are cheap and WAL readers run concurrently while writers wait on the busy timeout.
+    def __init__(self, path: Path, *, pool_size: int = 10, max_overflow: int = 50, pool_timeout: float = 30) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         self.path = path
         self.engine = create_engine(
             f"sqlite:///{path}",
+            # sqlite3's timeout is the busy timeout (15 s).
             connect_args={"check_same_thread": False, "timeout": 15},
             pool_size=pool_size, max_overflow=max_overflow, pool_timeout=pool_timeout,
         )
@@ -31,7 +33,6 @@ class Database:
             cursor = connection.cursor()
             cursor.execute("pragma journal_mode=wal")
             cursor.execute("pragma foreign_keys=on")
-            cursor.execute("pragma busy_timeout=15000")
             cursor.execute("pragma synchronous=normal")
             # Large GROUP BY / ORDER BY intermediates can spill to disk.
             cursor.execute("pragma temp_store=file")
@@ -42,15 +43,7 @@ class Database:
     def initialize(self) -> None:
         Base.metadata.create_all(self.engine)
 
-    @contextmanager
-    def session(self) -> Iterator[Session]:
-        session = self.sessions()
-        try:
-            yield session
-            session.commit()
-        except Exception:
-            session.rollback()
-            raise
-        finally:
-            session.close()
+    def session(self) -> AbstractContextManager[Session]:
+        # Commits on success, rolls back on error, always closes.
+        return self.sessions.begin()
 

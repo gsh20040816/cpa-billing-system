@@ -8,20 +8,16 @@ import re
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
 import httpx
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import psycopg
 
 from .config import Settings
-from .database import Database
-from .domain import NANO_USD, format_cents, format_usd_nano, largest_remainder, parse_tiers, tiered_weight
+from .database import Database, now_ms
+from .domain import NANO_USD, decimal_units, format_cents, format_usd_nano, largest_remainder, parse_tiers, tiered_weight
 from .services import BillingError, BillingService, DEFAULT_TIERS
 
 
@@ -35,6 +31,40 @@ COMMAND_MESSAGE_LIMIT = 3900
 MEMBERSHIP_CACHE_TTL_MS = 5 * 60_000
 UPDATE_QUEUE_SIZE = 32
 HTML_TAG = re.compile(r"<(/?)([A-Za-z][A-Za-z0-9-]*)(?:\s[^>]*)?>")
+COMMON_COMMANDS = [
+    {"command": "start", "description": "打开帮助"},
+    {"command": "help", "description": "查看帮助"},
+    {"command": "usage", "description": "查看 CPA 全局用量"},
+    {"command": "models", "description": "查看模型用量"},
+    {"command": "ranking", "description": "查看全局排行"},
+    {"command": "chart", "description": "查看最近用量图"},
+    {"command": "billing", "description": "查看当前计费周期"},
+    {"command": "sub2billing", "description": "查看 Sub2API 当前周期"},
+    {"command": "accounts", "description": "查看账号用量"},
+    {"command": "id", "description": "显示 Telegram ID"},
+]
+PRIVATE_COMMANDS = COMMON_COMMANDS + [
+    {"command": "register", "description": "注册或新增 CPA API Key"},
+    {"command": "mykey", "description": "查看已绑定 Key"},
+    {"command": "resetkey", "description": "重置指定 API Key"},
+    {"command": "revoke", "description": "吊销指定 API Key"},
+    {"command": "confirm", "description": "确认待处理操作"},
+    {"command": "cancel", "description": "取消当前操作"},
+]
+ADMIN_COMMANDS = PRIVATE_COMMANDS + [
+    {"command": "billconfig", "description": "创建计费周期"},
+    {"command": "billcycle", "description": "修改计费周期时间"},
+    {"command": "billcycles", "description": "查看计费周期配置"},
+    {"command": "stats", "description": "查看用户统计"},
+    {"command": "users", "description": "查看用户列表"},
+    {"command": "allowuser", "description": "手动授权用户"},
+    {"command": "revokeuser", "description": "吊销用户 Key"},
+    {"command": "checkuser", "description": "检查用户资格"},
+    {"command": "namekey", "description": "命名未绑定 Key"},
+    {"command": "allowchat", "description": "添加可查询群组"},
+    {"command": "delchat", "description": "删除可查询群组"},
+    {"command": "listchats", "description": "查看可查询群组"},
+]
 
 
 def esc(value: Any) -> str:
@@ -147,12 +177,9 @@ def parse_user_id(args: str) -> int | None:
 
 def parse_fixed_cost_cents(value: str) -> int | None:
     try:
-        amount = Decimal(value.strip())
-    except (InvalidOperation, ValueError):
+        return decimal_units(value, 2)
+    except ValueError:
         return None
-    if not amount.is_finite() or amount < 0:
-        return None
-    return int((amount * 100).to_integral_value(rounding=ROUND_HALF_UP))
 
 
 class TelegramAPI:
@@ -194,6 +221,7 @@ class BillingBot:
         self.settings, self.service = settings, service
         self.tg = TelegramAPI(settings.telegram_token)
         self.bot_username: str | None = None
+        self.deferred_admin_menus: set[int] = set()
 
     async def eligible(self, user: dict[str, Any]) -> bool:
         user_id = int(user["id"])
@@ -201,17 +229,19 @@ class BillingBot:
             return True
         if await asyncio.to_thread(self.service.user_is_eligible_cached, user_id, MEMBERSHIP_CACHE_TTL_MS):
             return True
-        for group_id in self.settings.allowed_group_ids:
+
+        async def check(group_id: int) -> bool:
             try:
                 member = await self.tg.member(group_id, user_id)
                 status = str(member.get("status", ""))
                 legal = status in MEMBER or (status == "restricted" and bool(member.get("is_member")))
                 await asyncio.to_thread(self.service.set_membership, user, group_id, status, legal)
-                if legal:
-                    return True
+                return legal
             except Exception:
                 LOG.exception("membership check failed user=%s group=%s", user_id, group_id)
-        return False
+                return False
+
+        return any(await asyncio.gather(*(check(group_id) for group_id in self.settings.allowed_group_ids)))
 
     def is_admin(self, user: dict[str, Any]) -> bool:
         return int(user.get("id", 0)) in self.settings.admin_user_ids
@@ -242,13 +272,19 @@ class BillingBot:
         command_name, mention_separator, mention = command_token.partition("@")
         if mention_separator and (not self.bot_username or mention.casefold() != self.bot_username.casefold()):
             return ""
-        await asyncio.to_thread(self.service.upsert_user, user)
         command = command_name.lower()
         private = chat.get("type") == "private"
         if command in {"/start", "/help"}:
             return self.help(self.is_admin(user))
         if command == "/id":
             return f"chat_id: <code>{chat.get('id')}</code>\nuser_id: <code>{user.get('id')}</code>\ntype: <code>{esc(chat.get('type'))}</code>"
+        if command in {"/createuser", "/bindemail"}:
+            return "CPA 版不再按邮箱创建/绑定用户。请使用 /register 自助注册并绑定 Telegram 用户。"
+        if command == "/image":
+            return "CPA 版暂未迁移旧 Sub2API 的 /image 生图入口。当前请直接使用你的 CPA API Key 调用模型。"
+        if command == "/cancel":
+            return "没有正在进行的交互操作。"
+        await asyncio.to_thread(self.service.upsert_user, user)
         if command in {"/register", "/mykey", "/resetkey", "/revoke", "/confirm"} and not private:
             return "这个命令只能私聊 bot 使用，避免 API Key 发到群里。"
         if command == "/register":
@@ -282,12 +318,6 @@ class BillingBot:
             if raw:
                 return f"已重置指定 API Key：\n\n<code>{esc(raw)}</code>\n\n请立即保存，系统不会再次显示完整 Key。\n{API_BASE_URL_HINT}"
             return "已吊销指定 API Key。"
-        if command in {"/createuser", "/bindemail"}:
-            return "CPA 版不再按邮箱创建/绑定用户。请使用 /register 自助注册并绑定 Telegram 用户。"
-        if command == "/image":
-            return "CPA 版暂未迁移旧 Sub2API 的 /image 生图入口。当前请直接使用你的 CPA API Key 调用模型。"
-        if command == "/cancel":
-            return "没有正在进行的交互操作。"
         if command in {"/usage", "/models", "/ranking", "/chart", "/accounts", "/billing", "/sub2billing"}:
             chat_allowed = await asyncio.to_thread(self.service.chat_is_allowed, int(chat.get("id", 0)))
             if not (chat_allowed or await self.eligible(user)):
@@ -302,7 +332,7 @@ class BillingBot:
                 rows = await asyncio.to_thread(self.service.model_usage, 10)
                 return "<b>模型用量 Top 10</b>\n\n" + "\n".join(f"{i}. <b>{esc(r['model'])}</b> req=<code>{r['requests']:,}</code> tokens=<code>{compact(r['tokens'])}</code> cost=<code>{r['cost']}</code>" for i, r in enumerate(rows, 1))
             if command == "/ranking":
-                recent = await asyncio.to_thread(self.service.rankings, int(datetime.now().timestamp() * 1000) - 86_400_000)
+                recent = await asyncio.to_thread(self.service.rankings, now_ms() - 86_400_000)
                 total = await asyncio.to_thread(self.service.rankings, None)
                 def section(title: str, rows: list[dict[str, Any]]) -> str:
                     return f"<b>{title}</b>\n\n" + "\n".join(f"{i}. <b>{esc(r['name'])}</b> req=<code>{r['requests']:,}</code> tokens=<code>{compact(r['tokens'])}</code> cost=<code>{r['cost']}</code> API Key=<code>{r['key_count']}</code>" for i, r in enumerate(rows, 1))
@@ -450,6 +480,8 @@ class BillingBot:
         start, end, name, cycle = selected
         if not self.settings.sub2_postgres_dsn:
             raise BillingError("SUB2API_POSTGRES_DSN is not configured")
+        import psycopg
+
         with psycopg.connect(self.settings.sub2_postgres_dsn) as connection:
             rows = connection.execute("""select u.id,coalesce(nullif(u.username,''),nullif(u.email,''),'user-'||u.id::text),
                 coalesce(sum(l.actual_cost),0) from usage_logs l join users u on u.id=l.user_id
@@ -472,6 +504,10 @@ class BillingBot:
 
     @staticmethod
     def _render_chart(labels: list[str], series: list[dict[str, Any]]) -> Path:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
         fig, ax = plt.subplots(figsize=(12, 6), dpi=130)
         handle = tempfile.NamedTemporaryFile(prefix="cpa-chart-", suffix=".png", delete=False); handle.close()
         path = Path(handle.name)
@@ -517,8 +553,8 @@ class BillingBot:
             reply = await self.dispatch(message)
             sender_id = int((message.get("from") or {}).get("id") or 0)
             command = str(message.get("text") or "").split(maxsplit=1)[0] if message.get("text") else ""
-            if sender_id in self.settings.admin_user_ids and command.split("@", 1)[0] == "/start":
-                await self.configure_commands()
+            if sender_id in self.deferred_admin_menus and command.split("@", 1)[0] == "/start":
+                await self.configure_admin_commands(sender_id)
         except BillingError as exc:
             LOG.warning("command rejected: %s", exc)
             reply = f"执行失败：<code>{esc(exc)}</code>"
@@ -533,56 +569,29 @@ class BillingBot:
             LOG.exception("reply failed")
 
     async def configure_commands(self) -> None:
-        common = [
-            {"command": "start", "description": "打开帮助"},
-            {"command": "help", "description": "查看帮助"},
-            {"command": "usage", "description": "查看 CPA 全局用量"},
-            {"command": "models", "description": "查看模型用量"},
-            {"command": "ranking", "description": "查看全局排行"},
-            {"command": "chart", "description": "查看最近用量图"},
-            {"command": "billing", "description": "查看当前计费周期"},
-            {"command": "sub2billing", "description": "查看 Sub2API 当前周期"},
-            {"command": "accounts", "description": "查看账号用量"},
-            {"command": "id", "description": "显示 Telegram ID"},
-        ]
-        private = common + [
-            {"command": "register", "description": "注册或新增 CPA API Key"},
-            {"command": "mykey", "description": "查看已绑定 Key"},
-            {"command": "resetkey", "description": "重置指定 API Key"},
-            {"command": "revoke", "description": "吊销指定 API Key"},
-            {"command": "confirm", "description": "确认待处理操作"},
-            {"command": "cancel", "description": "取消当前操作"},
-        ]
-        admin = private + [
-            {"command": "billconfig", "description": "创建计费周期"},
-            {"command": "billcycle", "description": "修改计费周期时间"},
-            {"command": "billcycles", "description": "查看计费周期配置"},
-            {"command": "stats", "description": "查看用户统计"},
-            {"command": "users", "description": "查看用户列表"},
-            {"command": "allowuser", "description": "手动授权用户"},
-            {"command": "revokeuser", "description": "吊销用户 Key"},
-            {"command": "checkuser", "description": "检查用户资格"},
-            {"command": "namekey", "description": "命名未绑定 Key"},
-            {"command": "allowchat", "description": "添加可查询群组"},
-            {"command": "delchat", "description": "删除可查询群组"},
-            {"command": "listchats", "description": "查看可查询群组"},
-        ]
-        await self.tg.call("setMyCommands", {"commands": common, "scope": {"type": "default"}})
-        await self.tg.call("setMyCommands", {"commands": private, "scope": {"type": "all_private_chats"}})
+        await self.tg.call("setMyCommands", {"commands": COMMON_COMMANDS, "scope": {"type": "default"}})
+        await self.tg.call("setMyCommands", {"commands": PRIVATE_COMMANDS, "scope": {"type": "all_private_chats"}})
         for user_id in sorted(self.settings.admin_user_ids):
+            await self.configure_admin_commands(user_id)
+
+    async def configure_admin_commands(self, user_id: int) -> None:
+        try:
+            await self.tg.call("setMyCommands", {
+                "commands": ADMIN_COMMANDS,
+                "scope": {"type": "chat", "chat_id": user_id},
+            })
+        except httpx.HTTPStatusError as exc:
             try:
-                await self.tg.call("setMyCommands", {
-                    "commands": admin,
-                    "scope": {"type": "chat", "chat_id": user_id},
-                })
-            except httpx.HTTPStatusError as exc:
-                try:
-                    description = exc.response.json().get("description", "")
-                except ValueError:
-                    description = ""
-                if exc.response.status_code != 400 or description != "Bad Request: chat not found":
-                    raise
-                LOG.warning("admin command menu deferred until first /start user=%s", user_id)
+                description = exc.response.json().get("description", "")
+            except ValueError:
+                description = ""
+            if exc.response.status_code != 400 or description != "Bad Request: chat not found":
+                raise
+            # Telegram rejects chat scopes until the admin has opened the bot; retry on their /start.
+            self.deferred_admin_menus.add(user_id)
+            LOG.warning("admin command menu deferred until first /start user=%s", user_id)
+        else:
+            self.deferred_admin_menus.discard(user_id)
 
     async def _consume_updates(self, queue: asyncio.Queue[dict[str, Any]]) -> None:
         while True:

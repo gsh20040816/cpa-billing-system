@@ -74,3 +74,25 @@ def test_subscription_outside_cycle_is_zero() -> None:
         timezone="UTC",
     )
     assert amount == 0
+
+
+def test_decimal_units_rounds_or_requires_exact_places() -> None:
+    from cpa_billing.domain import DecimalInputError, decimal_units
+
+    assert decimal_units("1.005", 2) == 101
+    assert decimal_units(" 2.5 ", 0) == 3
+    assert decimal_units("1.23", 2, exact=True) == 123
+    assert decimal_units("-1.5", 1, exact=True, minimum=None) == -15
+    for value, kwargs, kind in (
+        ("abc", {}, "format"),
+        ("", {}, "format"),
+        ("NaN", {}, "range"),
+        ("Infinity", {"minimum": None}, "range"),
+        ("-1", {}, "range"),
+        ("1001", {"maximum": 1000}, "range"),
+        ("1e30", {}, "range"),
+        ("1.234", {"exact": True}, "precision"),
+    ):
+        with pytest.raises(DecimalInputError) as raised:
+            decimal_units(value, 2, **kwargs)
+        assert raised.value.kind == kind

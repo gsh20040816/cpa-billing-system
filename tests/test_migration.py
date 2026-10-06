@@ -41,3 +41,45 @@ def test_migration_does_not_store_raw_key(service, settings, tmp_path) -> None:
         assert "secret-value" not in key.masked_value
         assert session.scalar(select(BillingCycle)).data_quality_waiver
         assert session.scalar(select(KeyOwnershipPeriod)).telegram_user_id == 2
+
+
+def test_worker_hot_path_migration_indexes_backfills_and_clamps_tokens_idempotently():
+    import importlib.util
+    from pathlib import Path
+
+    import sqlalchemy as sa
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+
+    path = Path(__file__).parents[1] / "migrations/versions/0016_worker_hot_path.py"
+    spec = importlib.util.spec_from_file_location("worker_hot_path_migration", path)
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+    tokens = migration.TOKEN_COLUMNS
+    engine = sa.create_engine("sqlite://")
+    with engine.begin() as db:
+        db.execute(sa.text(
+            "CREATE TABLE raw_usage_events (id INTEGER PRIMARY KEY, source_id INTEGER, source_event_id INTEGER, "
+            "reasoning_effort TEXT, request_service_tier TEXT, response_service_tier TEXT, "
+            + ", ".join(f"{column} INTEGER" for column in tokens) + ")"
+        ))
+        db.execute(sa.text(
+            f"INSERT INTO raw_usage_events (id, source_id, source_event_id, {', '.join(tokens)}) "
+            f"VALUES (1, 1, 1, -5, 7, -1, 0, 3, -2, 4, 9)"
+        ))
+        with Operations.context(MigrationContext.configure(db)):
+            migration.upgrade()
+            migration.upgrade()
+        row = db.execute(sa.text("SELECT * FROM raw_usage_events")).mappings().one()
+        assert [row[column] for column in tokens] == [0, 7, 0, 0, 3, 0, 4, 9]
+        indexes = {item["name"] for item in sa.inspect(db).get_indexes("raw_usage_events")}
+        assert {f"idx_raw_events_missing_{column}" for column in migration.BACKFILL_COLUMNS} <= indexes
+        plan = db.execute(sa.text(
+            "EXPLAIN QUERY PLAN SELECT id FROM raw_usage_events WHERE source_id = 1 AND reasoning_effort IS NULL "
+            "ORDER BY source_event_id LIMIT 10"
+        )).all()
+        assert "idx_raw_events_missing_reasoning_effort" in plan[0][-1]
+        with Operations.context(MigrationContext.configure(db)):
+            migration.downgrade()
+        remaining = {item["name"] for item in sa.inspect(db).get_indexes("raw_usage_events")}
+        assert not remaining & {f"idx_raw_events_missing_{column}" for column in migration.BACKFILL_COLUMNS}

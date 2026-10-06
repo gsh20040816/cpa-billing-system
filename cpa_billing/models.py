@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from sqlalchemy import BigInteger, Boolean, CheckConstraint, ForeignKey, Index, Integer, String, Text, UniqueConstraint
+from sqlalchemy import BigInteger, Boolean, CheckConstraint, ForeignKey, Index, Integer, String, Text, UniqueConstraint, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -33,6 +33,11 @@ class RawUsageEvent(Base):
         UniqueConstraint("source_id", "event_hash"),
         Index("idx_raw_events_time", "occurred_at_ms"),
         Index("idx_raw_events_key_time", "api_key_hash", "occurred_at_ms"),
+        # Partial indexes: CPAMP backfills look up rows not yet checked (migration 0016).
+        *(
+            Index(f"idx_raw_events_missing_{column}", "source_id", "source_event_id", sqlite_where=text(f"{column} IS NULL"))
+            for column in ("reasoning_effort", "request_service_tier", "response_service_tier")
+        ),
     )
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     source_id: Mapped[int] = mapped_column(ForeignKey("cpamp_sources.id"))

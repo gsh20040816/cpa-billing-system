@@ -1,13 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import time
-from collections import defaultdict, deque
+from collections import deque
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any, Literal
 
@@ -18,11 +16,13 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from starlette.datastructures import MutableHeaders
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from .config import Settings
 from .database import Database
-from .domain import NANO_USD
+from .domain import DecimalInputError, decimal_units
 from .security import constant_equal
 from .services import BillingDependencyError, BillingError, BillingService
 
@@ -32,25 +32,58 @@ FRONTEND_DIST = Path(os.getenv("BILLING_FRONTEND_DIST", str(ROOT / "frontend" / 
 USER_COOKIE = "__Host-billing_session"
 ADMIN_COOKIE = "__Host-billing_admin_session"
 LOGGER = logging.getLogger(__name__)
+SECURITY_HEADERS = {
+    "Content-Security-Policy": (
+        "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; "
+        "form-action 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; "
+        "img-src 'self' data:; script-src 'self'; connect-src 'self'"
+    ),
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "same-origin",
+    "X-Frame-Options": "DENY",
+    "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+}
+
+
+class SecurityHeadersMiddleware:
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        cache_control = "public, max-age=31536000, immutable" if scope["path"].startswith("/assets/") else "no-store"
+
+        async def send_with_headers(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                headers = MutableHeaders(scope=message)
+                for name, value in SECURITY_HEADERS.items():
+                    headers[name] = value
+                headers["Cache-Control"] = cache_control
+            await send(message)
+
+        await self.app(scope, receive, send_with_headers)
 
 
 class LoginLimiter:
     def __init__(self, maximum: int = 8, window_seconds: int = 60) -> None:
         self.maximum = maximum
         self.window_seconds = window_seconds
-        self.attempts: dict[str, deque[float]] = defaultdict(deque)
+        self.attempts: dict[str, deque[float]] = {}
 
-    def _prune(self, key: str, current: float) -> deque[float]:
-        bucket = self.attempts[key]
+    def _prune(self, key: str, current: float) -> int:
+        bucket = self.attempts.get(key)
+        if bucket is None:
+            return 0
         while bucket and current - bucket[0] > self.window_seconds:
             bucket.popleft()
         if not bucket:
-            self.attempts.pop(key, None)
-            return deque()
-        return bucket
+            del self.attempts[key]
+        return len(bucket)
 
     def check(self, key: str) -> None:
-        if len(self._prune(key, time.monotonic())) >= self.maximum:
+        if self._prune(key, time.monotonic()) >= self.maximum:
             raise HTTPException(
                 status_code=429,
                 detail="登录失败次数过多，请稍后再试。",
@@ -59,10 +92,8 @@ class LoginLimiter:
 
     def failure(self, key: str) -> None:
         current = time.monotonic()
-        bucket = self._prune(key, current)
-        if key not in self.attempts:
-            self.attempts[key] = bucket
-        bucket.append(current)
+        self._prune(key, current)
+        self.attempts.setdefault(key, deque()).append(current)
         if len(self.attempts) > 4096:
             for candidate in list(self.attempts):
                 self._prune(candidate, current)
@@ -274,80 +305,88 @@ def _client_address(request: Request) -> str:
     return address[:128]
 
 
-def _money_to_cents(value: str) -> int:
+def _decimal_units(value: str, places: int, errors: dict[str, str], *,
+                   minimum: int | None = 0, maximum: int | None = None) -> int:
     try:
-        amount = Decimal(value.strip())
-    except InvalidOperation as exc:
-        raise BillingError("固定成本格式无效") from exc
-    if not amount.is_finite() or amount < 0:
-        raise BillingError("固定成本必须是非负金额")
-    quantized = amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-    if amount != quantized:
-        raise BillingError("固定成本最多保留两位小数")
-    return int(quantized * 100)
+        return decimal_units(value, places, exact=True, minimum=minimum, maximum=maximum)
+    except DecimalInputError as exc:
+        raise BillingError(errors[exc.kind]) from None
+
+
+def _money_to_cents(value: str) -> int:
+    return _decimal_units(value, 2, {
+        "format": "固定成本格式无效", "range": "固定成本必须是非负金额", "precision": "固定成本最多保留两位小数",
+    })
 
 
 def _rate_to_ppm(value: str) -> int:
-    try:
-        rate = Decimal(value.strip())
-    except InvalidOperation as exc:
-        raise BillingError("人民币/USD 费率格式无效") from exc
-    if not rate.is_finite() or rate < 0 or rate > 1000:
-        raise BillingError("人民币/USD 费率必须在 0 到 1000 之间")
-    quantized = rate.quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
-    if rate != quantized:
-        raise BillingError("人民币/USD 费率最多保留六位小数")
-    return int(quantized * 1_000_000)
+    return _decimal_units(value, 6, {
+        "format": "人民币/USD 费率格式无效", "range": "人民币/USD 费率必须在 0 到 1000 之间",
+        "precision": "人民币/USD 费率最多保留六位小数",
+    }, maximum=1000)
 
 
 def _manual_usage_to_nano(value: str) -> int:
-    try:
-        amount = Decimal(value.strip())
-        quantized = amount.quantize(Decimal("0.000000001"))
-    except (InvalidOperation, ValueError) as exc:
-        raise BillingError("原始等效用量格式无效") from exc
-    if not amount.is_finite():
-        raise BillingError("原始等效用量必须是有限数值")
-    if amount != quantized:
-        raise BillingError("原始等效用量最多保留九位小数")
-    amount_nano_usd = int(quantized * NANO_USD)
-    if amount_nano_usd == 0:
-        raise BillingError("原始等效用量不能为零")
-    if abs(amount_nano_usd) > 9_223_372_036_854_775_807:
-        raise BillingError("原始等效用量超出可记录范围")
-    return amount_nano_usd
+    # Zero and int64 bounds are enforced by the service.
+    return _decimal_units(value, 9, {
+        "format": "原始等效用量格式无效", "range": "原始等效用量必须是有限数值", "precision": "原始等效用量最多保留九位小数",
+    }, minimum=None)
 
 
 def _usd_per_million_to_nano(value: str | None, label: str, optional: bool = False) -> int | None:
-    if value is None or not str(value).strip():
+    if value is None or not value.strip():
         if optional:
             return None
         raise BillingError(f"{label}不能为空")
-    try:
-        amount = Decimal(str(value).strip())
-        quantized = amount.quantize(Decimal("0.001"), rounding=ROUND_HALF_UP)
-    except (InvalidOperation, ValueError) as exc:
-        raise BillingError(f"{label}格式无效") from exc
-    if not amount.is_finite() or amount < 0:
-        raise BillingError(f"{label}必须是非负有限数值")
-    if amount != quantized:
-        raise BillingError(f"{label}最多保留三位小数")
-    return int(quantized * Decimal(1000))
+    return _decimal_units(value, 3, {
+        "format": f"{label}格式无效", "range": f"{label}必须是非负有限数值", "precision": f"{label}最多保留三位小数",
+    })
 
 
-def _multiplier_to_ppm(value: str | None, label: str) -> int:
-    if value is None or not str(value).strip():
+def _multiplier_to_ppm(value: str, label: str) -> int:
+    if not value.strip():
         raise BillingError(f"{label}不能为空")
-    try:
-        amount = Decimal(str(value).strip())
-        quantized = amount.quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
-    except (InvalidOperation, ValueError) as exc:
-        raise BillingError(f"{label}格式无效") from exc
-    if not amount.is_finite() or amount < 0:
-        raise BillingError(f"{label}必须是非负有限数值")
-    if amount != quantized:
-        raise BillingError(f"{label}最多保留六位小数")
-    return int(quantized * Decimal(1_000_000))
+    return _decimal_units(value, 6, {
+        "format": f"{label}格式无效", "range": f"{label}必须是非负有限数值", "precision": f"{label}最多保留六位小数",
+    })
+
+
+def request_history_query(
+    range_name: str = Query("today", alias="range"),
+    cycle: str | None = Query(None),
+    hours: int | None = Query(None, ge=1),
+    start: str | None = Query(None),
+    end: str | None = Query(None),
+    model: list[str] = Query(default=[]),
+    tier: str | None = Query(None),
+    provider: str | None = Query(None),
+    request_status: str | None = Query(None, alias="status"),
+    key_id: int | None = Query(None, ge=1),
+    failure_code: int | None = Query(None),
+    min_tokens: int | None = Query(None, ge=0),
+    max_tokens: int | None = Query(None, ge=0),
+    min_cost: str | None = Query(None),
+    max_cost: str | None = Query(None),
+    min_latency: int | None = Query(None, ge=0),
+    max_latency: int | None = Query(None, ge=0),
+    min_ttft: int | None = Query(None, ge=0),
+    max_ttft: int | None = Query(None, ge=0),
+    min_tps: float | None = Query(None, ge=0),
+    max_tps: float | None = Query(None, ge=0),
+    long_context: bool | None = Query(None),
+    q: str | None = Query(None, max_length=200),
+    sort: str = Query("time_desc"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=100),
+) -> dict[str, Any]:
+    return {
+        "range_name": range_name, "cycle_name": cycle, "custom_hours": hours, "start": start, "end": end,
+        "models": model, "tier": tier, "provider": provider, "status": request_status, "key_id": key_id,
+        "failure_code": failure_code, "min_tokens": min_tokens, "max_tokens": max_tokens,
+        "min_cost": min_cost, "max_cost": max_cost, "min_latency": min_latency, "max_latency": max_latency,
+        "min_ttft": min_ttft, "max_ttft": max_ttft, "min_tps": min_tps, "max_tps": max_tps,
+        "long_context": long_context, "query_text": q, "sort": sort, "page": page, "page_size": page_size,
+    }
 
 
 @dataclass(frozen=True)
@@ -402,19 +441,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="未绑定 API Key 仅允许查看历史请求、全站状态和上游账号。")
         return auth
 
-    def page_current(request: Request) -> WebAuth | None:
-        return resolve_web_auth(request)
-
     def admin_current(request: Request) -> WebAuth:
         auth = current(request)
         if not auth.is_admin:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="需要管理员权限")
         return auth
 
-    def verify_csrf(request: Request, auth: WebAuth | Any) -> None:
-        session = auth.session if isinstance(auth, WebAuth) else auth
+    def verify_csrf(request: Request, auth: WebAuth) -> None:
         token = request.headers.get("x-csrf-token", "")
-        if not token or not constant_equal(token, session.csrf_token):
+        if not token or not constant_equal(token, auth.session.csrf_token):
             raise HTTPException(status_code=403, detail="CSRF 校验失败，请刷新页面后重试。")
 
     def spa_response() -> Response:
@@ -466,23 +501,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         errors = [{key: value for key, value in item.items() if key != "input"} for item in exc.errors()]
         return JSONResponse({"detail": jsonable_encoder(errors)}, status_code=422)
 
-    @app.middleware("http")
-    async def security_headers(request: Request, call_next: Any) -> Response:
-        response = await call_next(request)
-        response.headers["Content-Security-Policy"] = (
-            "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; "
-            "form-action 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; "
-            "img-src 'self' data:; script-src 'self'; connect-src 'self'"
-        )
-        response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["Referrer-Policy"] = "same-origin"
-        response.headers["X-Frame-Options"] = "DENY"
-        response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
-        if request.url.path.startswith("/assets/"):
-            response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
-        else:
-            response.headers["Cache-Control"] = "no-store"
-        return response
+    app.add_middleware(SecurityHeadersMiddleware)
 
     @app.get("/healthz")
     def health() -> dict[str, str]:
@@ -517,7 +536,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=401, detail="API Key 无效、已撤销或当前未在 CPA 中启用。")
         limiter.success(limiter_key)
         user, key = authenticated
-        token, csrf = service.create_session(None if user is None else user.telegram_user_id, key.id)
+        token, csrf = await asyncio.to_thread(service.create_session, None if user is None else user.telegram_user_id, key.id)
         response = JSONResponse({
             "ok": True,
             "telegram_user_id": None if user is None else user.telegram_user_id,
@@ -548,12 +567,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def admin_login(request: Request, payload: AdminLoginPayload) -> JSONResponse:
         limiter_key = f"admin:{_client_address(request)}"
         limiter.check(limiter_key)
-        if not service.authenticate_admin_token(payload.management_token):
+        if not await asyncio.to_thread(service.authenticate_admin_token, payload.management_token):
             limiter.failure(limiter_key)
             await asyncio.sleep(0.5)
             raise HTTPException(status_code=401, detail="管理 token 无效。")
         limiter.success(limiter_key)
-        token, csrf = service.create_admin_session()
+        token, csrf = await asyncio.to_thread(service.create_admin_session)
         response = JSONResponse({"ok": True, "is_admin": True, "csrf_token": csrf})
         set_admin_cookie(response, token)
         response.delete_cookie(USER_COOKIE, path="/")
@@ -632,7 +651,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         session_ended = payload.action == "revoke" and target_is_login_key
         response_payload = {**result, "session_ended": session_ended}
         if payload.action == "reset" and target_is_login_key and result["new_key_id"]:
-            token, csrf = service.create_session(auth.user.telegram_user_id, result["new_key_id"])
+            token, csrf = await asyncio.to_thread(service.create_session, auth.user.telegram_user_id, result["new_key_id"])
             response_payload["csrf_token"] = csrf
             response = JSONResponse(response_payload)
             set_user_cookie(response, token)
@@ -652,66 +671,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/me/usage/events")
     def api_request_history(
-        range_name: str = Query("today", alias="range"),
-        cycle: str | None = Query(None),
-        hours: int | None = Query(None, ge=1),
-        start: str | None = Query(None),
-        end: str | None = Query(None),
-        model: list[str] = Query(default=[]),
-        tier: str | None = Query(None),
-        provider: str | None = Query(None),
-        request_status: str | None = Query(None, alias="status"),
-        key_id: int | None = Query(None, ge=1),
-        failure_code: int | None = Query(None),
-        min_tokens: int | None = Query(None, ge=0),
-        max_tokens: int | None = Query(None, ge=0),
-        min_cost: str | None = Query(None),
-        max_cost: str | None = Query(None),
-        min_latency: int | None = Query(None, ge=0),
-        max_latency: int | None = Query(None, ge=0),
-        min_ttft: int | None = Query(None, ge=0),
-        max_ttft: int | None = Query(None, ge=0),
-        min_tps: float | None = Query(None, ge=0),
-        max_tps: float | None = Query(None, ge=0),
-        long_context: bool | None = Query(None),
-        q: str | None = Query(None, max_length=200),
-        sort: str = Query("time_desc"),
-        page: int = Query(1, ge=1),
-        page_size: int = Query(50, ge=1, le=100),
+        query: dict[str, Any] = Depends(request_history_query),
         auth: WebAuth = Depends(current),
     ) -> dict[str, Any]:
-        guest = is_read_only_guest(auth)
         all_users = auth.user is None
-        return service.request_history(
-            None if all_users else auth.user.telegram_user_id,
-            all_users=all_users,
-            range_name=range_name,
-            cycle_name=cycle,
-            custom_hours=hours,
-            start=start,
-            end=end,
-            models=model,
-            tier=tier,
-            provider=provider,
-            status=request_status,
-            key_id=auth.session.api_key_id if guest else key_id,
-            failure_code=failure_code,
-            min_tokens=min_tokens,
-            max_tokens=max_tokens,
-            min_cost=min_cost,
-            max_cost=max_cost,
-            min_latency=min_latency,
-            max_latency=max_latency,
-            min_ttft=min_ttft,
-            max_ttft=max_ttft,
-            min_tps=min_tps,
-            max_tps=max_tps,
-            long_context=long_context,
-            query_text=q,
-            sort=sort,
-            page=page,
-            page_size=page_size,
-        )
+        if is_read_only_guest(auth):
+            query["key_id"] = auth.session.api_key_id
+        return service.request_history(None if all_users else auth.user.telegram_user_id, all_users=all_users, **query)
 
     @app.get("/api/admin/usage/filter-options")
     def api_admin_request_options(_: Any = Depends(admin_current)) -> dict[str, Any]:
@@ -719,64 +685,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/admin/usage/events")
     def api_admin_request_history(
-        range_name: str = Query("today", alias="range"),
-        cycle: str | None = Query(None),
-        hours: int | None = Query(None, ge=1),
-        start: str | None = Query(None),
-        end: str | None = Query(None),
-        model: list[str] = Query(default=[]),
-        tier: str | None = Query(None),
-        provider: str | None = Query(None),
-        request_status: str | None = Query(None, alias="status"),
-        key_id: int | None = Query(None, ge=1),
-        failure_code: int | None = Query(None),
-        min_tokens: int | None = Query(None, ge=0),
-        max_tokens: int | None = Query(None, ge=0),
-        min_cost: str | None = Query(None),
-        max_cost: str | None = Query(None),
-        min_latency: int | None = Query(None, ge=0),
-        max_latency: int | None = Query(None, ge=0),
-        min_ttft: int | None = Query(None, ge=0),
-        max_ttft: int | None = Query(None, ge=0),
-        min_tps: float | None = Query(None, ge=0),
-        max_tps: float | None = Query(None, ge=0),
-        long_context: bool | None = Query(None),
-        q: str | None = Query(None, max_length=200),
-        sort: str = Query("time_desc"),
-        page: int = Query(1, ge=1),
-        page_size: int = Query(50, ge=1, le=100),
+        query: dict[str, Any] = Depends(request_history_query),
         _: Any = Depends(admin_current),
     ) -> dict[str, Any]:
-        return service.request_history(
-            None,
-            all_users=True,
-            range_name=range_name,
-            cycle_name=cycle,
-            custom_hours=hours,
-            start=start,
-            end=end,
-            models=model,
-            tier=tier,
-            provider=provider,
-            status=request_status,
-            key_id=key_id,
-            failure_code=failure_code,
-            min_tokens=min_tokens,
-            max_tokens=max_tokens,
-            min_cost=min_cost,
-            max_cost=max_cost,
-            min_latency=min_latency,
-            max_latency=max_latency,
-            min_ttft=min_ttft,
-            max_ttft=max_ttft,
-            min_tps=min_tps,
-            max_tps=max_tps,
-            long_context=long_context,
-            query_text=q,
-            sort=sort,
-            page=page,
-            page_size=page_size,
-        )
+        return service.request_history(None, all_users=True, **query)
 
     @app.get("/api/rankings")
     def api_rankings(
@@ -823,9 +735,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return await asyncio.to_thread(service.refresh_account_quotas, payload.account_ids)
 
     @app.get("/api/admin/snapshot")
-    async def api_admin_snapshot(_: Any = Depends(admin_current)) -> dict[str, Any]:
+    def api_admin_snapshot(_: Any = Depends(admin_current)) -> dict[str, Any]:
+        # Plain def: FastAPI runs these blocking aggregates in its threadpool, off the event loop.
         try:
-            accounts = await asyncio.to_thread(service.accounts_snapshot)
+            accounts = service.accounts_snapshot()
         except BillingDependencyError as exc:
             accounts = {"accounts": [], "inspection": {}, "error": str(exc)}
         return {
@@ -1062,12 +975,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "long_output_multiplier_ppm": _multiplier_to_ppm(payload.long_context_output_multiplier, "长上下文 Output 倍率"),
         }
         if payload.context_tiers is not None:
-            values["context_tiers_json"] = json.dumps([
+            values["context_tiers"] = [
                 {"threshold_tokens": band.threshold_tokens, "service_tier": band.service_tier,
                  **{field: _usd_per_million_to_nano(getattr(band, field + "_usd_per_million"), "上下文区间价格")
                     for field in ("input", "output", "cache_read", "cache_creation")}}
                 for band in payload.context_tiers
-            ])
+            ]
             values.update(long_threshold_tokens=None, long_input_multiplier_ppm=1_000_000, long_output_multiplier_ppm=1_000_000)
         return service.update_pricing_rule(
             payload.model,
@@ -1166,13 +1079,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/login", include_in_schema=False)
     def login_page(request: Request) -> Response:
-        if page_current(request):
+        if resolve_web_auth(request):
             return RedirectResponse("/", status_code=303)
         return spa_response()
 
     @app.get("/admin/login", include_in_schema=False)
     def admin_login_page(request: Request) -> Response:
-        if page_current(request):
+        if resolve_web_auth(request):
             return RedirectResponse("/", status_code=303)
         return spa_response()
 
@@ -1185,13 +1098,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if full_path.startswith("api/") or full_path.startswith("auth/"):
             raise HTTPException(status_code=404, detail="Not Found")
         if full_path == "admin" or full_path.startswith("admin/"):
-            auth = page_current(request)
+            auth = resolve_web_auth(request)
             if auth is None:
                 return RedirectResponse("/login", status_code=303)
             if not auth.is_admin:
                 return RedirectResponse("/requests" if is_read_only_guest(auth) else "/", status_code=303)
             return spa_response()
-        auth = page_current(request)
+        auth = resolve_web_auth(request)
         if auth is None:
             return RedirectResponse("/login", status_code=303)
         if is_read_only_guest(auth) and full_path not in {"requests", "status", "accounts"}:

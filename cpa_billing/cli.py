@@ -7,9 +7,6 @@ import logging
 import time
 from pathlib import Path
 
-import uvicorn
-
-from .bot import run_bot
 from .config import Settings
 from .database import Database
 from .migrate import migrate_legacy_bot
@@ -24,11 +21,21 @@ def build() -> tuple[Settings, BillingService]:
     return settings, service
 
 
+RATE_BATCH_SIZE = 500
+RATE_BATCHES_PER_TICK = 20
+
+
 def worker(service: BillingService, interval: float, once: bool) -> None:
     while True:
         try:
             imported = service.sync_cpamp()
-            rated = service.rate_events(limit=500)
+            # Rate more than one import batch per tick so a rerate backlog drains; each batch takes the lock separately.
+            rated = 0
+            for _ in range(RATE_BATCHES_PER_TICK):
+                batch = service.rate_events(limit=RATE_BATCH_SIZE)
+                rated += batch
+                if batch < RATE_BATCH_SIZE:
+                    break
             logging.info("worker imported=%s rated=%s", imported, rated)
         except Exception:
             logging.exception("usage sync iteration failed")
@@ -69,6 +76,17 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
+    # The bot and web server build their own service; heavy imports stay out of other commands.
+    if args.command == "bot":
+        from .bot import run_bot
+        asyncio.run(run_bot())
+        return
+    if args.command == "serve":
+        import uvicorn
+
+        from .web import create_app
+        uvicorn.run(create_app(), host=args.host, port=args.port, proxy_headers=True)
+        return
     settings, service = build()
     if args.command == "init":
         print("initialized", settings.database_path)
@@ -96,11 +114,6 @@ def main() -> None:
         ), ensure_ascii=False))
     elif args.command == "sync-keys":
         print(json.dumps(service.sync_cpa_keys(), ensure_ascii=False))
-    elif args.command == "bot":
-        asyncio.run(run_bot())
-    elif args.command == "serve":
-        from .web import create_app
-        uvicorn.run(create_app(settings), host=args.host, port=args.port, proxy_headers=True)
 
 
 if __name__ == "__main__":
