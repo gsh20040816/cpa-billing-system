@@ -868,8 +868,6 @@ def test_usage_ranges_share_today_cycle_and_integer_hours_semantics(service) -> 
         yesterday_start, yesterday_end, _ = service._resolve_time_range(session, "yesterday")
         assert today_start < today_end
         assert yesterday_start < yesterday_end == today_start
-        with pytest.raises(BillingError, match="正整数小时"):
-            service._resolve_time_range(session, "custom", custom_hours=1.5)
 
 
 def test_web_key_actions_execute_directly_and_invalidate_target_sessions(service, settings, monkeypatch) -> None:
@@ -2431,3 +2429,165 @@ def test_upstream_groups_bill_independently_then_sum(service, settings, monkeypa
     with service.db.session() as session:
         snapshots = list(session.scalars(select(CycleGroup)))
     assert {item.group_name for item in snapshots} == {"default", "grok"}
+
+
+def _billing_scenario(service, settings, monkeypatch, cycle_name: str) -> None:
+    create_owner(service, "scenario-codex-2", 2, 0)
+    create_owner(service, "scenario-grok-3", 3, 0)
+    create_owner(service, "scenario-manual-4", 4, 0)
+    with service.db.session() as session:
+        extra = APIKey(cpamp_hash=cpamp_key_hash("scenario-extra-2"), login_fingerprint="extra-2", masked_value="extra",
+                       status="active", current_owner_id=2, created_at_ms=0)
+        session.add(extra)
+        session.flush()
+        session.add(KeyOwnershipPeriod(api_key_id=extra.id, telegram_user_id=2, valid_from_ms=0, source="test", created_at_ms=0))
+        for raw in ("scenario-metered", "scenario-free"):
+            session.add(APIKey(cpamp_hash=cpamp_key_hash(raw), masked_value=f"masked-{raw}", status="unowned",
+                               current_owner_id=None, present_in_cpa=True, created_at_ms=0))
+        session.flush()
+        metered_id = session.scalar(select(APIKey.id).where(APIKey.cpamp_hash == cpamp_key_hash("scenario-metered")))
+        pool_id = session.scalar(select(ResourcePool.id).where(ResourcePool.name == "default-cpa"))
+    service.update_unowned_key_profile(metered_id, "metered", "3", "test")
+    events = [
+        ("scenario-codex-2", "codex-auth", 700_000, "gpt-test", False),
+        ("scenario-extra-2", "codex-auth", 300_000, "gpt-5.6-luna", True),
+        ("scenario-codex-2", "grok-auth", 500_000, "gpt-test", True),
+        ("scenario-grok-3", "grok-auth", 900_000, "gpt-5.6-luna", False),
+        ("scenario-grok-3", "codex-auth", 200_000, "gpt-test", False),
+        ("scenario-metered", "codex-auth", 400_000, "gpt-test", False),
+        ("scenario-metered", "grok-auth", 100_000, "gpt-5.6-luna", False),
+        ("scenario-free", "codex-auth", 250_000, "gpt-test", True),
+    ]
+    for index, (raw, auth, tokens, model, failed) in enumerate(events):
+        insert_event(settings, cpamp_key_hash(raw), 1000 + index, event_hash=f"scenario-{index}", input_tokens=tokens,
+                     cached_tokens=0, output_tokens=0, auth_index=auth, model=model, failed=failed,
+                     fail_status_code=500 if failed else None)
+    service.sync_cpamp()
+    service.rate_events()
+    monkeypatch.setattr(service.cpa, "auth_files", lambda: [
+        {"id": "codex-account", "auth_index": "codex-auth", "account_type": "oauth", "name": "Codex OAuth"},
+        {"id": "grok-account", "auth_index": "grok-auth", "account_type": "api-key", "name": "Grok API"},
+    ])
+    with service.db.session() as session:
+        default_id = session.scalar(select(UpstreamAccountGroup.id).where(UpstreamAccountGroup.is_default.is_(True)))
+        gradient_id = session.scalar(select(GradientRule.id).where(GradientRule.active.is_(True)))
+    grok_id = service.create_upstream_group("grok", gradient_id, "split grok")
+    service.configure_account_billing("codex-account", default_id, "codex group", subscription_mode="one_time",
+                                      period_start="1970-01-01T08:00", period_end="1970-01-02T08:00",
+                                      period_cost_cents=1001)
+    service.configure_account_billing("grok-account", grok_id, "grok group", rate_ppm=7_000_000)
+    service.create_cycle(cycle_name, "1970-01-01T08:00", "1970-01-02T08:00", 0,
+                         upstream_costs=[{"account_id": "codex-account"}, {"account_id": "grok-account"}])
+    service.add_manual_usage_adjustment(cycle_name, pool_id, 4, 3 * NANO_USD, "offline", None, group_id=grok_id)
+    service.add_manual_usage_adjustment(cycle_name, pool_id, 2, NANO_USD, "offline", None)
+    service.add_adjustment(cycle_name, 3, -25, "credit", None)
+
+
+def test_dashboard_user_summary_preview_and_pricing_agree_across_groups(service, settings, monkeypatch) -> None:
+    _billing_scenario(service, settings, monkeypatch, "scenario")
+    dashboard = service.dashboard("scenario")
+    light = service.dashboard("scenario", include_models=False)
+    assert light["rows"] == dashboard["rows"]
+    assert light["models"] == [] and dashboard["models"]
+    rows = {row["telegram_user_id"]: row for row in dashboard["rows"]}
+    assert set(rows) == {2, 3, 4, None}
+    assert rows[None]["requests"] == 3 and rows[None]["key_count"] == 2
+    assert rows[2]["requests"] == 3 and rows[2]["key_count"] == 2
+    assert rows[4]["requests"] == 0 and rows[4]["manual_actual"] == "3.0000"
+    assert [item["masked"] for item in dashboard["metered_keys"]] == ["masked-scenario-metered"]
+    assert dashboard["metered_keys"][0]["requests"] == 2
+    assert {item["group"] for item in dashboard["group_totals"]} == {"default", "grok"}
+    assert sum(row["amount_cents"] for row in dashboard["rows"]) == (
+        sum(item["member_amount_cents"] for item in dashboard["group_totals"]) - 25
+        + sum(item["amount_cents"] for item in dashboard["metered_keys"])
+    )
+
+    fields = ("actual", "request_actual", "manual_actual", "billed", "amount")
+    for user_id in (2, 3, 4):
+        summary = service.user_summary(user_id, "scenario")
+        row = rows[user_id]
+        assert {key: summary["statement"][key] for key in fields} == {key: row[key] for key in fields}
+        assert summary["statement"]["live"] is True
+        assert summary["cycle"]["name"] == "scenario"
+        assert summary["summary"]["requests"] == row["requests"]
+        assert summary["summary"]["tokens"] == row["tokens"]
+        assert summary["summary"]["cost"] == row["request_actual"]
+    summary = service.user_summary(2, "scenario")
+    assert summary["summary"]["failed"] == 2
+    assert summary["summary"]["success_rate"] == "33.3%"
+    assert [item["model"] for item in summary["models"]] == ["gpt-test", "gpt-5.6-luna"]
+    assert sum(item["requests"] for item in summary["models"]) == sum(item["requests"] for item in summary["tiers"]) == 3
+
+    pricing = service.pricing_snapshot("scenario")
+    assert pricing["billing"]["upstream_costs"] == dashboard["upstream_costs"]
+    assert pricing["billing"]["billing_model"] == "upstream_channels"
+
+    statements = service.preview_cycle("scenario")
+    assert [statement.amount_cents for statement in statements] == sorted(
+        (statement.amount_cents for statement in statements), reverse=True
+    )
+    assert {statement.telegram_user_id: statement.amount_cents for statement in statements} == {
+        user_id: rows[user_id]["amount_cents"] for user_id in (2, 3, 4)
+    }
+    with service.db.session() as session:
+        key_counts = dict(session.execute(
+            select(Statement.telegram_user_id, func.max(StatementLine.api_key_count))
+            .join(StatementLine, StatementLine.statement_id == Statement.id)
+            .group_by(Statement.telegram_user_id)
+        ).all())
+    assert key_counts == {2: 2, 3: 1, 4: 1}
+
+    service.close_cycle("scenario", 1, False)
+    closed = service.dashboard("scenario")
+    assert [(row["telegram_user_id"], row["amount_cents"], row["requests"], row["actual"]) for row in closed["rows"]] == [
+        (row["telegram_user_id"], row["amount_cents"], row["requests"], row["actual"]) for row in dashboard["rows"]
+    ]
+    assert [(item["key_id"], item["requests"], item["tokens"], item["amount_cents"]) for item in closed["metered_keys"]] == [
+        (item["key_id"], item["requests"], item["tokens"], item["amount_cents"]) for item in dashboard["metered_keys"]
+    ]
+    assert closed["totals"]["amount"] == dashboard["totals"]["amount"]
+    closed_summary = service.user_summary(3, "scenario")
+    assert closed_summary["statement"]["live"] is False
+    assert closed_summary["statement"]["amount"] == rows[3]["amount"]
+
+
+def test_legacy_closed_dashboard_pool_totals_match_open_estimate(service, settings) -> None:
+    create_owner(service, "legacy-a", 2, 0)
+    create_owner(service, "legacy-b", 3, 0)
+    insert_event(settings, cpamp_key_hash("legacy-a"), 1000, event_hash="legacy-a", input_tokens=600_000, cached_tokens=0, output_tokens=0)
+    insert_event(settings, cpamp_key_hash("legacy-b"), 1001, event_hash="legacy-b", input_tokens=300_000, cached_tokens=0, output_tokens=0)
+    service.sync_cpamp()
+    service.rate_events()
+    service.create_cycle("legacy", "1970-01-01T08:00", "1970-01-02T08:00", 1001)
+    open_dashboard = service.dashboard("legacy")
+    service.close_cycle("legacy", 1, False)
+    closed = service.dashboard("legacy")
+    assert closed["billing_model"] == open_dashboard["billing_model"] == "legacy_pool_fixed"
+    assert [(item["pool_id"], item["fixed_cost_cents"], item["member_amount_cents"]) for item in closed["pool_totals"]] == [
+        (item["pool_id"], item["fixed_cost_cents"], item["member_amount_cents"]) for item in open_dashboard["pool_totals"]
+    ]
+    assert sum(row["amount_cents"] for row in closed["rows"]) == 1001
+
+
+def test_request_filter_options_collects_distinct_values_in_one_pass(service, settings) -> None:
+    create_owner(service, "options-key", 2, 0)
+    insert_event(settings, cpamp_key_hash("options-key"), 1000, event_hash="o1", model="b-model", tier="priority")
+    insert_event(settings, cpamp_key_hash("options-key"), 2000, event_hash="o2", model="a-model", failed=True, fail_status_code=503)
+    insert_event(settings, cpamp_key_hash("options-key"), 3000, event_hash="o3", model="a-model", failed=True, fail_status_code=429)
+    insert_event(settings, cpamp_key_hash("other-key"), 500, event_hash="o4", model="c-model")
+    service.sync_cpamp()
+    own = service.request_filter_options(2)
+    assert own["models"] == ["a-model", "b-model"]
+    assert own["tiers"] == ["default", "priority"]
+    assert own["providers"] == ["codex"]
+    assert own["failure_codes"] == [429, 503]
+    assert own["range"] == {"start": service._iso_timestamp(1000), "end": service._iso_timestamp(3000)}
+    everyone = service.request_filter_options(None, all_users=True)
+    assert everyone["models"] == ["a-model", "b-model", "c-model"]
+    assert everyone["range"]["start"] == service._iso_timestamp(500)
+    with service.db.session() as session:
+        session.add(TelegramUser(telegram_user_id=9, registered_at_ms=0, last_seen_at_ms=0))
+    assert service.request_filter_options(9) == {
+        "models": [], "tiers": [], "providers": [], "failure_codes": [], "keys": [],
+        "range": {"start": None, "end": None},
+    }

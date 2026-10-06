@@ -593,7 +593,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/users")
     def api_users(cycle: str | None = Query(None), _: WebAuth = Depends(full_user_current)) -> dict[str, Any]:
-        data = service.dashboard(cycle)
+        data = service.dashboard(cycle, include_models=False)
         return {"cycle": data["cycle"], "users": data["rows"]}
 
     @app.get("/api/users/{user_id}/summary")
