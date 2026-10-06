@@ -1432,11 +1432,12 @@ class BillingService:
             return row
 
     def set_membership(self, user: dict[str, Any], group_id: int, status: str, legal: bool) -> None:
+        user_id = int(user["id"])
         self.upsert_user(user)
         with self.db.session() as session:
-            row = session.get(GroupMembership, (int(user["id"]), group_id))
+            row = session.get(GroupMembership, (user_id, group_id))
             if row is None:
-                row = GroupMembership(telegram_user_id=int(user["id"]), group_chat_id=group_id, status=status, legal=legal, updated_at_ms=now_ms())
+                row = GroupMembership(telegram_user_id=user_id, group_chat_id=group_id, status=status, legal=legal, updated_at_ms=now_ms())
                 session.add(row)
             else:
                 row.status, row.legal, row.updated_at_ms = status, legal, now_ms()
@@ -1453,8 +1454,8 @@ class BillingService:
                 GroupMembership.legal.is_(True),
             ]
             if max_age_ms is not None:
-                filters.append(GroupMembership.updated_at_ms >= now_ms() - max(0, int(max_age_ms)))
-            return bool(session.scalar(select(func.count()).select_from(GroupMembership).where(*filters)))
+                filters.append(GroupMembership.updated_at_ms >= now_ms() - max_age_ms)
+            return session.scalar(select(GroupMembership.telegram_user_id).where(*filters).limit(1)) is not None
 
     def _insert_key(self, session: Any, raw_key: str, owner_id: int, source: str) -> APIKey:
         key_hash = cpamp_key_hash(raw_key)
@@ -1504,12 +1505,11 @@ class BillingService:
         with self.db.session() as session:
             existing = {key.cpamp_hash: key for key in session.scalars(select(APIKey))}
             for key_hash, raw in current_hashes.items():
-                fingerprint = login_fingerprint(raw, self.settings.key_pepper)
                 key = existing.get(key_hash)
                 if key is None:
                     session.add(APIKey(
                         cpamp_hash=key_hash,
-                        login_fingerprint=fingerprint,
+                        login_fingerprint=login_fingerprint(raw, self.settings.key_pepper),
                         masked_value=mask_api_key(raw),
                         status="unowned",
                         current_owner_id=None,
@@ -1521,7 +1521,7 @@ class BillingService:
                     continue
                 key.masked_value = mask_api_key(raw)
                 if key.login_fingerprint is None:
-                    key.login_fingerprint = fingerprint
+                    key.login_fingerprint = login_fingerprint(raw, self.settings.key_pepper)
                 key.present_in_cpa = True
                 key.last_seen_in_cpa_at_ms = observed
                 if key.status == "retired":
@@ -1655,7 +1655,7 @@ class BillingService:
             user = session.get(TelegramUser, user_id)
             if user is None:
                 raise BillingError("Telegram 用户不存在")
-            before = bool(user.is_admin)
+            before = user.is_admin
             if before != is_admin:
                 user.is_admin = is_admin
                 session.add(AuditLog(
@@ -1668,7 +1668,7 @@ class BillingService:
                     reason=normalized_reason,
                     created_at_ms=now_ms(),
                 ))
-            effective = bool(user.is_admin or user_id in self.settings.admin_user_ids)
+            effective = user.is_admin or user_id in self.settings.admin_user_ids
             return {
                 "id": user_id,
                 "is_admin": effective,
@@ -1749,11 +1749,11 @@ class BillingService:
         new_raw = generate_api_key(self.settings.api_key_prefix) if action_name in {"add", "reset"} else None
         removed_raw: str | None = None
         try:
-            if action_name == "add" and new_raw:
+            if action_name == "add":
                 self.cpa.add_key(new_raw)
-            elif action_name == "reset" and new_raw and target_hash:
+            elif action_name == "reset":
                 removed_raw = self.cpa.replace_key_hash(target_hash, new_raw)
-            elif action_name == "revoke" and target_hash:
+            else:
                 removed_raw = self.cpa.remove_key_hash(target_hash)
                 if removed_raw is None:
                     raise BillingError("目标 API Key 已不在 CPA 有效列表中")
@@ -1797,9 +1797,9 @@ class BillingService:
             }
         except Exception:
             try:
-                if action_name == "add" and new_raw:
+                if action_name == "add":
                     self.cpa.remove_key_hash(cpamp_key_hash(new_raw))
-                elif action_name == "reset" and new_raw and removed_raw:
+                elif action_name == "reset" and removed_raw:
                     self.cpa.replace_key_hash(cpamp_key_hash(new_raw), removed_raw)
                 elif action_name == "revoke" and removed_raw:
                     self.cpa.add_key(removed_raw)
@@ -1840,7 +1840,7 @@ class BillingService:
             action.confirmed_at_ms = now_ms()
             if result["new_api_key"]:
                 action.result_masked_key = mask_api_key(result["new_api_key"])
-        return str(result["new_api_key"] or "")
+        return result["new_api_key"] or ""
 
     def rename_key(self, user_id: int, key_id: int, name: str | None) -> dict[str, Any]:
         normalized = (name or "").strip()
@@ -1940,8 +1940,6 @@ class BillingService:
                 raise BillingError("尚未创建账期")
             return selected_cycle.start_at_ms, selected_cycle.end_at_ms, selected_cycle
         if custom_hours is not None:
-            if isinstance(custom_hours, bool) or not isinstance(custom_hours, int) or custom_hours <= 0:
-                raise BillingError("自定义时间范围必须是正整数小时")
             return current - custom_hours * 60 * 60 * 1000, current, None
 
         # Keep the service-level date bounds for existing internal callers; the web UI uses hours.
@@ -1973,8 +1971,17 @@ class BillingService:
                 return full_name
         return str(fallback)
 
-    def _validate_cycle_rating(self, session: Any, cycle: BillingCycle) -> None:
-        unpriced = session.scalar(select(func.count()).select_from(RawUsageEvent).outerjoin(
+    @staticmethod
+    def _cycle_period(cycle: BillingCycle) -> tuple[Any, ...]:
+        return (
+            RatedEvent.pricing_version_id == cycle.pricing_version_id,
+            RatedEvent.occurred_at_ms >= cycle.start_at_ms,
+            RatedEvent.occurred_at_ms < cycle.end_at_ms,
+        )
+
+    @staticmethod
+    def _cycle_unpriced_count(session: Any, cycle: BillingCycle) -> int:
+        return session.scalar(select(func.count()).select_from(RawUsageEvent).outerjoin(
             RatedEvent, and_(
                 RatedEvent.raw_event_id == RawUsageEvent.id,
                 RatedEvent.pricing_version_id == cycle.pricing_version_id,
@@ -1983,32 +1990,125 @@ class BillingService:
             RawUsageEvent.occurred_at_ms >= cycle.start_at_ms,
             RawUsageEvent.occurred_at_ms < cycle.end_at_ms,
             RatedEvent.id.is_(None),
-        )) or 0
+        ))
+
+    def _validate_cycle_rating(self, session: Any, cycle: BillingCycle) -> None:
+        unpriced = self._cycle_unpriced_count(session, cycle)
         if unpriced:
             raise BillingError(f"cycle has {unpriced} unrated events")
         unassigned = session.scalar(select(func.count()).select_from(RatedEvent).where(
-            RatedEvent.pricing_version_id == cycle.pricing_version_id,
-            RatedEvent.occurred_at_ms >= cycle.start_at_ms,
-            RatedEvent.occurred_at_ms < cycle.end_at_ms,
+            *self._cycle_period(cycle),
             RatedEvent.pool_id.is_(None),
-        )) or 0
+        ))
         if unassigned:
             raise BillingError(f"cycle has {unassigned} unassigned events")
 
-    def _build_cycle_estimate(self, session: Any, cycle: BillingCycle, strict: bool) -> CycleEstimate:
-        period = (
-            RatedEvent.pricing_version_id == cycle.pricing_version_id,
-            RatedEvent.occurred_at_ms >= cycle.start_at_ms,
-            RatedEvent.occurred_at_ms < cycle.end_at_ms,
-        )
-        pool_users: dict[int, dict[int, int]] = defaultdict(dict)
-        for pool_id, user_id, weight in session.execute(
-            select(RatedEvent.pool_id, RatedEvent.telegram_user_id, func.sum(RatedEvent.rated_weight_nano_usd))
-            .where(*period, RatedEvent.telegram_user_id.is_not(None), RatedEvent.pool_id.is_not(None))
-            .group_by(RatedEvent.pool_id, RatedEvent.telegram_user_id)
+    def _cycle_usage_rows(self, session: Any, cycle: BillingCycle) -> list[Any]:
+        # Single pass over the cycle: (auth_index, pool_id, user_id, unowned key hash, requests, tokens, actual).
+        unowned_hash = case((RatedEvent.telegram_user_id.is_(None), RawUsageEvent.api_key_hash))
+        return session.execute(
+            select(
+                RawUsageEvent.auth_index,
+                RatedEvent.pool_id,
+                RatedEvent.telegram_user_id,
+                unowned_hash,
+                func.count(RatedEvent.id),
+                func.sum(RawUsageEvent.total_tokens),
+                func.sum(RatedEvent.rated_weight_nano_usd),
+            )
+            .join(RawUsageEvent, RawUsageEvent.id == RatedEvent.raw_event_id)
+            .where(*self._cycle_period(cycle))
+            .group_by(RawUsageEvent.auth_index, RatedEvent.pool_id, RatedEvent.telegram_user_id, unowned_hash)
+        ).all()
+
+    @staticmethod
+    def _usage_by_auth(
+        usage_rows: list[Any],
+    ) -> tuple[dict[str, dict[int, dict[str, int]]], dict[str, dict[int, dict[int, int]]]]:
+        usage_by_auth: dict[str, dict[int, dict[str, int]]] = defaultdict(lambda: defaultdict(lambda: {
+            "requests": 0, "tokens": 0, "actual_nano_usd": 0,
+        }))
+        user_usage_by_auth: dict[str, dict[int, dict[int, int]]] = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
+        for auth_index, pool_id, user_id, _, requests, tokens, actual in usage_rows:
+            if auth_index is None or pool_id is None:
+                continue
+            pool_usage = usage_by_auth[auth_index][pool_id]
+            pool_usage["requests"] += requests
+            pool_usage["tokens"] += tokens
+            pool_usage["actual_nano_usd"] += actual
+            if user_id is not None:
+                user_usage_by_auth[auth_index][user_id][pool_id] += actual
+        return usage_by_auth, user_usage_by_auth
+
+    def _build_cycle_estimate(self, session: Any, cycle: BillingCycle, strict: bool,
+                              usage_rows: list[Any] | None = None) -> CycleEstimate:
+        if usage_rows is None:
+            usage_rows = self._cycle_usage_rows(session, cycle)
+        unowned_usage: dict[tuple[int, str], list[int]] = {}
+        for _, pool_id, user_id, key_hash, requests, tokens, actual in usage_rows:
+            if user_id is None and pool_id is not None and key_hash is not None:
+                totals = unowned_usage.setdefault((pool_id, key_hash), [0, 0, 0])
+                totals[0] += requests
+                totals[1] += tokens
+                totals[2] += actual
+        hashes = {key_hash for _, key_hash in unowned_usage}
+        key_by_hash = {
+            key.cpamp_hash: key
+            for key in session.scalars(select(APIKey).where(APIKey.cpamp_hash.in_(hashes)))
+        } if hashes else {}
+        pools = {pool.id: pool.name for pool in session.scalars(select(ResourcePool))}
+        metered_by_pool: dict[int, list[dict[str, Any]]] = defaultdict(list)
+        metered_keys: list[dict[str, Any]] = []
+        upstream_rows = list(session.scalars(
+            select(CycleUpstreamCost).where(CycleUpstreamCost.cycle_id == cycle.id)
+        ))
+        for (pool_id, key_hash), (requests, tokens, actual) in sorted(unowned_usage.items()):
+            key = key_by_hash.get(key_hash)
+            if key is None or key.billing_multiplier_ppm is None:
+                continue
+            item = {
+                "pool_id": pool_id,
+                "pool": pools.get(pool_id, str(pool_id)),
+                "key_id": key.id,
+                "masked": key.masked_value,
+                "name": key.display_name,
+                "requests": requests,
+                "tokens": tokens,
+                "actual_nano_usd": actual,
+                "multiplier_ppm": key.billing_multiplier_ppm,
+                "amount_cents": _metered_amount_cents(actual, key.billing_multiplier_ppm),
+            }
+            metered_by_pool[pool_id].append(item)
+            metered_keys.append(item)
+
+        adjustments: dict[int, int] = defaultdict(int)
+        for user_id, amount in session.execute(
+            select(Adjustment.telegram_user_id, Adjustment.amount_cents).where(Adjustment.cycle_id == cycle.id)
         ):
-            pool_users[int(pool_id)][int(user_id)] = int(weight or 0)
-        for pool_id, user_id, weight in session.execute(
+            adjustments[user_id] += amount
+
+        if upstream_rows:
+            return self._build_grouped_upstream_estimate(
+                session,
+                cycle,
+                strict,
+                usage_rows,
+                pools,
+                upstream_rows,
+                key_by_hash,
+                metered_keys,
+                metered_by_pool,
+                adjustments,
+            )
+
+        pool_user_totals: dict[tuple[int, int], int] = defaultdict(int)
+        for _, pool_id, user_id, _, _, _, actual in usage_rows:
+            if user_id is not None and pool_id is not None:
+                pool_user_totals[pool_id, user_id] += actual
+        pool_users: dict[int, dict[int, int]] = defaultdict(dict)
+        for (pool_id, user_id), weight in sorted(pool_user_totals.items()):
+            pool_users[pool_id][user_id] = weight
+        for pool_id, user_id, manual_weight in session.execute(
             select(
                 ManualUsageAdjustment.pool_id,
                 ManualUsageAdjustment.telegram_user_id,
@@ -2017,84 +2117,21 @@ class BillingService:
             .where(ManualUsageAdjustment.cycle_id == cycle.id)
             .group_by(ManualUsageAdjustment.pool_id, ManualUsageAdjustment.telegram_user_id)
         ):
-            manual_weight = int(weight or 0)
             if manual_weight < 0:
                 raise BillingError("手动原始用量余额不能为负数")
-            pool = pool_users[int(pool_id)]
-            pool[int(user_id)] = pool.get(int(user_id), 0) + manual_weight
-
-        unowned_usage = session.execute(
-            select(
-                RatedEvent.pool_id,
-                RawUsageEvent.api_key_hash,
-                func.count(RatedEvent.id),
-                func.sum(RawUsageEvent.total_tokens),
-                func.sum(RatedEvent.rated_weight_nano_usd),
-            )
-            .join(RawUsageEvent, RawUsageEvent.id == RatedEvent.raw_event_id)
-            .where(*period, RatedEvent.telegram_user_id.is_(None), RatedEvent.pool_id.is_not(None))
-            .group_by(RatedEvent.pool_id, RawUsageEvent.api_key_hash)
-        ).all()
-        hashes = {str(row[1]) for row in unowned_usage if row[1]}
-        key_by_hash = {
-            key.cpamp_hash: key
-            for key in session.scalars(select(APIKey).where(APIKey.cpamp_hash.in_(hashes)))
-        } if hashes else {}
+            pool = pool_users[pool_id]
+            pool[user_id] = pool.get(user_id, 0) + manual_weight
         costs = {
-            row.pool_id: int(row.fixed_cost_cents)
+            row.pool_id: row.fixed_cost_cents
             for row in session.scalars(select(CyclePoolCost).where(CyclePoolCost.cycle_id == cycle.id))
         }
-        pools = {pool.id: pool.name for pool in session.scalars(select(ResourcePool))}
         tiers = parse_tiers(json.loads(cycle.tiers_json))
-        metered_by_pool: dict[int, list[dict[str, Any]]] = defaultdict(list)
-        metered_keys: list[dict[str, Any]] = []
-        upstream_rows = list(session.scalars(
-            select(CycleUpstreamCost).where(CycleUpstreamCost.cycle_id == cycle.id)
-        ))
-        for pool_id, key_hash, requests, tokens, actual in unowned_usage:
-            key = key_by_hash.get(str(key_hash or ""))
-            if key is None or key.billing_multiplier_ppm is None:
-                continue
-            amount = _metered_amount_cents(int(actual or 0), int(key.billing_multiplier_ppm))
-            item = {
-                "pool_id": int(pool_id),
-                "pool": pools.get(int(pool_id), str(pool_id)),
-                "key_id": key.id,
-                "masked": key.masked_value,
-                "name": key.display_name,
-                "requests": int(requests or 0),
-                "tokens": int(tokens or 0),
-                "actual_nano_usd": int(actual or 0),
-                "multiplier_ppm": int(key.billing_multiplier_ppm),
-                "amount_cents": amount,
-            }
-            metered_by_pool[int(pool_id)].append(item)
-            metered_keys.append(item)
-
-        adjustments: dict[int, int] = defaultdict(int)
-        for row in session.scalars(select(Adjustment).where(Adjustment.cycle_id == cycle.id)):
-            adjustments[row.telegram_user_id] += int(row.amount_cents)
-
-        if upstream_rows:
-            return self._build_grouped_upstream_estimate(
-                session,
-                cycle,
-                strict,
-                period,
-                pools,
-                upstream_rows,
-                metered_keys,
-                metered_by_pool,
-                adjustments,
-            )
 
         user_lines: dict[int, list[tuple[int | None, int, int, int, int]]] = defaultdict(list)
         pool_totals: list[dict[str, Any]] = []
         for pool_id in sorted(costs.keys() | pool_users.keys() | metered_by_pool.keys()):
-            fixed = int(costs.get(pool_id, 0))
-            dynamic = 0
+            total_cost = costs.get(pool_id, 0)
             metered = sum(item["amount_cents"] for item in metered_by_pool.get(pool_id, []))
-            total_cost = int(costs.get(pool_id, 0))
             residual = max(0, total_cost - metered)
             users = pool_users.get(pool_id, {})
             billed = {uid: tiered_weight(weight, tiers) for uid, weight in users.items()}
@@ -2107,8 +2144,8 @@ class BillingService:
             pool_totals.append({
                 "pool_id": pool_id,
                 "pool": pools.get(pool_id, str(pool_id)),
-                "fixed_cost_cents": fixed,
-                "dynamic_cost_cents": dynamic,
+                "fixed_cost_cents": total_cost,
+                "dynamic_cost_cents": 0,
                 "metered_amount_cents": metered,
                 "residual_cost_cents": residual,
                 "member_amount_cents": member_amount,
@@ -2130,9 +2167,9 @@ class BillingService:
         if row.subscription_mode in {"one_time", "recurring"} and row.period_cost_cents is not None and row.period_start_at_ms is not None:
             try:
                 return prorate_subscription_cost(
-                    mode=str(row.subscription_mode),
-                    period_cost_cents=int(row.period_cost_cents),
-                    start_ms=int(row.period_start_at_ms),
+                    mode=row.subscription_mode,
+                    period_cost_cents=row.period_cost_cents,
+                    start_ms=row.period_start_at_ms,
                     end_ms=row.period_end_at_ms,
                     recurring_unit=row.recurring_unit,
                     recurring_interval=row.recurring_interval,
@@ -2142,7 +2179,7 @@ class BillingService:
                 )
             except ValueError as exc:
                 raise BillingError(f"上游账号 {row.account_name} 的订阅周期无效：{exc}") from exc
-        return int(row.fixed_cost_cents or 0)
+        return row.fixed_cost_cents or 0
 
     def _cycle_group_snapshots(self, session: Any, cycle: BillingCycle) -> list[CycleGroup]:
         groups = list(session.scalars(
@@ -2160,60 +2197,20 @@ class BillingService:
             is_default=True,
         )]
 
-    def _build_grouped_upstream_estimate(
+    def _upstream_cost_allocation(
         self,
         session: Any,
         cycle: BillingCycle,
-        strict: bool,
-        period: tuple[Any, ...],
-        pools: dict[int, str],
         upstream_rows: list[CycleUpstreamCost],
-        metered_keys: list[dict[str, Any]],
-        metered_by_pool: dict[int, list[dict[str, Any]]],
-        adjustments: dict[int, int],
-    ) -> CycleEstimate:
+        usage_by_auth: dict[str, dict[int, dict[str, int]]],
+        pools: dict[int, str],
+    ) -> tuple[dict[int, CycleGroup], int, list[dict[str, Any]], dict[int, int], dict[int, int],
+               dict[int, set[str]], dict[int, int], dict[int, int]]:
         group_rows = self._cycle_group_snapshots(session, cycle)
         group_by_id = {row.group_id: row for row in group_rows}
         default_group_id = next((row.group_id for row in group_rows if row.is_default), group_rows[0].group_id)
-        usage_by_auth: dict[str, dict[int, dict[str, int]]] = defaultdict(lambda: defaultdict(lambda: {
-            "requests": 0, "tokens": 0, "actual_nano_usd": 0,
-        }))
-        user_usage_by_auth: dict[str, dict[int, dict[int, int]]] = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
-        for auth_index, pool_id, user_id, requests, tokens, actual in session.execute(
-            select(
-                RawUsageEvent.auth_index,
-                RatedEvent.pool_id,
-                RatedEvent.telegram_user_id,
-                func.count(RatedEvent.id),
-                func.sum(RawUsageEvent.total_tokens),
-                func.sum(RatedEvent.rated_weight_nano_usd),
-            )
-            .join(RawUsageEvent, RawUsageEvent.id == RatedEvent.raw_event_id)
-            .where(*period, RatedEvent.pool_id.is_not(None), RawUsageEvent.auth_index.is_not(None))
-            .group_by(RawUsageEvent.auth_index, RatedEvent.pool_id, RatedEvent.telegram_user_id)
-        ):
-            pool_usage = usage_by_auth[str(auth_index)][int(pool_id)]
-            pool_usage["requests"] += int(requests or 0)
-            pool_usage["tokens"] += int(tokens or 0)
-            pool_usage["actual_nano_usd"] += int(actual or 0)
-            if user_id is not None:
-                user_usage_by_auth[str(auth_index)][int(user_id)][int(pool_id)] += int(actual or 0)
-
-        unowned_by_auth = session.execute(
-            select(
-                RawUsageEvent.auth_index,
-                RatedEvent.pool_id,
-                RawUsageEvent.api_key_hash,
-                func.sum(RatedEvent.rated_weight_nano_usd),
-            )
-            .join(RawUsageEvent, RawUsageEvent.id == RatedEvent.raw_event_id)
-            .where(*period, RatedEvent.telegram_user_id.is_(None), RatedEvent.pool_id.is_not(None), RawUsageEvent.auth_index.is_not(None))
-            .group_by(RawUsageEvent.auth_index, RatedEvent.pool_id, RawUsageEvent.api_key_hash)
-        ).all()
-
         default_pool_id = next((pool_id for pool_id, name in pools.items() if name == "default-cpa"), None)
         upstream_costs: list[dict[str, Any]] = []
-        group_account_ids: dict[int, list[str]] = defaultdict(list)
         group_fixed: dict[int, int] = defaultdict(int)
         group_dynamic: dict[int, int] = defaultdict(int)
         group_auth: dict[int, set[str]] = defaultdict(set)
@@ -2221,7 +2218,7 @@ class BillingService:
         pool_dynamic: dict[int, int] = defaultdict(int)
 
         for row in upstream_rows:
-            group_id = int(row.group_id or default_group_id)
+            group_id = row.group_id or default_group_id
             if group_id not in group_by_id:
                 group_id = default_group_id
             by_pool = usage_by_auth.get(row.auth_index, {})
@@ -2238,7 +2235,7 @@ class BillingService:
                 for pool_id, pool_amount in allocated.items():
                     pool_fixed[pool_id] += pool_amount
             else:
-                amount = _metered_amount_cents(total_actual, int(row.rate_ppm or 0))
+                amount = _metered_amount_cents(total_actual, row.rate_ppm or 0)
                 allocated = largest_remainder(
                     amount,
                     {pool_id: item["actual_nano_usd"] for pool_id, item in by_pool.items()},
@@ -2246,7 +2243,6 @@ class BillingService:
                 group_dynamic[group_id] += amount
                 for pool_id, pool_amount in allocated.items():
                     pool_dynamic[pool_id] += pool_amount
-            group_account_ids[group_id].append(row.account_id)
             group_auth[group_id].add(row.auth_index)
             upstream_costs.append({
                 "account_id": row.account_id,
@@ -2263,22 +2259,40 @@ class BillingService:
                 "subscription_mode": row.subscription_mode,
                 "period_cost_cents": row.period_cost_cents,
             })
+        upstream_costs.sort(key=lambda item: item["amount_cents"], reverse=True)
+        return (group_by_id, default_group_id, upstream_costs, group_fixed, group_dynamic, group_auth,
+                pool_fixed, pool_dynamic)
 
-        key_by_hash = {
-            key.cpamp_hash: key
-            for key in session.scalars(select(APIKey))
-        } if unowned_by_auth else {}
+    def _build_grouped_upstream_estimate(
+        self,
+        session: Any,
+        cycle: BillingCycle,
+        strict: bool,
+        usage_rows: list[Any],
+        pools: dict[int, str],
+        upstream_rows: list[CycleUpstreamCost],
+        key_by_hash: dict[str, APIKey],
+        metered_keys: list[dict[str, Any]],
+        metered_by_pool: dict[int, list[dict[str, Any]]],
+        adjustments: dict[int, int],
+    ) -> CycleEstimate:
+        usage_by_auth, user_usage_by_auth = self._usage_by_auth(usage_rows)
+        (group_by_id, default_group_id, upstream_costs, group_fixed, group_dynamic, group_auth,
+         pool_fixed, pool_dynamic) = self._upstream_cost_allocation(session, cycle, upstream_rows, usage_by_auth, pools)
+
+        auth_to_group = {auth_index: group_id for group_id, auths in group_auth.items() for auth_index in auths}
         group_metered: dict[int, int] = defaultdict(int)
-        for auth_index, pool_id, key_hash, actual in unowned_by_auth:
-            key = key_by_hash.get(str(key_hash or ""))
+        for auth_index, pool_id, user_id, key_hash, _, _, actual in usage_rows:
+            if user_id is not None or pool_id is None or auth_index is None:
+                continue
+            key = key_by_hash.get(key_hash)
             if key is None or key.billing_multiplier_ppm is None:
                 continue
-            amount = _metered_amount_cents(int(actual or 0), int(key.billing_multiplier_ppm))
-            group_id = next((gid for gid, auths in group_auth.items() if str(auth_index) in auths), default_group_id)
-            group_metered[group_id] += amount
+            amount = _metered_amount_cents(actual, key.billing_multiplier_ppm)
+            group_metered[auth_to_group.get(auth_index, default_group_id)] += amount
 
         manual_by_group: dict[int, dict[int, dict[int, int]]] = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
-        for pool_id, user_id, group_id, weight in session.execute(
+        for pool_id, user_id, group_id, manual_weight in session.execute(
             select(
                 ManualUsageAdjustment.pool_id,
                 ManualUsageAdjustment.telegram_user_id,
@@ -2288,11 +2302,9 @@ class BillingService:
             .where(ManualUsageAdjustment.cycle_id == cycle.id)
             .group_by(ManualUsageAdjustment.pool_id, ManualUsageAdjustment.telegram_user_id, ManualUsageAdjustment.group_id)
         ):
-            manual_weight = int(weight or 0)
             if manual_weight < 0:
                 raise BillingError("手动原始用量余额不能为负数")
-            gid = int(group_id or default_group_id)
-            manual_by_group[gid][int(user_id)][int(pool_id)] += manual_weight
+            manual_by_group[group_id or default_group_id][user_id][pool_id] += manual_weight
 
         user_lines: dict[int, list[tuple[int | None, int, int, int, int]]] = defaultdict(list)
         group_totals: list[dict[str, Any]] = []
@@ -2366,7 +2378,7 @@ class BillingService:
         return CycleEstimate(
             user_lines=dict(user_lines),
             metered_keys=sorted(metered_keys, key=lambda item: (item["amount_cents"], item["actual_nano_usd"]), reverse=True),
-            upstream_costs=sorted(upstream_costs, key=lambda item: item["amount_cents"], reverse=True),
+            upstream_costs=upstream_costs,
             pool_totals=pool_totals,
             group_totals=sorted(group_totals, key=lambda item: item["group"]),
             adjustments=dict(adjustments),
@@ -2374,7 +2386,7 @@ class BillingService:
             billing_model="upstream_channels",
         )
 
-    def _persist_cycle_estimate(self, session: Any, cycle: BillingCycle, estimate: CycleEstimate) -> None:
+    def _persist_cycle_estimate(self, session: Any, cycle: BillingCycle, estimate: CycleEstimate) -> list[Statement]:
         statement_ids = select(Statement.id).where(Statement.cycle_id == cycle.id)
         session.execute(delete(StatementLine).where(StatementLine.statement_id.in_(statement_ids)))
         session.execute(delete(Statement).where(Statement.cycle_id == cycle.id))
@@ -2400,6 +2412,12 @@ class BillingService:
             row.member_amount_cents = item["member_amount_cents"]
             row.surplus_cents = item["surplus_cents"]
             row.unallocated_cents = item["unallocated_cents"]
+        key_counts = dict(session.execute(
+            select(APIKey.current_owner_id, func.count(APIKey.id))
+            .where(APIKey.current_owner_id.is_not(None))
+            .group_by(APIKey.current_owner_id)
+        ).all())
+        statements: list[tuple[Statement, list[tuple[int | None, int, int, int, int]]]] = []
         for user_id in estimate.user_lines.keys() | estimate.adjustments.keys():
             user_lines = estimate.user_lines.get(user_id, [])
             statement = Statement(
@@ -2413,10 +2431,10 @@ class BillingService:
                 final=False,
             )
             session.add(statement)
-            session.flush()
-            key_count = session.scalar(
-                select(func.count()).select_from(APIKey).where(APIKey.current_owner_id == user_id)
-            ) or 0
+            statements.append((statement, user_lines))
+        session.flush()
+        for statement, user_lines in statements:
+            key_count = key_counts.get(statement.telegram_user_id, 0)
             for group_id, pool_id, actual, billed, amount in user_lines:
                 session.add(StatementLine(
                     statement_id=statement.id,
@@ -2425,7 +2443,7 @@ class BillingService:
                     actual_weight_nano_usd=actual,
                     billed_weight_nano_usd=billed,
                     amount_cents=amount,
-                    api_key_count=int(key_count),
+                    api_key_count=key_count,
                 ))
         for item in estimate.metered_keys:
             session.add(MeteredKeyCharge(
@@ -2438,6 +2456,7 @@ class BillingService:
                 generated_at_ms=estimate.generated_at_ms,
                 final=False,
             ))
+        return [statement for statement, _ in statements]
 
     def preview_cycle(self, cycle_name: str) -> list[Statement]:
         with self.db.session() as session:
@@ -2450,12 +2469,10 @@ class BillingService:
                 ))
             self._validate_cycle_rating(session, cycle)
             estimate = self._build_cycle_estimate(session, cycle, strict=True)
-            self._persist_cycle_estimate(session, cycle, estimate)
+            statements = self._persist_cycle_estimate(session, cycle, estimate)
             cycle.status = "preview"
             session.flush()
-            return list(session.scalars(
-                select(Statement).where(Statement.cycle_id == cycle.id).order_by(Statement.amount_cents.desc())
-            ))
+            return sorted(statements, key=lambda statement: statement.amount_cents, reverse=True)
 
     def close_cycle(self, cycle_name: str, operator_id: int | None, confirm_waiver: bool,
                     operator_type: str = "telegram") -> None:
@@ -2473,7 +2490,182 @@ class BillingService:
                                  operation="cycle.close", target=cycle.name,
                                  after_json=json.dumps({"waiver": cycle.data_quality_waiver}), created_at_ms=now_ms()))
 
-    def dashboard(self, cycle_name: str | None = None) -> dict[str, Any]:
+    def _cycle_billing(self, session: Any, cycle: BillingCycle, usage_rows: list[Any]) -> dict[str, Any]:
+        if cycle.status != "closed":
+            estimate = self._build_cycle_estimate(session, cycle, strict=False, usage_rows=usage_rows)
+            live_user = {
+                user_id: (
+                    sum(value[2] for value in lines),
+                    sum(value[3] for value in lines),
+                    sum(value[4] for value in lines) + estimate.adjustments.get(user_id, 0),
+                )
+                for user_id, lines in estimate.user_lines.items()
+            }
+            for user_id, adjustment in estimate.adjustments.items():
+                live_user.setdefault(user_id, (0, 0, adjustment))
+            return {
+                "live_user": live_user,
+                "metered_keys": estimate.metered_keys,
+                "upstream_costs": estimate.upstream_costs,
+                "pool_totals": estimate.pool_totals,
+                "group_totals": estimate.group_totals,
+                "generated_at_ms": estimate.generated_at_ms,
+                "billing_model": estimate.billing_model,
+            }
+        statements = list(session.scalars(select(Statement).where(Statement.cycle_id == cycle.id)))
+        charges = list(session.scalars(select(MeteredKeyCharge).where(MeteredKeyCharge.cycle_id == cycle.id)))
+        key_map = {row.id: row for row in session.execute(
+            select(APIKey.id, APIKey.masked_value, APIKey.display_name)
+            .where(APIKey.id.in_({item.api_key_id for item in charges}))
+        )} if charges else {}
+        pool_map = {pool.id: pool.name for pool in session.scalars(select(ResourcePool))}
+        unowned_hashes = {
+            key_hash for _, pool_id, user_id, key_hash, _, _, _ in usage_rows
+            if user_id is None and pool_id is not None and key_hash is not None
+        }
+        key_id_by_hash = dict(session.execute(
+            select(APIKey.cpamp_hash, APIKey.id).where(APIKey.cpamp_hash.in_(unowned_hashes))
+        ).all()) if unowned_hashes else {}
+        metered_stats: dict[tuple[int, int], list[int]] = {}
+        for _, pool_id, user_id, key_hash, requests, tokens, _ in usage_rows:
+            key_id = key_id_by_hash.get(key_hash) if user_id is None and pool_id is not None else None
+            if key_id is not None:
+                stats = metered_stats.setdefault((pool_id, key_id), [0, 0])
+                stats[0] += requests
+                stats[1] += tokens
+        metered_keys = [{
+            "pool_id": item.pool_id,
+            "pool": pool_map.get(item.pool_id, str(item.pool_id)),
+            "key_id": item.api_key_id,
+            "masked": key_map[item.api_key_id].masked_value if item.api_key_id in key_map else "key:****",
+            "name": key_map[item.api_key_id].display_name if item.api_key_id in key_map else None,
+            "requests": metered_stats.get((item.pool_id, item.api_key_id), (0, 0))[0],
+            "tokens": metered_stats.get((item.pool_id, item.api_key_id), (0, 0))[1],
+            "actual_nano_usd": item.actual_weight_nano_usd,
+            "multiplier_ppm": item.multiplier_ppm,
+            "amount_cents": item.amount_cents,
+        } for item in charges]
+        upstream_rows = list(session.scalars(
+            select(CycleUpstreamCost).where(CycleUpstreamCost.cycle_id == cycle.id)
+        ))
+        upstream_costs = [{
+            "account_id": item.account_id,
+            "account_name": item.account_name,
+            "auth_type": item.auth_type,
+            "group_id": item.group_id,
+            "group_name": item.group_name,
+            "fixed_cost_cents": item.fixed_cost_cents,
+            "rate_ppm": item.rate_ppm,
+            "requests": item.request_count or 0,
+            "tokens": item.token_count or 0,
+            "actual_nano_usd": item.actual_weight_nano_usd or 0,
+            "amount_cents": item.amount_cents or 0,
+            "subscription_mode": item.subscription_mode,
+            "period_cost_cents": item.period_cost_cents,
+        } for item in upstream_rows]
+        live_user = {
+            statement.telegram_user_id: (
+                statement.actual_weight_nano_usd, statement.billed_weight_nano_usd, statement.amount_cents,
+            )
+            for statement in statements
+        }
+        member_by_pool = dict(session.execute(
+            select(StatementLine.pool_id, func.sum(StatementLine.amount_cents))
+            .join(Statement, Statement.id == StatementLine.statement_id)
+            .where(Statement.cycle_id == cycle.id)
+            .group_by(StatementLine.pool_id)
+        ).all())
+        metered_totals: dict[int, int] = defaultdict(int)
+        for item in metered_keys:
+            metered_totals[item["pool_id"]] += item["amount_cents"]
+        metered_by_pool_closed = {pool_id: metered_totals[pool_id] for pool_id in {item["pool_id"] for item in metered_keys}}
+        pool_totals = []
+        if upstream_rows:
+            obligation_by_pool = {
+                pool_id: member_by_pool.get(pool_id, 0) + metered_by_pool_closed.get(pool_id, 0)
+                for pool_id in member_by_pool.keys() | metered_by_pool_closed.keys()
+            }
+            fixed_total = sum(item.fixed_cost_cents or 0 for item in upstream_rows)
+            dynamic_total = sum(item.amount_cents or 0 for item in upstream_rows if item.auth_type == "api_key")
+            fixed_allocated = largest_remainder(fixed_total, obligation_by_pool)
+            dynamic_allocated = largest_remainder(dynamic_total, obligation_by_pool)
+            pool_totals = [{
+                "pool_id": pool_id,
+                "pool": pool_map.get(pool_id, str(pool_id)),
+                "fixed_cost_cents": fixed_allocated.get(pool_id, 0),
+                "dynamic_cost_cents": dynamic_allocated.get(pool_id, 0),
+                "metered_amount_cents": metered_by_pool_closed.get(pool_id, 0),
+                "residual_cost_cents": member_by_pool.get(pool_id, 0),
+                "member_amount_cents": member_by_pool.get(pool_id, 0),
+                "surplus_cents": max(
+                    0,
+                    metered_by_pool_closed.get(pool_id, 0)
+                    - fixed_allocated.get(pool_id, 0)
+                    - dynamic_allocated.get(pool_id, 0),
+                ),
+                "unallocated_cents": 0,
+            } for pool_id in obligation_by_pool]
+        else:
+            for pool_id, fixed in session.execute(
+                select(CyclePoolCost.pool_id, CyclePoolCost.fixed_cost_cents).where(CyclePoolCost.cycle_id == cycle.id)
+            ):
+                metered = metered_by_pool_closed.get(pool_id, 0)
+                pool_totals.append({
+                    "pool_id": pool_id, "pool": pool_map.get(pool_id, str(pool_id)),
+                    "fixed_cost_cents": fixed, "dynamic_cost_cents": 0,
+                    "metered_amount_cents": metered,
+                    "residual_cost_cents": max(0, fixed - metered),
+                    "member_amount_cents": member_by_pool.get(pool_id, 0),
+                    "surplus_cents": max(0, metered - fixed), "unallocated_cents": 0,
+                })
+        group_totals = [{
+            "group_id": item.group_id,
+            "group": item.group_name,
+            "gradient_rule_id": item.gradient_rule_id,
+            "fixed_cost_cents": item.fixed_cost_cents,
+            "dynamic_cost_cents": item.dynamic_cost_cents,
+            "metered_amount_cents": item.metered_amount_cents,
+            "residual_cost_cents": item.residual_cost_cents,
+            "member_amount_cents": item.member_amount_cents,
+            "surplus_cents": item.surplus_cents,
+            "unallocated_cents": item.unallocated_cents,
+        } for item in session.scalars(select(CycleGroup).where(CycleGroup.cycle_id == cycle.id))]
+        return {
+            "live_user": live_user,
+            "metered_keys": metered_keys,
+            "upstream_costs": upstream_costs,
+            "pool_totals": pool_totals,
+            "group_totals": group_totals,
+            "generated_at_ms": max(
+                (row.generated_at_ms for row in statements), default=cycle.closed_at_ms or now_ms()
+            ),
+            "billing_model": "upstream_channels" if upstream_rows else "legacy_pool_fixed",
+        }
+
+    def _billing_user_row(self, user: TelegramUser, usage: tuple[int, int, int], manual_actual: int,
+                          estimate_values: tuple[int, int, int], key_count: int) -> dict[str, Any]:
+        requests, tokens, request_actual = usage
+        actual = request_actual + manual_actual
+        return {
+            "telegram_user_id": user.telegram_user_id,
+            "name": self._user_name(user, user.telegram_user_id),
+            "requests": requests,
+            "tokens": tokens,
+            "actual": format_usd_nano(actual),
+            "actual_nano": actual,
+            "request_actual": format_usd_nano(request_actual),
+            "request_actual_nano": request_actual,
+            "manual_actual": format_usd_nano(manual_actual),
+            "manual_actual_nano": manual_actual,
+            "billed": format_usd_nano(estimate_values[1]),
+            "amount": format_cents(estimate_values[2]),
+            "amount_cents": estimate_values[2],
+            "user_rate": format_yuan_per_usd(estimate_values[2], actual),
+            "key_count": key_count,
+            "unowned": False,
+        }
+
+    def dashboard(self, cycle_name: str | None = None, *, include_models: bool = True) -> dict[str, Any]:
         with self.db.session() as session:
             cycle = self._display_cycle(session, cycle_name)
             cycles = list(session.scalars(select(BillingCycle).order_by(BillingCycle.start_at_ms.desc())))
@@ -2488,219 +2680,47 @@ class BillingService:
                                    "metered_amount": "0.00", "amount": "0.00",
                                    "global_rate": None}}
 
-            period = (
-                RatedEvent.pricing_version_id == cycle.pricing_version_id,
-                RatedEvent.occurred_at_ms >= cycle.start_at_ms,
-                RatedEvent.occurred_at_ms < cycle.end_at_ms,
-            )
-            usage_rows = session.execute(
-                select(RatedEvent.telegram_user_id, func.count(RatedEvent.id), func.sum(RawUsageEvent.total_tokens),
-                       func.sum(RatedEvent.rated_weight_nano_usd))
-                .join(RawUsageEvent, RawUsageEvent.id == RatedEvent.raw_event_id)
-                .where(*period)
-                .group_by(RatedEvent.telegram_user_id)
-            ).all()
-            usage = {user_id: (int(requests or 0), int(tokens or 0), int(cost or 0))
-                     for user_id, requests, tokens, cost in usage_rows}
-            manual_usage = {
-                int(user_id): int(weight or 0)
-                for user_id, weight in session.execute(
-                    select(
-                        ManualUsageAdjustment.telegram_user_id,
-                        func.sum(ManualUsageAdjustment.amount_nano_usd),
-                    )
-                    .where(ManualUsageAdjustment.cycle_id == cycle.id)
-                    .group_by(ManualUsageAdjustment.telegram_user_id)
-                )
-            }
-            if cycle.status == "closed":
-                statements = {row.telegram_user_id: row for row in session.scalars(
-                    select(Statement).where(Statement.cycle_id == cycle.id)
-                )}
-                key_map = {key.id: key for key in session.scalars(select(APIKey))}
-                pool_map = {pool.id: pool.name for pool in session.scalars(select(ResourcePool))}
-                metered_stats = {
-                    (int(pool_id), int(key_id)): (int(requests or 0), int(tokens or 0))
-                    for pool_id, key_id, requests, tokens in session.execute(
-                        select(
-                            RatedEvent.pool_id,
-                            APIKey.id,
-                            func.count(RatedEvent.id),
-                            func.sum(RawUsageEvent.total_tokens),
-                        )
-                        .join(RawUsageEvent, RawUsageEvent.id == RatedEvent.raw_event_id)
-                        .join(APIKey, APIKey.cpamp_hash == RawUsageEvent.api_key_hash)
-                        .where(*period, RatedEvent.telegram_user_id.is_(None))
-                        .group_by(RatedEvent.pool_id, APIKey.id)
-                    )
-                    if pool_id is not None
-                }
-                metered_keys = [{
-                    "pool_id": item.pool_id,
-                    "pool": pool_map.get(item.pool_id, str(item.pool_id)),
-                    "key_id": item.api_key_id,
-                    "masked": key_map[item.api_key_id].masked_value if item.api_key_id in key_map else "key:****",
-                    "name": key_map[item.api_key_id].display_name if item.api_key_id in key_map else None,
-                    "requests": metered_stats.get((item.pool_id, item.api_key_id), (0, 0))[0],
-                    "tokens": metered_stats.get((item.pool_id, item.api_key_id), (0, 0))[1],
-                    "actual_nano_usd": item.actual_weight_nano_usd,
-                    "multiplier_ppm": item.multiplier_ppm,
-                    "amount_cents": item.amount_cents,
-                } for item in session.scalars(select(MeteredKeyCharge).where(MeteredKeyCharge.cycle_id == cycle.id))]
-                upstream_rows = list(session.scalars(
-                    select(CycleUpstreamCost).where(CycleUpstreamCost.cycle_id == cycle.id)
-                ))
-                billing_model = "upstream_channels" if upstream_rows else "legacy_pool_fixed"
-                upstream_costs = [{
-                    "account_id": item.account_id,
-                    "account_name": item.account_name,
-                    "auth_type": item.auth_type,
-                    "group_id": item.group_id,
-                    "group_name": item.group_name,
-                    "fixed_cost_cents": item.fixed_cost_cents,
-                    "rate_ppm": item.rate_ppm,
-                    "requests": int(item.request_count or 0),
-                    "tokens": int(item.token_count or 0),
-                    "actual_nano_usd": int(item.actual_weight_nano_usd or 0),
-                    "amount_cents": int(item.amount_cents or 0),
-                    "subscription_mode": item.subscription_mode,
-                    "period_cost_cents": item.period_cost_cents,
-                } for item in upstream_rows]
-                live_user = {
-                    user_id: (statement.actual_weight_nano_usd, statement.billed_weight_nano_usd, statement.amount_cents)
-                    for user_id, statement in statements.items()
-                }
-                fixed_by_pool = {item.pool_id: item.fixed_cost_cents for item in session.scalars(
-                    select(CyclePoolCost).where(CyclePoolCost.cycle_id == cycle.id)
-                )}
-                pool_totals = []
-                if upstream_rows:
-                    member_by_pool = {
-                        int(pool_id): int(amount or 0)
-                        for pool_id, amount in session.execute(
-                            select(StatementLine.pool_id, func.sum(StatementLine.amount_cents))
-                            .join(Statement, Statement.id == StatementLine.statement_id)
-                            .where(Statement.cycle_id == cycle.id)
-                            .group_by(StatementLine.pool_id)
-                        )
-                    }
-                    metered_by_pool_closed = {
-                        pool_id: sum(item["amount_cents"] for item in metered_keys if item["pool_id"] == pool_id)
-                        for pool_id in {item["pool_id"] for item in metered_keys}
-                    }
-                    obligation_by_pool = {
-                        pool_id: member_by_pool.get(pool_id, 0) + metered_by_pool_closed.get(pool_id, 0)
-                        for pool_id in member_by_pool.keys() | metered_by_pool_closed.keys()
-                    }
-                    fixed_total = sum(int(item.fixed_cost_cents or 0) for item in upstream_rows)
-                    dynamic_total = sum(
-                        int(item.amount_cents or 0) for item in upstream_rows if item.auth_type == "api_key"
-                    )
-                    fixed_allocated = largest_remainder(fixed_total, obligation_by_pool)
-                    dynamic_allocated = largest_remainder(dynamic_total, obligation_by_pool)
-                    pool_totals = [{
-                        "pool_id": pool_id,
-                        "pool": pool_map.get(pool_id, str(pool_id)),
-                        "fixed_cost_cents": fixed_allocated.get(pool_id, 0),
-                        "dynamic_cost_cents": dynamic_allocated.get(pool_id, 0),
-                        "metered_amount_cents": metered_by_pool_closed.get(pool_id, 0),
-                        "residual_cost_cents": member_by_pool.get(pool_id, 0),
-                        "member_amount_cents": member_by_pool.get(pool_id, 0),
-                        "surplus_cents": max(
-                            0,
-                            metered_by_pool_closed.get(pool_id, 0)
-                            - fixed_allocated.get(pool_id, 0)
-                            - dynamic_allocated.get(pool_id, 0),
-                        ),
-                        "unallocated_cents": 0,
-                    } for pool_id in obligation_by_pool]
-                for pool_id, fixed in ([] if upstream_rows else fixed_by_pool.items()):
-                    metered = sum(item["amount_cents"] for item in metered_keys if item["pool_id"] == pool_id)
-                    member = sum(line.amount_cents for line in session.scalars(
-                        select(StatementLine).join(Statement).where(
-                            Statement.cycle_id == cycle.id,
-                            StatementLine.pool_id == pool_id,
-                        )
-                    ))
-                    pool_totals.append({
-                        "pool_id": pool_id, "pool": pool_map.get(pool_id, str(pool_id)),
-                        "fixed_cost_cents": int(fixed), "dynamic_cost_cents": 0,
-                        "metered_amount_cents": metered,
-                        "residual_cost_cents": max(0, int(fixed) - metered), "member_amount_cents": member,
-                        "surplus_cents": max(0, metered - int(fixed)), "unallocated_cents": 0,
-                    })
-                generated_at_ms = max((row.generated_at_ms for row in statements.values()), default=cycle.closed_at_ms or now_ms())
-                group_totals = [{
-                    "group_id": item.group_id,
-                    "group": item.group_name,
-                    "gradient_rule_id": item.gradient_rule_id,
-                    "fixed_cost_cents": int(item.fixed_cost_cents or 0),
-                    "dynamic_cost_cents": int(item.dynamic_cost_cents or 0),
-                    "metered_amount_cents": int(item.metered_amount_cents or 0),
-                    "residual_cost_cents": int(item.residual_cost_cents or 0),
-                    "member_amount_cents": int(item.member_amount_cents or 0),
-                    "surplus_cents": int(item.surplus_cents or 0),
-                    "unallocated_cents": int(item.unallocated_cents or 0),
-                } for item in session.scalars(select(CycleGroup).where(CycleGroup.cycle_id == cycle.id))]
-            else:
-                estimate = self._build_cycle_estimate(session, cycle, strict=False)
-                live_user = {
-                    user_id: (
-                        sum(value[2] for value in lines),
-                        sum(value[3] for value in lines),
-                        sum(value[4] for value in lines) + estimate.adjustments.get(user_id, 0),
-                    )
-                    for user_id, lines in estimate.user_lines.items()
-                }
-                for user_id, adjustment in estimate.adjustments.items():
-                    live_user.setdefault(user_id, (0, 0, adjustment))
-                statements = {}
-                metered_keys = estimate.metered_keys
-                upstream_costs = estimate.upstream_costs
-                pool_totals = estimate.pool_totals
-                group_totals = estimate.group_totals
-                generated_at_ms = estimate.generated_at_ms
-                billing_model = estimate.billing_model
-            key_counts = {owner_id: int(count or 0) for owner_id, count in session.execute(
+            usage_rows = self._cycle_usage_rows(session, cycle)
+            usage: dict[int | None, list[int]] = {}
+            unowned_hashes: set[str] = set()
+            for _, _, user_id, key_hash, requests, tokens, actual in usage_rows:
+                totals = usage.setdefault(user_id, [0, 0, 0])
+                totals[0] += requests
+                totals[1] += tokens
+                totals[2] += actual
+                if user_id is None and key_hash is not None:
+                    unowned_hashes.add(key_hash)
+            manual_usage = dict(session.execute(
+                select(ManualUsageAdjustment.telegram_user_id, func.sum(ManualUsageAdjustment.amount_nano_usd))
+                .where(ManualUsageAdjustment.cycle_id == cycle.id)
+                .group_by(ManualUsageAdjustment.telegram_user_id)
+            ).all())
+            billing = self._cycle_billing(session, cycle, usage_rows)
+            live_user = billing["live_user"]
+            metered_keys = billing["metered_keys"]
+            upstream_costs = billing["upstream_costs"]
+            pool_totals = billing["pool_totals"]
+            key_counts = dict(session.execute(
                 select(APIKey.current_owner_id, func.count(APIKey.id))
                 .where(APIKey.status == "active", APIKey.current_owner_id.is_not(None))
                 .group_by(APIKey.current_owner_id)
-            )}
+            ).all())
             users = list(session.scalars(
                 select(TelegramUser).where(TelegramUser.registered_at_ms.is_not(None)).order_by(TelegramUser.telegram_user_id)
             ))
-            rows: list[dict[str, Any]] = []
-            for user in users:
-                requests, tokens, request_actual = usage.get(user.telegram_user_id, (0, 0, 0))
-                estimate_values = live_user.get(user.telegram_user_id, (0, 0, 0))
-                manual_actual = manual_usage.get(user.telegram_user_id, 0)
-                actual = request_actual + manual_actual
-                rows.append({
-                    "telegram_user_id": user.telegram_user_id,
-                    "name": self._user_name(user, user.telegram_user_id),
-                    "requests": requests,
-                    "tokens": tokens,
-                    "actual": format_usd_nano(actual),
-                    "actual_nano": actual,
-                    "request_actual": format_usd_nano(request_actual),
-                    "request_actual_nano": request_actual,
-                    "manual_actual": format_usd_nano(manual_actual),
-                    "manual_actual_nano": manual_actual,
-                    "billed": format_usd_nano(estimate_values[1]),
-                    "amount": format_cents(estimate_values[2]),
-                    "amount_cents": estimate_values[2],
-                    "user_rate": format_yuan_per_usd(estimate_values[2], actual),
-                    "key_count": key_counts.get(user.telegram_user_id, 0),
-                    "unowned": False,
-                })
+            rows: list[dict[str, Any]] = [
+                self._billing_user_row(
+                    user,
+                    tuple(usage.get(user.telegram_user_id, (0, 0, 0))),
+                    manual_usage.get(user.telegram_user_id, 0),
+                    live_user.get(user.telegram_user_id, (0, 0, 0)),
+                    key_counts.get(user.telegram_user_id, 0),
+                )
+                for user in users
+            ]
             if None in usage:
                 requests, tokens, actual = usage[None]
-                unowned_key_count = session.scalar(
-                    select(func.count(func.distinct(RawUsageEvent.api_key_hash)))
-                    .select_from(RatedEvent)
-                    .join(RawUsageEvent, RawUsageEvent.id == RatedEvent.raw_event_id)
-                    .where(*period, RatedEvent.telegram_user_id.is_(None))
-                ) or 0
+                metered_amount = sum(item["amount_cents"] for item in metered_keys)
                 rows.append({
                     "telegram_user_id": None,
                     "name": "未绑定 Telegram 的 API Key",
@@ -2713,10 +2733,10 @@ class BillingService:
                     "manual_actual": "0.0000",
                     "manual_actual_nano": 0,
                     "billed": "0.0000",
-                    "amount": format_cents(sum(item["amount_cents"] for item in metered_keys)),
-                    "amount_cents": sum(item["amount_cents"] for item in metered_keys),
+                    "amount": format_cents(metered_amount),
+                    "amount_cents": metered_amount,
                     "user_rate": None,
-                    "key_count": int(unowned_key_count),
+                    "key_count": len(unowned_hashes),
                     "unowned": True,
                 })
             rows.sort(key=lambda item: (item["actual_nano"], item["requests"]), reverse=True)
@@ -2724,29 +2744,18 @@ class BillingService:
                 select(RawUsageEvent.model, func.count(RatedEvent.id), func.sum(RawUsageEvent.total_tokens),
                        func.sum(RatedEvent.rated_weight_nano_usd))
                 .join(RatedEvent, RatedEvent.raw_event_id == RawUsageEvent.id)
-                .where(*period)
+                .where(*self._cycle_period(cycle))
                 .group_by(RawUsageEvent.model)
                 .order_by(func.sum(RatedEvent.rated_weight_nano_usd).desc())
                 .limit(20)
-            ).all()
+            ).all() if include_models else []
             member_amount_cents = sum(item["amount_cents"] for item in rows if not item["unowned"])
             metered_amount_cents = sum(item["amount_cents"] for item in metered_keys)
             dynamic_amount_cents = sum(
                 item["amount_cents"] for item in upstream_costs if item["auth_type"] == "api_key"
             )
             member_billed_nano_usd = sum(value[1] for value in live_user.values())
-            unpriced_events = int(session.scalar(
-                select(func.count()).select_from(RawUsageEvent)
-                .outerjoin(RatedEvent, and_(
-                    RatedEvent.raw_event_id == RawUsageEvent.id,
-                    RatedEvent.pricing_version_id == cycle.pricing_version_id,
-                ))
-                .where(
-                    RawUsageEvent.occurred_at_ms >= cycle.start_at_ms,
-                    RawUsageEvent.occurred_at_ms < cycle.end_at_ms,
-                    RatedEvent.id.is_(None),
-                )
-            ) or 0)
+            unpriced_events = self._cycle_unpriced_count(session, cycle)
             gradient = session.get(GradientRule, cycle.gradient_rule_id)
             version = session.get(PricingVersion, cycle.pricing_version_id)
             return {
@@ -2759,7 +2768,7 @@ class BillingService:
                           "estimate_live": cycle.status != "closed",
                           "estimate_complete": unpriced_events == 0,
                           "unpriced_events": unpriced_events,
-                          "estimate_generated_at": self._iso_timestamp(generated_at_ms)},
+                          "estimate_generated_at": self._iso_timestamp(billing["generated_at_ms"])},
                 "cycles": [{"name": item.name, "status": item.status} for item in cycles],
                 "rows": rows,
                 "metered_keys": [{
@@ -2777,7 +2786,7 @@ class BillingService:
                     ),
                     "amount": format_cents(item["amount_cents"]),
                 } for item in upstream_costs],
-                "billing_model": billing_model,
+                "billing_model": billing["billing_model"],
                 "pool_totals": [{
                     **item,
                     "fixed_cost": format_cents(item["fixed_cost_cents"]),
@@ -2793,22 +2802,22 @@ class BillingService:
                     "metered_amount": format_cents(item["metered_amount_cents"]),
                     "residual_cost": format_cents(item["residual_cost_cents"]),
                     "member_amount": format_cents(item["member_amount_cents"]),
-                } for item in group_totals],
-                "models": [{"model": model, "requests": int(requests or 0), "tokens": int(tokens or 0),
-                            "cost": format_usd_nano(int(cost or 0))} for model, requests, tokens, cost in model_rows],
+                } for item in billing["group_totals"]],
+                "models": [{"model": model, "requests": requests, "tokens": tokens, "cost": format_usd_nano(cost)}
+                           for model, requests, tokens, cost in model_rows],
                 "totals": {
                     "requests": sum(item["requests"] for item in rows),
                     "tokens": sum(item["tokens"] for item in rows),
                     "actual": format_usd_nano(sum(item["actual_nano"] for item in rows)),
                     "request_actual": format_usd_nano(sum(item["request_actual_nano"] for item in rows)),
                     "manual_actual": format_usd_nano(sum(item["manual_actual_nano"] for item in rows)),
-                    "billed": format_usd_nano(sum(value[1] for value in live_user.values())),
+                    "billed": format_usd_nano(member_billed_nano_usd),
                     "member_amount": format_cents(member_amount_cents),
                     "metered_amount": format_cents(metered_amount_cents),
                     "dynamic_cost": format_cents(dynamic_amount_cents),
                     "amount": format_cents(member_amount_cents + metered_amount_cents),
                     "fixed_cost": format_cents(
-                        sum(int(item["fixed_cost_cents"] or 0) for item in upstream_costs if item.get("auth_type") == "oauth")
+                        sum(item["fixed_cost_cents"] or 0 for item in upstream_costs if item.get("auth_type") == "oauth")
                         or sum(item["fixed_cost_cents"] for item in pool_totals)
                     ),
                     "global_rate": format_yuan_per_usd(member_amount_cents, member_billed_nano_usd),
@@ -2820,60 +2829,68 @@ class BillingService:
             user = session.get(TelegramUser, user_id)
             if user is None or user.registered_at_ms is None:
                 raise BillingError("user not found")
-        billing = self.dashboard(cycle_name)
-        billing_row = next(
-            (row for row in billing["rows"] if row["telegram_user_id"] == user_id),
-            None,
-        )
-        with self.db.session() as session:
-            user = session.get(TelegramUser, user_id)
-            cycle = session.scalar(
-                select(BillingCycle).where(BillingCycle.name == billing["cycle"]["name"])
-            ) if billing["cycle"] else None
+            cycle = self._display_cycle(session, cycle_name)
             data: dict[str, Any] = {"telegram_user_id": user_id, "username": user.username, "first_name": user.first_name, "last_name": user.last_name,
-                                    "statement": None if billing_row is None else {
-                                        "actual": billing_row["actual"],
-                                        "request_actual": billing_row["request_actual"],
-                                        "manual_actual": billing_row["manual_actual"],
-                                        "billed": billing_row["billed"],
-                                        "amount": billing_row["amount"],
-                                        "live": bool(billing["cycle"]["estimate_live"]),
-                                        "generated_at": billing["cycle"]["estimate_generated_at"],
-                                    },
+                                    "statement": None,
                                     "cycle": None, "cycles": [], "summary": {"requests": 0, "tokens": 0, "cost": "0.0000",
                                     "failed": 0, "success_rate": "-", "long_context": 0}, "models": [], "tiers": []}
             data["cycles"] = [{"name": item.name, "status": item.status} for item in session.scalars(
                 select(BillingCycle).order_by(BillingCycle.start_at_ms.desc())
             )]
-            if cycle:
-                data["cycle"] = {"name": cycle.name, "status": cycle.status, "start": self._format_timestamp(cycle.start_at_ms),
-                                 "end": self._format_timestamp(cycle.end_at_ms)}
-                period = (RatedEvent.pricing_version_id == cycle.pricing_version_id,
-                          RatedEvent.occurred_at_ms >= cycle.start_at_ms, RatedEvent.occurred_at_ms < cycle.end_at_ms,
-                          RatedEvent.telegram_user_id == user_id)
-                summary = session.execute(
-                    select(func.count(RatedEvent.id), func.sum(RawUsageEvent.total_tokens),
-                           func.sum(RatedEvent.rated_weight_nano_usd), func.sum(RawUsageEvent.failed),
-                           func.sum(RatedEvent.long_context_applied))
-                    .join(RawUsageEvent, RawUsageEvent.id == RatedEvent.raw_event_id)
-                    .where(*period)
-                ).one()
-                requests = int(summary[0] or 0)
-                failed = int(summary[3] or 0)
-                data["summary"] = {"requests": requests, "tokens": int(summary[1] or 0),
-                                   "cost": format_usd_nano(int(summary[2] or 0)), "failed": failed,
-                                   "success_rate": f"{(requests - failed) * 100 / requests:.1f}%" if requests else "-",
-                                   "long_context": int(summary[4] or 0)}
-                model_rows = session.execute(select(RawUsageEvent.model, func.count(RawUsageEvent.id), func.sum(RawUsageEvent.total_tokens),
-                                                    func.sum(RatedEvent.rated_weight_nano_usd)).join(RatedEvent, RatedEvent.raw_event_id == RawUsageEvent.id)
-                                             .where(*period).group_by(RawUsageEvent.model)
-                                             .order_by(func.sum(RatedEvent.rated_weight_nano_usd).desc())).all()
-                tier_rows = session.execute(select(RatedEvent.service_tier, func.count(RatedEvent.id), func.sum(RatedEvent.rated_weight_nano_usd))
-                                            .where(*period).group_by(RatedEvent.service_tier)).all()
-                data["models"] = [{"model": model, "requests": int(requests or 0), "tokens": int(tokens or 0), "cost": format_usd_nano(int(cost or 0))}
-                                  for model, requests, tokens, cost in model_rows]
-                data["tiers"] = [{"tier": tier, "requests": int(requests or 0), "cost": format_usd_nano(int(cost or 0))}
-                                 for tier, requests, cost in tier_rows]
+            if cycle is None:
+                return data
+            usage_rows = self._cycle_usage_rows(session, cycle)
+            billing = self._cycle_billing(session, cycle, usage_rows)
+            manual_actual = session.scalar(
+                select(func.sum(ManualUsageAdjustment.amount_nano_usd))
+                .where(ManualUsageAdjustment.cycle_id == cycle.id, ManualUsageAdjustment.telegram_user_id == user_id)
+            ) or 0
+            request_actual = sum(row[6] for row in usage_rows if row[2] == user_id)
+            billing_row = self._billing_user_row(
+                user, (0, 0, request_actual), manual_actual, billing["live_user"].get(user_id, (0, 0, 0)), 0,
+            )
+            data["statement"] = {
+                "actual": billing_row["actual"],
+                "request_actual": billing_row["request_actual"],
+                "manual_actual": billing_row["manual_actual"],
+                "billed": billing_row["billed"],
+                "amount": billing_row["amount"],
+                "live": cycle.status != "closed",
+                "generated_at": self._iso_timestamp(billing["generated_at_ms"]),
+            }
+            data["cycle"] = {"name": cycle.name, "status": cycle.status, "start": self._format_timestamp(cycle.start_at_ms),
+                             "end": self._format_timestamp(cycle.end_at_ms)}
+            models: dict[str, list[int]] = {}
+            tiers: dict[str, list[int]] = {}
+            failed = long_context = 0
+            for model, tier, requests, tokens, cost, failed_count, long_count in session.execute(
+                select(RawUsageEvent.model, RatedEvent.service_tier, func.count(RatedEvent.id),
+                       func.sum(RawUsageEvent.total_tokens), func.sum(RatedEvent.rated_weight_nano_usd),
+                       func.sum(case((RawUsageEvent.failed.is_(True), 1), else_=0)),
+                       func.sum(case((RatedEvent.long_context_applied.is_(True), 1), else_=0)))
+                .join(RawUsageEvent, RawUsageEvent.id == RatedEvent.raw_event_id)
+                .where(*self._cycle_period(cycle), RatedEvent.telegram_user_id == user_id)
+                .group_by(RawUsageEvent.model, RatedEvent.service_tier)
+            ):
+                model_totals = models.setdefault(model, [0, 0, 0])
+                model_totals[0] += requests
+                model_totals[1] += tokens
+                model_totals[2] += cost
+                tier_totals = tiers.setdefault(tier, [0, 0])
+                tier_totals[0] += requests
+                tier_totals[1] += cost
+                failed += failed_count
+                long_context += long_count
+            requests = sum(item[0] for item in models.values())
+            data["summary"] = {"requests": requests, "tokens": sum(item[1] for item in models.values()),
+                               "cost": format_usd_nano(sum(item[2] for item in models.values())), "failed": failed,
+                               "success_rate": f"{(requests - failed) * 100 / requests:.1f}%" if requests else "-",
+                               "long_context": long_context}
+            data["models"] = [{"model": model, "requests": requests, "tokens": tokens, "cost": format_usd_nano(cost)}
+                              for model, (requests, tokens, cost) in sorted(
+                                  sorted(models.items()), key=lambda item: item[1][2], reverse=True)]
+            data["tiers"] = [{"tier": tier, "requests": requests, "cost": format_usd_nano(cost)}
+                             for tier, (requests, cost) in sorted(tiers.items())]
             return data
 
     def user_keys(self, user_id: int) -> dict[str, Any]:
@@ -2923,38 +2940,22 @@ class BillingService:
         with self.db.session() as session:
             if not all_users and session.get(TelegramUser, user_id) is None:
                 raise BillingError("用户不存在")
-            model_values = union(*(
-                select(column.label("model"))
-                .select_from(property_scope)
-                .where(*property_filters, column.is_not(None))
-                for column in (
-                    RawUsageEvent.model,
-                    RawUsageEvent.requested_model,
-                    RawUsageEvent.resolved_model,
-                )
-            )).subquery()
-            models = [str(value) for value in session.scalars(
-                select(model_values.c.model).order_by(model_values.c.model)
-            )]
             tier_expression = self._raw_billing_service_tier_expression()
-            tiers = sorted({str(value or "default") for value in session.scalars(
-                select(tier_expression).select_from(property_scope)
-                .where(*property_filters).distinct().order_by(tier_expression)
-            )})
-            providers = [str(value) for value in session.scalars(
-                select(RawUsageEvent.provider).select_from(property_scope)
-                .where(*property_filters).where(RawUsageEvent.provider.is_not(None))
-                .distinct().order_by(RawUsageEvent.provider)
-            )]
-            failure_codes = [int(value) for value in session.scalars(
-                select(RawUsageEvent.fail_status_code).select_from(property_scope)
-                .where(*property_filters).where(RawUsageEvent.fail_status_code.is_not(None))
-                .distinct().order_by(RawUsageEvent.fail_status_code)
-            )]
-            bounds = session.execute(
-                select(func.min(RawUsageEvent.occurred_at_ms), func.max(RawUsageEvent.occurred_at_ms))
+            property_columns = (
+                RawUsageEvent.model, RawUsageEvent.requested_model, RawUsageEvent.resolved_model,
+                tier_expression, RawUsageEvent.provider, RawUsageEvent.fail_status_code,
+            )
+            property_rows = session.execute(
+                select(*property_columns, func.min(RawUsageEvent.occurred_at_ms), func.max(RawUsageEvent.occurred_at_ms))
                 .select_from(property_scope).where(*property_filters)
-            ).one()
+                .group_by(*property_columns)
+            ).all()
+            models = sorted({value for row in property_rows for value in row[:3] if value is not None})
+            tiers = sorted({row[3] for row in property_rows})
+            providers = sorted({row[4] for row in property_rows if row[4] is not None})
+            failure_codes = sorted({row[5] for row in property_rows if row[5] is not None})
+            bounds = (min((row[6] for row in property_rows), default=None),
+                      max((row[7] for row in property_rows), default=None))
             key_rows = session.execute(
                 select(APIKey.id, APIKey.masked_value, APIKey.display_name, APIKey.status)
                 .select_from(event_scope)
@@ -3024,6 +3025,8 @@ class BillingService:
                 raise BillingError("TPS 筛选值必须是非负有限数")
         if min_tps is not None and max_tps is not None and min_tps > max_tps:
             raise BillingError("TPS 筛选下限不能大于上限")
+
+        from sqlalchemy.orm import defer
 
         with self.db.session() as session:
             if range_name is None:
@@ -3169,16 +3172,17 @@ class BillingService:
                     func.sum(case((RatedEvent.id.is_(None), 1), else_=0)),
                 ).select_from(event_history).where(*filters)
             ).one()
-            total = int(aggregate[0] or 0)
+            total = aggregate[0]
             rows = session.execute(
                 select(RawUsageEvent, RatedEvent, APIKey, TelegramUser)
                 .select_from(event_history)
+                .options(defer(RawUsageEvent.response_metadata_json), defer(RatedEvent.calculation_json))
                 .where(*filters)
                 .order_by(sort_options[sort], RawUsageEvent.id.desc())
                 .offset((page - 1) * page_size)
                 .limit(page_size)
             ).all()
-            auth_indexes = {str(event.auth_index) for event, _, _, _ in rows if event.auth_index}
+            auth_indexes = {event.auth_index for event, _, _, _ in rows if event.auth_index}
             channel_snapshots: dict[str, list[tuple[int, int, CycleUpstreamCost]]] = defaultdict(list)
             if auth_indexes:
                 for upstream, cycle_start, cycle_end in session.execute(
@@ -3193,11 +3197,11 @@ class BillingService:
                 generation_ms = None
                 tps = None
                 if event.latency_ms is not None and event.ttft_ms is not None:
-                    candidate_generation_ms = int(event.latency_ms) - int(event.ttft_ms)
+                    candidate_generation_ms = event.latency_ms - event.ttft_ms
                     if candidate_generation_ms > 0:
                         generation_ms = candidate_generation_ms
                 if event.latency_ms is not None and event.latency_ms > 0 and event.output_tokens > 0:
-                    tps = round(int(event.output_tokens) * 1000 / int(event.latency_ms), 2)
+                    tps = round(event.output_tokens * 1000 / event.latency_ms, 2)
                 key_payload = {
                     "id": key.id if key else None,
                     "masked": key.masked_value if key else mask_hash(event.api_key_hash or ""),
@@ -3205,16 +3209,16 @@ class BillingService:
                 }
                 channel_snapshot = next((
                     upstream
-                    for start_at_ms, end_at_ms, upstream in channel_snapshots.get(str(event.auth_index or ""), [])
+                    for start_at_ms, end_at_ms, upstream in channel_snapshots.get(event.auth_index, [])
                     if start_at_ms <= event.occurred_at_ms < end_at_ms
                 ), None)
-                source_label = str(event.source_label or "").strip()
+                source_label = (event.source_label or "").strip()
                 source_is_api_key = source_label.startswith("m:")
                 channel_name = channel_snapshot.account_name if channel_snapshot is not None else event.account_snapshot
                 channel_auth_type = channel_snapshot.auth_type if channel_snapshot is not None else None
                 if not channel_name and source_label:
                     channel_name = (
-                        f"{str(event.provider or '上游').title()} API key {source_label[2:]}"
+                        f"{(event.provider or '上游').title()} API key {source_label[2:]}"
                         if source_is_api_key else source_label
                     )
                     channel_auth_type = "api_key" if source_is_api_key else None
@@ -3244,13 +3248,13 @@ class BillingService:
                         "reasoning": event.reasoning_tokens,
                         "total": event.total_tokens,
                     },
-                    "failed": bool(event.failed),
+                    "failed": event.failed,
                     "status_code": event.fail_status_code,
                     "latency_ms": event.latency_ms,
                     "ttft_ms": event.ttft_ms,
                     "generation_ms": generation_ms,
                     "tps": tps,
-                    "long_context": bool(rated.long_context_applied) if rated else None,
+                    "long_context": rated.long_context_applied if rated else None,
                     "cost_nano_usd": rated.rated_weight_nano_usd if rated else None,
                     "cost": format_usd_nano(rated.rated_weight_nano_usd) if rated else None,
                     "pricing_status": "priced" if rated else "unpriced",
@@ -3331,19 +3335,19 @@ class BillingService:
             ).all()
             usage = {
                 user_id: {
-                    "requests": int(requests or 0),
-                    "tokens": int(tokens or 0),
-                    "cost_nano_usd": int(cost or 0),
-                    "failed": int(failed or 0),
-                    "long_context": int(long_context or 0),
+                    "requests": requests,
+                    "tokens": tokens,
+                    "cost_nano_usd": cost or 0,
+                    "failed": failed,
+                    "long_context": long_context,
                 }
                 for user_id, requests, tokens, cost, failed, long_context in usage_rows
             }
-            key_counts = {owner_id: int(count or 0) for owner_id, count in session.execute(
+            key_counts = dict(session.execute(
                 select(APIKey.current_owner_id, func.count(APIKey.id))
                 .where(APIKey.current_owner_id.is_not(None), APIKey.status == "active")
                 .group_by(APIKey.current_owner_id)
-            )}
+            ).all())
             rows: list[dict[str, Any]] = []
             users = list(session.scalars(
                 select(TelegramUser).where(TelegramUser.registered_at_ms.is_not(None))
@@ -3386,11 +3390,11 @@ class BillingService:
             ).all()
             for key_hash, key_id, masked, display_name, requests, tokens, cost, failed, long_context in unowned_rows:
                 values = {
-                    "requests": int(requests or 0),
-                    "tokens": int(tokens or 0),
-                    "cost_nano_usd": int(cost or 0),
-                    "failed": int(failed or 0),
-                    "long_context": int(long_context or 0),
+                    "requests": requests,
+                    "tokens": tokens,
+                    "cost_nano_usd": cost or 0,
+                    "failed": failed,
+                    "long_context": long_context,
                 }
                 key_label = display_name or masked or (mask_hash(str(key_hash)) if key_hash else "未知 API Key")
                 rows.append({
@@ -3519,11 +3523,14 @@ class BillingService:
                             "group_name": item.group_name,
                             "fixed_cost_cents": item.fixed_cost_cents,
                             "rate_ppm": item.rate_ppm,
-                            "actual_nano_usd": int(item.actual_weight_nano_usd or 0),
-                            "amount_cents": int(item.amount_cents or 0),
+                            "actual_nano_usd": item.actual_weight_nano_usd or 0,
+                            "amount_cents": item.amount_cents or 0,
                         } for item in configured_upstream]
                     else:
-                        upstream_costs = self._build_cycle_estimate(session, cycle, strict=False).upstream_costs
+                        usage_by_auth, _ = self._usage_by_auth(self._cycle_usage_rows(session, cycle))
+                        upstream_costs = self._upstream_cost_allocation(
+                            session, cycle, configured_upstream, usage_by_auth, {pool.id: pool.name for pool in pools},
+                        )[2]
             tiers = json.loads(cycle.tiers_json) if cycle else DEFAULT_TIERS
             unpriced_filters: list[Any] = [RatedEvent.id.is_(None)]
             if cycle:
@@ -3531,14 +3538,14 @@ class BillingService:
                     RawUsageEvent.occurred_at_ms >= cycle.start_at_ms,
                     RawUsageEvent.occurred_at_ms < cycle.end_at_ms,
                 ])
-            unpriced = int(session.scalar(
+            unpriced = session.scalar(
                 select(func.count()).select_from(RawUsageEvent)
                 .outerjoin(RatedEvent, and_(
                     RatedEvent.raw_event_id == RawUsageEvent.id,
                     RatedEvent.pricing_version_id == self._event_pricing_version(version_id),
                 ))
                 .where(*unpriced_filters)
-            ) or 0)
+            )
             gradient = session.get(GradientRule, cycle.gradient_rule_id) if cycle else None
             def version_payload(item: PricingVersion, unpriced_events: int | None = None) -> dict[str, Any]:
                 payload = {
@@ -3586,8 +3593,8 @@ class BillingService:
                         "id": pool.id,
                         "name": pool.name,
                         "active": pool.active,
-                        "fixed_cost_cents": int(costs.get(pool.id, 0)),
-                        "fixed_cost": format_cents(int(costs.get(pool.id, 0))),
+                        "fixed_cost_cents": costs.get(pool.id, 0),
+                        "fixed_cost": format_cents(costs.get(pool.id, 0)),
                         "rules": [{
                             "priority": assignment.priority,
                             "account_scope": "restricted" if assignment.auth_index_pattern else "all",
