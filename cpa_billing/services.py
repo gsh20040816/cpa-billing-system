@@ -3657,16 +3657,7 @@ class BillingService:
         elif seconds is None and "MONTHLY" in period_type:
             seconds = 30 * 24 * 60 * 60
 
-        def window_label(value: int | None) -> str:
-            if value == 7 * 24 * 60 * 60:
-                return "周"
-            if value is not None and 28 * 24 * 60 * 60 <= value <= 31 * 24 * 60 * 60:
-                return "月"
-            if value is None or value <= 0:
-                return "窗口"
-            hours = value / 3600
-            return f"{hours:g} 小时"
-
+        window_label = BillingService._quota_window_label(seconds)
         rows: list[dict[str, Any]] = []
 
         def add_row(key: str, label: str, used_percent: Any, *, scope: str = "window") -> None:
@@ -3699,7 +3690,7 @@ class BillingService:
         if percent is not None or period or end:
             add_row(
                 "xai.credit_usage",
-                f"OAuth 用量 · {window_label(seconds)}",
+                f"OAuth 用量 · {window_label}",
                 percent,
             )
         products = config.get("productUsage", config.get("product_usage"))
@@ -3712,11 +3703,21 @@ class BillingService:
                 continue
             add_row(
                 f"xai.product.{name}",
-                f"{name} · {window_label(seconds)}",
+                f"{name} · {window_label}",
                 product_percent,
                 scope="feature",
             )
         return rows
+
+    @staticmethod
+    def _quota_window_label(seconds: int | None) -> str:
+        if seconds == 7 * 24 * 60 * 60:
+            return "周"
+        if seconds is not None and 28 * 24 * 60 * 60 <= seconds <= 31 * 24 * 60 * 60:
+            return "月"
+        if seconds is None or seconds <= 0:
+            return "窗口"
+        return f"{seconds / 3600:g} 小时"
 
     @staticmethod
     def _quota_rows(payload: Any) -> tuple[list[dict[str, Any]], int | None]:
@@ -3733,21 +3734,9 @@ class BillingService:
             except (TypeError, ValueError):
                 return None
 
-        def window_label(seconds: int | None) -> str:
-            if seconds == 5 * 60 * 60:
-                return "5 小时"
-            if seconds == 7 * 24 * 60 * 60:
-                return "周"
-            if seconds is not None and 28 * 24 * 60 * 60 <= seconds <= 31 * 24 * 60 * 60:
-                return "月"
-            if seconds is None or seconds <= 0:
-                return "窗口"
-            hours = seconds / 3600
-            return f"{hours:g} 小时"
-
         def add_window(
             key: str,
-            label: str,
+            label_prefix: str,
             window: Any,
             *,
             scope: str = "window",
@@ -3760,7 +3749,7 @@ class BillingService:
             seconds = window_seconds(window)
             rows.append({
                 "key": key,
-                "label": label,
+                "label": f"{label_prefix} · {BillingService._quota_window_label(seconds)}",
                 "scope": scope,
                 "metric": metric,
                 "plan_type": payload.get("plan_type", payload.get("planType")),
@@ -3807,14 +3796,14 @@ class BillingService:
         if isinstance(rate_limit, dict):
             add_window(
                 "rate_limit.primary_window",
-                f"正常用量 · {window_label(window_seconds(rate_limit.get('primary_window') or rate_limit.get('primaryWindow') or {}))}",
+                "正常用量",
                 rate_limit.get("primary_window", rate_limit.get("primaryWindow")),
                 allowed=rate_limit.get("allowed"),
                 limit_reached=rate_limit.get("limit_reached", rate_limit.get("limitReached")),
             )
             add_window(
                 "rate_limit.secondary_window",
-                f"正常用量 · {window_label(window_seconds(rate_limit.get('secondary_window') or rate_limit.get('secondaryWindow') or {}))}",
+                "正常用量",
                 rate_limit.get("secondary_window", rate_limit.get("secondaryWindow")),
                 allowed=rate_limit.get("allowed"),
                 limit_reached=rate_limit.get("limit_reached", rate_limit.get("limitReached")),
@@ -3824,7 +3813,7 @@ class BillingService:
         if isinstance(code_review, dict):
             add_window(
                 "code_review_rate_limit.primary_window",
-                f"代码审查 · {window_label(window_seconds(code_review.get('primary_window') or code_review.get('primaryWindow') or {}))}",
+                "代码审查",
                 code_review.get("primary_window", code_review.get("primaryWindow")),
                 scope="feature",
                 metric="code-review",
@@ -3833,7 +3822,7 @@ class BillingService:
             )
             add_window(
                 "code_review_rate_limit.secondary_window",
-                f"代码审查 · {window_label(window_seconds(code_review.get('secondary_window') or code_review.get('secondaryWindow') or {}))}",
+                "代码审查",
                 code_review.get("secondary_window", code_review.get("secondaryWindow")),
                 scope="feature",
                 metric="code-review",
@@ -3854,7 +3843,7 @@ class BillingService:
             secondary = rate_info.get("secondary_window", rate_info.get("secondaryWindow"))
             add_window(
                 f"additional_rate_limits.{name}.primary_window",
-                f"{name} · {window_label(window_seconds(primary or {}))}",
+                name,
                 primary,
                 scope="additional",
                 metric=metric,
@@ -3863,7 +3852,7 @@ class BillingService:
             )
             add_window(
                 f"additional_rate_limits.{name}.secondary_window",
-                f"{name} · {window_label(window_seconds(secondary or {}))}",
+                name,
                 secondary,
                 scope="additional",
                 metric=metric,
@@ -3937,7 +3926,6 @@ class BillingService:
     @staticmethod
     def _quota_available_estimate(used_percent: Any, cost_nano_usd: int) -> dict[str, Any]:
         """Estimate total and remaining window cost from upstream usage percentage."""
-        cost_nano_usd = int(cost_nano_usd or 0)
         payload: dict[str, Any] = {
             "status": "unavailable",
             "reason": None,
@@ -4011,6 +3999,12 @@ class BillingService:
         })
         return payload
 
+    def _local_time_ms(self, value: Any) -> int:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=ZoneInfo(self.settings.timezone))
+        return int(parsed.timestamp() * 1000)
+
     def _external_timestamp_ms(self, value: Any) -> int | None:
         if value is None or value == "":
             return None
@@ -4018,12 +4012,9 @@ class BillingService:
             numeric = int(value)
             return numeric if numeric > 10_000_000_000 else numeric * 1000
         try:
-            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            return self._local_time_ms(value)
         except ValueError:
             return None
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=ZoneInfo(self.settings.timezone))
-        return int(parsed.timestamp() * 1000)
 
     def _stable_quota_window_start(self, account_id: str, quota_key: str, candidate_ms: int | None) -> int | None:
         if candidate_ms is None:
@@ -4036,50 +4027,42 @@ class BillingService:
                 return candidate_ms
             return current
 
-    def _account_usage_aggregate(
+    @staticmethod
+    def _model_metric_filter(metric_value: str) -> Any:
+        metric = _model_slug(metric_value)
+        return or_(*(
+            condition
+            for column in (RawUsageEvent.model, RawUsageEvent.requested_model, RawUsageEvent.resolved_model)
+            for condition in (
+                func.lower(func.coalesce(column, "")) == metric,
+                func.lower(func.coalesce(column, "")).like(f"%/{metric}"),
+            )
+        ))
+
+    def _rated_event_source(self, version_id: int) -> Any:
+        return RawUsageEvent.__table__.outerjoin(
+            RatedEvent.__table__,
+            and_(
+                RatedEvent.raw_event_id == RawUsageEvent.id,
+                RatedEvent.pricing_version_id == self._event_pricing_version(version_id),
+            ),
+        )
+
+    def _account_usage_aggregates(
         self,
         session: Any,
         version_id: int,
-        auth_index: str,
-        start_ms: int | None = None,
-        end_ms: int | None = None,
-        model_metric: str | None = None,
-        excluded_model_metrics: tuple[str, ...] = (),
-    ) -> dict[str, Any]:
-        filters: list[Any] = [RawUsageEvent.auth_index == auth_index]
-        if start_ms is not None:
-            filters.append(RawUsageEvent.occurred_at_ms >= start_ms)
-        if end_ms is not None:
-            filters.append(RawUsageEvent.occurred_at_ms < end_ms)
-
-        model_columns = (
-            RawUsageEvent.model,
-            RawUsageEvent.requested_model,
-            RawUsageEvent.resolved_model,
-        )
-
-        def metric_filter(metric_value: str) -> Any:
-            metric = _model_slug(metric_value)
-            model_filters = []
-            for column in model_columns:
-                model_filters.extend((
-                    func.lower(func.coalesce(column, "")) == metric,
-                    func.lower(func.coalesce(column, "")).like(f"%/{metric}"),
-                ))
-            return or_(*model_filters)
-
-        if model_metric:
-            filters.append(metric_filter(model_metric))
-        if excluded_model_metrics:
-            filters.append(not_(or_(*(metric_filter(metric) for metric in excluded_model_metrics))))
+        auth_indexes: list[str],
+    ) -> dict[str, dict[str, Any]]:
         compatible_cached = func.max(
             func.max(RawUsageEvent.cached_tokens, RawUsageEvent.cache_tokens)
             - func.max(RawUsageEvent.cache_read_tokens, 0)
             - func.max(RawUsageEvent.cache_creation_tokens, 0),
             0,
         )
-        row = session.execute(
+        rows = {row[0]: tuple(row[1:]) for row in session.execute(
             select(
+                RawUsageEvent.auth_index,
                 func.count(RawUsageEvent.id),
                 func.sum(case((RawUsageEvent.failed.is_(False), 1), else_=0)),
                 func.sum(case((RawUsageEvent.failed.is_(True), 1), else_=0)),
@@ -4095,49 +4078,92 @@ class BillingService:
                 func.min(RawUsageEvent.occurred_at_ms),
                 func.max(RawUsageEvent.occurred_at_ms),
             )
-            .select_from(RawUsageEvent)
-            .outerjoin(
-                RatedEvent,
-                and_(
-                    RatedEvent.raw_event_id == RawUsageEvent.id,
-                    RatedEvent.pricing_version_id == self._event_pricing_version(version_id),
-                ),
-            )
-            .where(*filters)
+            .select_from(self._rated_event_source(version_id))
+            .where(RawUsageEvent.auth_index.in_(auth_indexes))
+            .group_by(RawUsageEvent.auth_index)
+        )} if auth_indexes else {}
+        empty = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, None, 0, None, None)
+        result: dict[str, dict[str, Any]] = {}
+        for auth_index in auth_indexes:
+            (requests, success, failed, input_tokens, output_tokens, reasoning_tokens, cached_tokens,
+             cache_read_tokens, cache_creation_tokens, total_tokens, cost, unpriced, first_ms, last_ms) = rows.get(auth_index, empty)
+            cost_nano = cost or 0
+            result[auth_index] = {
+                "requests": requests,
+                "success": success,
+                "failed": failed,
+                "success_rate": round(success * 100 / requests, 2) if requests else None,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "reasoning_tokens": reasoning_tokens,
+                "cached_tokens": cached_tokens,
+                "cache_read_tokens": cache_read_tokens,
+                "cache_creation_tokens": cache_creation_tokens,
+                "total_tokens": total_tokens,
+                "cost_nano_usd": cost_nano,
+                "cost": format_usd_nano(cost_nano),
+                "unpriced": unpriced,
+                "first_used_at": self._iso_timestamp(first_ms),
+                "last_used_at": self._iso_timestamp(last_ms),
+                "source": "billing-panel",
+            }
+        return result
+
+    def _account_window_usage(
+        self,
+        session: Any,
+        version_id: int,
+        auth_index: str,
+        windows: list[tuple[int | None, int, str | None, tuple[str, ...]]],
+    ) -> list[dict[str, Any]]:
+        """Aggregate every quota window of one account in a single conditional scan."""
+        columns: list[Any] = []
+        for start_ms, end_ms, model_metric, excluded_model_metrics in windows:
+            conditions = [RawUsageEvent.occurred_at_ms < end_ms]
+            if start_ms is not None:
+                conditions.append(RawUsageEvent.occurred_at_ms >= start_ms)
+            if model_metric:
+                conditions.append(self._model_metric_filter(model_metric))
+            if excluded_model_metrics:
+                conditions.append(not_(or_(*(self._model_metric_filter(metric) for metric in excluded_model_metrics))))
+            inside = and_(*conditions)
+            columns.extend((
+                func.sum(case((inside, 1), else_=0)),
+                func.sum(case((inside, RawUsageEvent.total_tokens), else_=0)),
+                func.sum(case((inside, RatedEvent.rated_weight_nano_usd), else_=0)),
+                func.sum(case((and_(inside, RatedEvent.id.is_(None)), 1), else_=0)),
+            ))
+        filters = [
+            RawUsageEvent.auth_index == auth_index,
+            RawUsageEvent.occurred_at_ms < max(window[1] for window in windows),
+        ]
+        starts = [window[0] for window in windows]
+        if None not in starts:
+            filters.append(RawUsageEvent.occurred_at_ms >= min(starts))
+        row = session.execute(
+            select(*columns).select_from(self._rated_event_source(version_id)).where(*filters)
         ).one()
-        requests = int(row[0] or 0)
-        success = int(row[1] or 0)
-        cost_nano = int(row[10] or 0)
-        return {
-            "requests": requests,
-            "success": success,
-            "failed": int(row[2] or 0),
-            "success_rate": round(success * 100 / requests, 2) if requests else None,
-            "input_tokens": int(row[3] or 0),
-            "output_tokens": int(row[4] or 0),
-            "reasoning_tokens": int(row[5] or 0),
-            "cached_tokens": int(row[6] or 0),
-            "cache_read_tokens": int(row[7] or 0),
-            "cache_creation_tokens": int(row[8] or 0),
-            "total_tokens": int(row[9] or 0),
-            "cost_nano_usd": cost_nano,
-            "cost": format_usd_nano(cost_nano),
-            "unpriced": int(row[11] or 0),
-            "first_used_at": self._iso_timestamp(row[12]),
-            "last_used_at": self._iso_timestamp(row[13]),
-            "source": "billing-panel",
-        }
+        usage = []
+        for offset in range(0, len(columns), 4):
+            requests, tokens, cost, unpriced = row[offset:offset + 4]
+            cost_nano = cost or 0
+            usage.append({
+                "requests": requests or 0,
+                "total_tokens": tokens or 0,
+                "cost_nano_usd": cost_nano,
+                "cost": format_usd_nano(cost_nano),
+                "unpriced": unpriced or 0,
+            })
+        return usage
 
     def _hydrate_account_usage(self, accounts: list[dict[str, Any]], auth_by_account: dict[str, str]) -> None:
-        with self.db.session() as session:
-            version_id = self._active_pricing_id(session)
         current = now_ms()
         with self.db.session() as session:
+            version_id = self._active_pricing_id(session)
+            usage_by_auth = self._account_usage_aggregates(session, version_id, sorted(set(auth_by_account.values())))
             for account in accounts:
-                auth_index = auth_by_account.get(str(account["id"]))
-                if not auth_index:
-                    continue
-                account["usage"] = self._account_usage_aggregate(session, version_id, auth_index)
+                auth_index = auth_by_account[account["id"]]
+                account["usage"] = usage_by_auth[auth_index]
                 additional_metric_labels: dict[str, str] = {}
                 for quota in account["quota"]:
                     if quota.get("scope") != "additional":
@@ -4146,9 +4172,11 @@ class BillingService:
                     if metric:
                         additional_metric_labels.setdefault(metric, label or metric)
                 additional_metrics = tuple(sorted(additional_metric_labels))
+                windows: list[tuple[int | None, int, str | None, tuple[str, ...]]] = []
+                window_meta: list[tuple[int | None, int, str | None, str | None]] = []
                 for quota in account["quota"]:
                     window_seconds = int(quota.get("window_seconds") or 0)
-                    reset_at_ms = self._external_timestamp_ms(quota.get("reset_at"))
+                    reset_at_ms = quota.pop("_reset_at_ms")
                     if reset_at_ms is None and quota.get("reset_after_seconds") is not None:
                         reset_at_ms = current + int(quota["reset_after_seconds"] or 0) * 1000
                     window_end_ms = min(current, reset_at_ms) if reset_at_ms is not None else current
@@ -4157,22 +4185,20 @@ class BillingService:
                     else:
                         candidate_start_ms = current - window_seconds * 1000 if window_seconds > 0 else None
                     window_start_ms = self._stable_quota_window_start(
-                        str(account["id"]),
+                        account["id"],
                         str(quota.get("key") or quota.get("label") or "unknown"),
                         candidate_start_ms,
                     )
                     is_additional = quota.get("scope") == "additional"
                     model_metric, model_label = self._quota_model_info(quota) if is_additional else (None, None)
-                    excluded_model_metrics = () if is_additional else additional_metrics
-                    usage = self._account_usage_aggregate(
-                        session,
-                        version_id,
-                        auth_index,
-                        start_ms=window_start_ms,
-                        end_ms=window_end_ms + 1,
-                        model_metric=model_metric,
-                        excluded_model_metrics=excluded_model_metrics,
-                    )
+                    windows.append((
+                        window_start_ms, window_end_ms + 1, model_metric, () if is_additional else additional_metrics,
+                    ))
+                    window_meta.append((window_start_ms, window_end_ms, model_metric, model_label))
+                window_usage = self._account_window_usage(session, version_id, auth_index, windows) if windows else []
+                for quota, usage, (window_start_ms, window_end_ms, model_metric, model_label) in zip(
+                    account["quota"], window_usage, window_meta,
+                ):
                     if model_metric:
                         quota["usage_filter"] = {
                             "mode": "only_model",
@@ -4199,19 +4225,11 @@ class BillingService:
                     quota["usage_source"] = "billing-panel"
 
     def _sanitize_accounts(self, raw: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, str], dict[str, str]]:
-        identities = raw.get("files", []) if isinstance(raw, dict) else []
-        quota_items = raw.get("quota", {}).get("items", []) if isinstance(raw.get("quota"), dict) else []
-        quota_by_auth = {
-            str(item.get("auth_index")): item
-            for item in quota_items
-            if isinstance(item, dict) and item.get("auth_index")
-        }
+        quota_by_auth = {item["auth_index"]: item for item in raw["quota"]["items"]}
         account_by_auth: dict[str, str] = {}
         auth_by_account: dict[str, str] = {}
         accounts: list[dict[str, Any]] = []
-        for identity in identities if isinstance(identities, list) else []:
-            if not isinstance(identity, dict):
-                continue
+        for identity in raw["files"]:
             account_id = str(identity.get("id") or "").strip()
             auth_index = str(identity.get("auth_index") or "").strip()
             if not account_id or not auth_index:
@@ -4221,20 +4239,25 @@ class BillingService:
             quota_item = quota_by_auth.get(auth_index, {})
             quota_rows, credits = self._quota_rows(quota_item.get("quota"))
             for quota in quota_rows:
-                reset_at_ms = self._external_timestamp_ms(quota.get("reset_at"))
-                quota["reset_at"] = self._iso_timestamp(reset_at_ms)
+                # Popped again by _hydrate_account_usage so the window math keeps the exact millisecond.
+                quota["_reset_at_ms"] = self._external_timestamp_ms(quota.get("reset_at"))
+                quota["reset_at"] = self._iso_timestamp(quota["_reset_at_ms"])
             quota_reset_guard = self._quota_reset_guard(identity, quota_rows)
             id_token = identity.get("id_token") if isinstance(identity.get("id_token"), dict) else {}
             plan_type = identity.get("plan_type") or identity.get("planType") or id_token.get("plan_type") or id_token.get("planType")
             quota_status = str(quota_item.get("status") or "unsupported")
+            auth_type = self._upstream_auth_type(identity)
+            disabled = bool(identity.get("disabled") or identity.get("unavailable"))
+            success_count = int(identity.get("success") or 0)
+            failure_count = int(identity.get("failed") or 0)
             accounts.append({
                 "id": account_id,
                 "name": identity.get("label") or identity.get("name") or identity.get("account") or identity.get("email") or f"上游账号 {account_id}",
                 "type": identity.get("type"),
                 "provider": identity.get("provider") or identity.get("type"),
-                "auth_type": self._upstream_auth_type(identity),
+                "auth_type": auth_type,
                 "plan_type": plan_type,
-                "disabled": bool(identity.get("disabled") or identity.get("unavailable")),
+                "disabled": disabled,
                 "active_start": id_token.get("chatgpt_subscription_active_start"),
                 "active_until": id_token.get("chatgpt_subscription_active_until"),
                 "usage": {
@@ -4257,13 +4280,10 @@ class BillingService:
                     "source": "billing-panel",
                 },
                 "health": {
-                    "total_success": int(identity.get("success") or 0),
-                    "total_failure": int(identity.get("failed") or 0),
-                    "success_rate": round(
-                        int(identity.get("success") or 0) * 100
-                        / (int(identity.get("success") or 0) + int(identity.get("failed") or 0)),
-                        2,
-                    ) if int(identity.get("success") or 0) + int(identity.get("failed") or 0) else None,
+                    "total_success": success_count,
+                    "total_failure": failure_count,
+                    "success_rate": round(success_count * 100 / (success_count + failure_count), 2)
+                    if success_count + failure_count else None,
                     "window_seconds": None,
                     "window_start": None,
                     "window_end": None,
@@ -4279,11 +4299,9 @@ class BillingService:
                 "cpa_unavailable": bool(identity.get("unavailable")),
                 "quota_reset_guard": quota_reset_guard,
                 "reset_credits_available": quota_item.get("reset_credits_available") if quota_item.get("reset_credits_available") is not None else credits,
-                "reset_credits": quota_item.get("reset_credits") or [],
+                "reset_credits": [dict(credit) for credit in quota_item.get("reset_credits") or []],
                 "reset_credits_error": quota_item.get("reset_credits_error"),
-                "can_refresh": self._upstream_auth_type(identity) == "oauth" and bool(auth_index)
-                and self._oauth_quota_provider(identity) is not None
-                and not bool(identity.get("disabled") or identity.get("unavailable")),
+                "can_refresh": auth_type == "oauth" and self._oauth_quota_provider(identity) is not None and not disabled,
             })
         accounts.sort(key=lambda item: (item["disabled"], str(item["name"]).casefold()))
         return accounts, account_by_auth, auth_by_account
@@ -4291,19 +4309,15 @@ class BillingService:
     @staticmethod
     def _account_inspection(accounts: list[dict[str, Any]]) -> dict[str, Any]:
         results: list[dict[str, Any]] = []
-        cached = completed = normal = limit_reached = unauthorized = other_failed = 0
+        completed = normal = limit_reached = unauthorized = other_failed = 0
         for account in accounts:
-            status = str(account.get("quota_status") or "unsupported")
+            status = account["quota_status"]
             if status == "completed":
-                cached += 1
                 completed += 1
             elif status == "failed":
                 other_failed += 1
-            elif status == "running":
-                pass
-            quota = account.get("quota") if isinstance(account.get("quota"), list) else []
-            has_limit = any(bool(item.get("limit_reached")) for item in quota if isinstance(item, dict))
-            has_auth_failure = account.get("quota_http_status") in {401, 402}
+            has_limit = any(item.get("limit_reached") for item in account["quota"])
+            has_auth_failure = account["quota_http_status"] in {401, 402}
             if has_limit:
                 limit_reached += 1
             elif status == "completed" and not has_auth_failure:
@@ -4311,15 +4325,15 @@ class BillingService:
             if has_auth_failure:
                 unauthorized += 1
             results.append({
-                "account_id": account.get("id"),
-                "name": account.get("name"),
-                "type": account.get("type"),
+                "account_id": account["id"],
+                "name": account["name"],
+                "type": account["type"],
                 "status": "limit_reached" if has_limit else status,
-                "refreshed_at": account.get("quota_refreshed_at"),
+                "refreshed_at": account["quota_refreshed_at"],
             })
         return {
             "total": len(accounts),
-            "cached": cached,
+            "cached": completed,
             "running": 0,
             "completed": completed,
             "normal": normal,
@@ -4344,19 +4358,6 @@ class BillingService:
         if provider in XAI_OAUTH_PROVIDERS:
             return "xai"
         return None
-
-    @staticmethod
-    def _cpa_account_headers(item: dict[str, Any]) -> dict[str, str]:
-        headers = {
-            "Authorization": "Bearer $TOKEN$",
-            "Content-Type": "application/json",
-            "User-Agent": "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal",
-        }
-        id_token = item.get("id_token") if isinstance(item.get("id_token"), dict) else {}
-        account_id = id_token.get("chatgpt_account_id") or id_token.get("chatgptAccountId")
-        if account_id:
-            headers["Chatgpt-Account-Id"] = str(account_id)
-        return headers
 
     @staticmethod
     def _cpa_xai_headers(item: dict[str, Any] | None = None) -> dict[str, str]:
@@ -4448,115 +4449,126 @@ class BillingService:
                 **reset_credit_metadata,
             }
 
-    def _cpa_accounts_raw(self, *, force: bool = False) -> dict[str, Any]:
-        files = self.cpa.upstream_channels()
-        quota_items: list[dict[str, Any]] = []
-        refreshed_at = self._iso_timestamp(now_ms())
-        for item in files:
-            auth_index = str(item.get("auth_index") or "").strip()
-            if not auth_index:
-                continue
-            account_id = str(item.get("id") or "").strip()
-            if not account_id:
-                continue
-            auth_type = str(item.get("account_type") or item.get("auth_type") or "oauth").strip().lower()
-            if auth_type.replace("-", "_") in {"api_key", "apikey", "key"}:
-                quota_items.append({
-                    "account_id": account_id,
-                    "auth_index": auth_index,
-                    "status": "unsupported",
-                    "refreshed_at": None,
-                    "quota": {},
-                })
-                continue
-            quota_provider = self._oauth_quota_provider(item)
-            if quota_provider is None:
-                quota_items.append({
-                    "account_id": account_id,
-                    "auth_index": auth_index,
-                    "status": "unsupported",
-                    "refreshed_at": None,
-                    "quota": {},
-                })
-                continue
-            if quota_provider == "xai":
-                quota_items.append(self._cpa_xai_quota_item(account_id, auth_index, refreshed_at, item))
-                continue
-            id_token = item.get("id_token") if isinstance(item.get("id_token"), dict) else {}
-            account_token_id = id_token.get("chatgpt_account_id") or id_token.get("chatgptAccountId")
-            reset_credit_metadata: dict[str, Any] = {
-                "reset_credits_available": None,
-                "reset_credits": [],
-                "reset_credits_error": None,
+    def _cpa_quota_item(self, item: dict[str, Any], refreshed_at: str | None, force: bool) -> dict[str, Any] | None:
+        auth_index = str(item.get("auth_index") or "").strip()
+        account_id = str(item.get("id") or "").strip()
+        if not auth_index or not account_id:
+            return None
+        unsupported = {
+            "account_id": account_id,
+            "auth_index": auth_index,
+            "status": "unsupported",
+            "refreshed_at": None,
+            "quota": {},
+        }
+        auth_type = str(item.get("account_type") or item.get("auth_type") or "oauth").strip().lower()
+        if auth_type.replace("-", "_") in {"api_key", "apikey", "key"}:
+            return unsupported
+        quota_provider = self._oauth_quota_provider(item)
+        if quota_provider is None:
+            return unsupported
+        if quota_provider == "xai":
+            return self._cpa_xai_quota_item(account_id, auth_index, refreshed_at, item)
+        id_token = item.get("id_token") if isinstance(item.get("id_token"), dict) else {}
+        account_token_id = id_token.get("chatgpt_account_id") or id_token.get("chatgptAccountId")
+        account_token_id = str(account_token_id) if account_token_id else None
+        reset_credit_metadata: dict[str, Any] = {
+            "reset_credits_available": None,
+            "reset_credits": [],
+            "reset_credits_error": None,
+        }
+        try:
+            reset_credits = self.cpa.codex_reset_credits(auth_index, account_token_id, force=force)
+            reset_credit_metadata.update({
+                "reset_credits_available": reset_credits["available_count"],
+                "reset_credits": reset_credits["credits"],
+            })
+        except (BillingError, httpx.HTTPError, json.JSONDecodeError) as exc:
+            if isinstance(exc, BillingError) and str(exc).strip():
+                reset_credit_metadata["reset_credits_error"] = str(exc)
+            else:
+                reset_credit_metadata["reset_credits_error"] = f"主动重置次数读取失败：{type(exc).__name__}"
+        try:
+            result = self.cpa.api_call(auth_index, "GET", CODEX_USAGE_URL, CPAClient._codex_headers(account_token_id))
+            status_code = int(result.get("status_code") or 0)
+            body = result.get("body")
+            payload = json.loads(body) if isinstance(body, str) and body.strip() else body
+        except (BillingError, httpx.HTTPError, json.JSONDecodeError) as exc:
+            return {
+                "account_id": account_id,
+                "auth_index": auth_index,
+                "status": "failed",
+                "error": f"额度读取失败：{type(exc).__name__}",
+                "refreshed_at": refreshed_at,
+                "quota": {},
+                **reset_credit_metadata,
             }
-            try:
-                reset_credits = self.cpa.codex_reset_credits(
-                    auth_index,
-                    str(account_token_id) if account_token_id else None,
-                    force=force,
-                )
-                reset_credit_metadata.update({
-                    "reset_credits_available": reset_credits["available_count"],
-                    "reset_credits": reset_credits["credits"],
-                })
-            except (BillingError, httpx.HTTPError, json.JSONDecodeError) as exc:
-                if isinstance(exc, BillingError) and str(exc).strip():
-                    reset_credit_metadata["reset_credits_error"] = str(exc)
-                else:
-                    reset_credit_metadata["reset_credits_error"] = f"主动重置次数读取失败：{type(exc).__name__}"
-            try:
-                result = self.cpa.api_call(
-                    auth_index,
-                    "GET",
-                    CODEX_USAGE_URL,
-                    self._cpa_account_headers(item),
-                )
-                status_code = int(result.get("status_code") or 0)
-                body = result.get("body")
-                payload = json.loads(body) if isinstance(body, str) and body.strip() else body
-                if status_code < 200 or status_code >= 300:
-                    quota_items.append({
-                        "account_id": account_id,
-                        "auth_index": auth_index,
-                        "status": "failed",
-                        "http_status_code": status_code or None,
-                        "error": f"上游额度接口返回 HTTP {status_code}",
-                        "refreshed_at": refreshed_at,
-                        "quota": {},
-                        **reset_credit_metadata,
-                    })
-                elif not isinstance(payload, dict):
-                    quota_items.append({
-                        "account_id": account_id,
-                        "auth_index": auth_index,
-                        "status": "failed",
-                        "http_status_code": status_code,
-                        "error": "上游额度响应不是 JSON 对象",
-                        "refreshed_at": refreshed_at,
-                        "quota": {},
-                        **reset_credit_metadata,
-                    })
-                else:
-                    quota_items.append({
-                        "account_id": account_id,
-                        "auth_index": auth_index,
-                        "status": "completed",
-                        "http_status_code": status_code,
-                        "refreshed_at": refreshed_at,
-                        "quota": payload,
-                        **reset_credit_metadata,
-                    })
-            except (BillingError, httpx.HTTPError, json.JSONDecodeError) as exc:
-                quota_items.append({
-                    "account_id": account_id,
-                    "auth_index": auth_index,
-                    "status": "failed",
-                    "error": f"额度读取失败：{type(exc).__name__}",
-                    "refreshed_at": refreshed_at,
-                    "quota": {},
-                    **reset_credit_metadata,
-                })
-        return {"files": files, "quota": {"items": quota_items}}
+        if status_code < 200 or status_code >= 300:
+            return {
+                "account_id": account_id,
+                "auth_index": auth_index,
+                "status": "failed",
+                "http_status_code": status_code or None,
+                "error": f"上游额度接口返回 HTTP {status_code}",
+                "refreshed_at": refreshed_at,
+                "quota": {},
+                **reset_credit_metadata,
+            }
+        if not isinstance(payload, dict):
+            return {
+                "account_id": account_id,
+                "auth_index": auth_index,
+                "status": "failed",
+                "http_status_code": status_code,
+                "error": "上游额度响应不是 JSON 对象",
+                "refreshed_at": refreshed_at,
+                "quota": {},
+                **reset_credit_metadata,
+            }
+        return {
+            "account_id": account_id,
+            "auth_index": auth_index,
+            "status": "completed",
+            "http_status_code": status_code,
+            "refreshed_at": refreshed_at,
+            "quota": payload,
+            **reset_credit_metadata,
+        }
+
+    _CPA_QUOTA_FETCH_WORKERS = 8
+    _TTL_CACHE_SECONDS = 30.0
+    _ttl_cache_guard = threading.Lock()
+
+    def _ttl_cache_slot(self, name: str) -> tuple[dict[str, tuple[float, Any]], Any]:
+        with self._ttl_cache_guard:
+            entries = self.__dict__.setdefault("_ttl_cache_entries", {})
+            return entries, self.__dict__.setdefault("_ttl_cache_locks", {}).setdefault(name, threading.Lock())
+
+    def _ttl_cached(self, name: str, loader: Any, *, force: bool = False) -> Any:
+        """Share a short-lived result per service; concurrent callers wait for one load. Results are read-only."""
+        entries, load_lock = self._ttl_cache_slot(name)
+        with load_lock:
+            entry = entries.get(name)
+            if not force and entry is not None and entry[0] > time.monotonic():
+                return entry[1]
+            value = loader()
+            entries[name] = (time.monotonic() + self._TTL_CACHE_SECONDS, value)
+            return value
+
+    def _ttl_cache_invalidate(self, name: str) -> None:
+        entries, load_lock = self._ttl_cache_slot(name)
+        with load_lock:
+            entries.pop(name, None)
+
+    def _cpa_accounts_raw(self, *, force: bool = False) -> dict[str, Any]:
+        def load() -> dict[str, Any]:
+            files = self.cpa.upstream_channels()
+            refreshed_at = self._iso_timestamp(now_ms())
+            with ThreadPoolExecutor(max_workers=self._CPA_QUOTA_FETCH_WORKERS, thread_name_prefix="cpa-quota") as executor:
+                items = list(executor.map(lambda item: self._cpa_quota_item(item, refreshed_at, force), files))
+            return {"files": files, "quota": {"items": [item for item in items if item is not None]}}
+
+        return self._ttl_cached("cpa_accounts_raw", load, force=force)
 
     def accounts_snapshot(self, *, force: bool = False) -> dict[str, Any]:
         try:
@@ -4598,25 +4610,29 @@ class BillingService:
     ) -> dict[str, Any]:
         if not reason.strip():
             raise BillingError("重置上游 Codex 额度必须填写原因")
-        snapshot = self.accounts_snapshot(force=True)
-        target_snapshot = next((item for item in snapshot["accounts"] if item.get("id") == account_id), None)
-        if target_snapshot is None:
+        # Probe only the target account, always fresh: the guard below must reflect CPA's current state.
+        try:
+            files = self.cpa.upstream_channels()
+        except (httpx.HTTPError, BillingError) as exc:
+            raise BillingDependencyError("CPA 上游账号服务不可用") from exc
+        target = next((item for item in files if str(item.get("id") or "") == account_id), None)
+        quota_item = None if target is None else self._cpa_quota_item(target, self._iso_timestamp(now_ms()), True)
+        accounts = [] if quota_item is None else self._sanitize_accounts(
+            {"files": [target], "quota": {"items": [quota_item]}}
+        )[0]
+        if not accounts or accounts[0]["id"] != account_id:
             raise BillingError("上游账号不存在或已失效")
-        guard = target_snapshot.get("quota_reset_guard") or {}
-        required_confirmations = int(guard.get("required_confirmations") or 3)
+        target_snapshot = accounts[0]
+        required_confirmations = target_snapshot["quota_reset_guard"]["required_confirmations"]
         if int(confirmations or 0) < required_confirmations:
             if required_confirmations == 3:
                 raise BillingError("当前 CPA 未报告本周额度已耗尽或账号已暂停，必须完成三次确认")
             raise BillingError("重置上游 Codex 额度必须完成二次确认")
-        if target_snapshot.get("reset_credits_error"):
+        if target_snapshot["reset_credits_error"]:
             raise BillingDependencyError(str(target_snapshot["reset_credits_error"]))
-        if not target_snapshot.get("reset_credits"):
+        if not target_snapshot["reset_credits"]:
             raise BillingError("该账号没有可用的主动重置次数")
-        files = self.cpa.auth_files()
-        target = next((item for item in files if str(item.get("id") or "") == account_id), None)
-        if target is None or not str(target.get("auth_index") or "").strip():
-            raise BillingError("上游账号不存在或已失效")
-        if bool(target.get("disabled") or target.get("unavailable")):
+        if target_snapshot["disabled"]:
             raise BillingError("已停用的上游账号不能重置上游 Codex 额度")
         id_token = target.get("id_token") if isinstance(target.get("id_token"), dict) else {}
         account_token_id = id_token.get("chatgpt_account_id") or id_token.get("chatgptAccountId")
@@ -4627,6 +4643,7 @@ class BillingService:
             )
         except (httpx.HTTPError, BillingError) as exc:
             raise BillingDependencyError("上游 Codex 主动重置失败") from exc
+        self._ttl_cache_invalidate("cpa_accounts_raw")
         with self.db.session() as session:
             session.add(AuditLog(
                 operator_type=operator_type,
@@ -4646,38 +4663,46 @@ class BillingService:
             "required_confirmations": required_confirmations,
         }
 
-    def _local_overview(self, version_id: int, start_ms: int, end_ms: int) -> dict[str, Any]:
+    def _local_overview(
+        self,
+        version_id: int,
+        start_ms: int,
+        end_ms: int,
+        totals: dict[str, int] | None = None,
+    ) -> dict[str, Any]:
+        """``totals`` (requests/tokens/cost_nano/failed/unpriced) may come from _local_realtime_with_totals."""
         with self.db.session() as session:
-            aggregate = session.execute(
-                select(
-                    func.count(RawUsageEvent.id),
-                    func.sum(RawUsageEvent.total_tokens),
-                    func.sum(RatedEvent.rated_weight_nano_usd),
-                    func.sum(case((RawUsageEvent.failed.is_(True), 1), else_=0)),
-                    func.sum(case((RatedEvent.id.is_(None), 1), else_=0)),
-                )
-                .select_from(RawUsageEvent)
-                .outerjoin(
-                    RatedEvent,
-                    and_(
-                        RatedEvent.raw_event_id == RawUsageEvent.id,
-                        RatedEvent.pricing_version_id == self._event_pricing_version(version_id),
-                    ),
-                )
-                .where(
-                    RawUsageEvent.occurred_at_ms >= start_ms,
-                    RawUsageEvent.occurred_at_ms < end_ms,
-                )
-            ).one()
+            if totals is None:
+                aggregate = session.execute(
+                    select(
+                        func.count(RawUsageEvent.id),
+                        func.sum(RawUsageEvent.total_tokens),
+                        func.sum(RatedEvent.rated_weight_nano_usd),
+                        func.sum(case((RawUsageEvent.failed.is_(True), 1), else_=0)),
+                        func.sum(case((RatedEvent.id.is_(None), 1), else_=0)),
+                    )
+                    .select_from(self._rated_event_source(version_id))
+                    .where(
+                        RawUsageEvent.occurred_at_ms >= start_ms,
+                        RawUsageEvent.occurred_at_ms < end_ms,
+                    )
+                ).one()
+                totals = {
+                    "requests": aggregate[0],
+                    "tokens": aggregate[1] or 0,
+                    "cost_nano": aggregate[2] or 0,
+                    "failed": aggregate[3] or 0,
+                    "unpriced": aggregate[4] or 0,
+                }
             duration_minutes = max((end_ms - start_ms) / 60_000, 1)
-            requests = int(aggregate[0] or 0)
-            tokens = int(aggregate[1] or 0)
-            failed = int(aggregate[3] or 0)
+            requests = totals["requests"]
+            tokens = totals["tokens"]
+            failed = totals["failed"]
             block_count = 48
             block_ms = max(1, math.ceil((end_ms - start_ms) / block_count))
             bucket = cast((RawUsageEvent.occurred_at_ms - start_ms) / block_ms, Integer)
             bucket_rows = {
-                int(index): (int(success or 0), int(failure or 0))
+                index: (success, failure)
                 for index, success, failure in session.execute(
                     select(
                         bucket,
@@ -4702,8 +4727,8 @@ class BillingService:
                 "rate": round(success * 100 / total, 3) if total else -1,
             })
         success = requests - failed
-        cost_nano = int(aggregate[2] or 0)
-        unpriced = int(aggregate[4] or 0)
+        cost_nano = totals["cost_nano"]
+        unpriced = totals["unpriced"]
         return {
             "summary": {
                 "request_count": requests,
@@ -4728,27 +4753,33 @@ class BillingService:
     @staticmethod
     def _usage_rows(items: dict[str, dict[str, int]]) -> list[dict[str, Any]]:
         total_cost = sum(item["cost_nano"] for item in items.values())
-        rows = []
-        for label, item in items.items():
-            rows.append({
-                "label": label,
-                "requests": item["requests"],
-                "tokens": item["tokens"],
-                "cost": format_usd_nano(item["cost_nano"]),
-                "share": round(item["cost_nano"] * 100 / total_cost, 2) if total_cost else 0,
-            })
-        rows.sort(key=lambda item: (Decimal(item["cost"].replace(",", "")), item["requests"]), reverse=True)
-        return rows
+        # Rank by the displayed 4-decimal cost (format_usd_nano's rounding), then requests.
+        ordered = sorted(
+            items.items(),
+            key=lambda pair: (round(Decimal(pair[1]["cost_nano"]) / Decimal(NANO_USD), 4), pair[1]["requests"]),
+            reverse=True,
+        )
+        return [{
+            "label": label,
+            "requests": item["requests"],
+            "tokens": item["tokens"],
+            "cost": format_usd_nano(item["cost_nano"]),
+            "share": round(item["cost_nano"] * 100 / total_cost, 2) if total_cost else 0,
+        } for label, item in ordered]
 
     @staticmethod
-    def _percentile(values: list[int], percentile: float) -> int | None:
-        if not values:
-            return None
-        ordered = sorted(values)
-        index = max(0, min(len(ordered) - 1, math.ceil(percentile * len(ordered)) - 1))
-        return int(ordered[index])
+    def _percentile_rank(percentile: float, total: Any) -> Any:
+        """SQL nearest-rank position ceil(p * n) (1-based), computed in REAL like Python's float math."""
+        scaled = literal(percentile) * total
+        floor = cast(scaled, Integer)
+        return floor + case((scaled > floor, 1), else_=0)
 
     def _local_realtime(self, version_id: int, start_ms: int, end_ms: int, range_name: str) -> dict[str, Any]:
+        return self._local_realtime_with_totals(version_id, start_ms, end_ms, range_name)[0]
+
+    def _local_realtime_with_totals(
+        self, version_id: int, start_ms: int, end_ms: int, range_name: str,
+    ) -> tuple[dict[str, Any], dict[str, int]]:
         duration_ms = max(end_ms - start_ms, 60_000)
         duration_minutes = duration_ms / 60_000
         if duration_minutes <= 60:
@@ -4764,10 +4795,10 @@ class BillingService:
             "cached": 0,
             "input_tokens": 0,
             "cache_read_tokens": 0,
-            "ttft": [],
-            "latency": [],
             "model_efficiency": defaultdict(lambda: {"tokens": 0, "cost_nano": 0}),
         } for _ in range(bucket_count)]
+        totals = {"requests": 0, "tokens": 0, "cost_nano": 0, "failed": 0, "unpriced": 0}
+        percentiles: dict[tuple[str, int], tuple[int | None, int | None]] = {}
         models: dict[str, dict[str, int]] = defaultdict(lambda: {"requests": 0, "tokens": 0, "cost_nano": 0})
         model_efficiency: dict[str, dict[str, int]] = defaultdict(lambda: {"tokens": 0, "cost_nano": 0})
         accounts: dict[str, dict[str, int]] = defaultdict(lambda: {"requests": 0, "tokens": 0, "cost_nano": 0})
@@ -4794,16 +4825,10 @@ class BillingService:
                 (raw_table.c.occurred_at_ms - literal(start_ms)) / literal(bucket_ms),
                 Integer,
             )
-            total_tokens_expression = func.coalesce(raw_table.c.total_tokens, 0)
-            input_tokens_expression = func.coalesce(raw_table.c.input_tokens, 0)
-            output_tokens_expression = func.coalesce(raw_table.c.output_tokens, 0)
-            cache_read_expression = func.max(func.coalesce(raw_table.c.cache_read_tokens, 0), 0)
-            cache_creation_expression = func.max(func.coalesce(raw_table.c.cache_creation_tokens, 0), 0)
+            cache_read_expression = func.max(raw_table.c.cache_read_tokens, 0)
+            cache_creation_expression = func.max(raw_table.c.cache_creation_tokens, 0)
             compatible_cached_expression = func.max(
-                func.max(
-                    func.coalesce(raw_table.c.cached_tokens, 0),
-                    func.coalesce(raw_table.c.cache_tokens, 0),
-                )
+                func.max(raw_table.c.cached_tokens, raw_table.c.cache_tokens)
                 - cache_read_expression
                 - cache_creation_expression,
                 0,
@@ -4833,12 +4858,13 @@ class BillingService:
                     account_expression,
                     provider_expression,
                     func.count(raw_table.c.id),
-                    func.sum(total_tokens_expression),
+                    func.sum(raw_table.c.total_tokens),
                     func.sum(case((raw_table.c.failed.is_(True), 1), else_=0)),
                     func.sum(effective_cache_read_expression),
-                    func.sum(input_tokens_expression),
-                    func.sum(input_tokens_expression + output_tokens_expression),
+                    func.sum(raw_table.c.input_tokens),
+                    func.sum(raw_table.c.input_tokens + raw_table.c.output_tokens),
                     func.sum(cost_expression),
+                    func.sum(case((rated_table.c.id.is_(None), 1), else_=0)),
                 )
                 .select_from(source)
                 .where(*filters)
@@ -4856,20 +4882,9 @@ class BillingService:
                 input_tokens,
                 efficiency_tokens,
                 cost_nano,
+                unpriced,
             ) in aggregate_rows:
-                index = min(bucket_count - 1, max(0, int(index)))
-                model = str(model)
-                account = str(account)
-                provider = str(provider)
-                requests = int(requests or 0)
-                tokens = int(tokens or 0)
-                failures = int(failures or 0)
-                cached = int(cached or 0)
-                input_tokens = int(input_tokens or 0)
-                efficiency_tokens = int(efficiency_tokens or 0)
-                cost_nano = int(cost_nano or 0)
-
-                item = buckets[index]
+                item = buckets[min(bucket_count - 1, max(0, index))]
                 item["requests"] += requests
                 item["tokens"] += tokens
                 item["failure"] += failures
@@ -4885,47 +4900,42 @@ class BillingService:
                 model_efficiency[model]["cost_nano"] += cost_nano
                 item["model_efficiency"][model]["tokens"] += efficiency_tokens
                 item["model_efficiency"][model]["cost_nano"] += cost_nano
+                totals["requests"] += requests
+                totals["tokens"] += tokens
+                totals["cost_nano"] += cost_nano
+                totals["failed"] += failures
+                totals["unpriced"] += unpriced
 
-            # SQLite has no portable percentile aggregate; fetch only the two response columns needed here.
-            response_rows = connection.execute(
-                select(
-                    bucket_expression,
-                    raw_table.c.ttft_ms,
-                    raw_table.c.latency_ms,
+            # Nearest-rank p50/p95 per bucket in SQLite; only one row per bucket reaches Python.
+            for metric, column in (("ttft", raw_table.c.ttft_ms), ("latency", raw_table.c.latency_ms)):
+                ranked = (
+                    select(
+                        bucket_expression.label("bucket"),
+                        column.label("value"),
+                        func.row_number().over(partition_by=bucket_expression, order_by=column).label("position"),
+                        func.count().over(partition_by=bucket_expression).label("total"),
+                    )
+                    .where(*filters, column.is_not(None))
+                    .subquery()
                 )
-                .select_from(source)
-                .where(
-                    *filters,
-                    or_(raw_table.c.ttft_ms.is_not(None), raw_table.c.latency_ms.is_not(None)),
-                )
-            )
-            for index, ttft_ms, latency_ms in response_rows:
-                index = min(bucket_count - 1, max(0, int(index)))
-                if ttft_ms is not None:
-                    buckets[index]["ttft"].append(int(ttft_ms))
-                if latency_ms is not None:
-                    buckets[index]["latency"].append(int(latency_ms))
+                for index, p50, p95 in connection.execute(
+                    select(
+                        ranked.c.bucket,
+                        func.max(case((ranked.c.position == self._percentile_rank(0.50, ranked.c.total), ranked.c.value))),
+                        func.max(case((ranked.c.position == self._percentile_rank(0.95, ranked.c.total), ranked.c.value))),
+                    ).group_by(ranked.c.bucket)
+                ):
+                    percentiles[(metric, index)] = (p50, p95)
 
-            key_summary = connection.execute(
-                select(
-                    func.count(func.distinct(case(
-                        (
-                            and_(raw_table.c.api_key_hash.is_not(None), raw_table.c.api_key_hash != ""),
-                            raw_table.c.api_key_hash,
-                        ),
-                        else_=None,
-                    ))),
-                    func.count(raw_table.c.id),
-                    func.sum(total_tokens_expression),
-                    func.sum(cost_expression),
-                )
-                .select_from(source)
-                .where(*filters)
-            ).one()
-        key_hashes_count = int(key_summary[0] or 0)
-        key_requests = int(key_summary[1] or 0)
-        key_tokens = int(key_summary[2] or 0)
-        key_cost_nano = int(key_summary[3] or 0)
+            key_hashes_count = connection.execute(
+                select(func.count(func.distinct(case(
+                    (
+                        and_(raw_table.c.api_key_hash.is_not(None), raw_table.c.api_key_hash != ""),
+                        raw_table.c.api_key_hash,
+                    ),
+                    else_=None,
+                )))).where(*filters)
+            ).scalar_one()
         token_velocity = []
         response_level = []
         request_level = []
@@ -4940,10 +4950,10 @@ class BillingService:
             })
             response_level.append({
                 "bucket": bucket_at,
-                "ttft_p50_ms": self._percentile(item["ttft"], 0.50),
-                "ttft_p95_ms": self._percentile(item["ttft"], 0.95),
-                "latency_p50_ms": self._percentile(item["latency"], 0.50),
-                "latency_p95_ms": self._percentile(item["latency"], 0.95),
+                "ttft_p50_ms": percentiles.get(("ttft", index), (None, None))[0],
+                "ttft_p95_ms": percentiles.get(("ttft", index), (None, None))[1],
+                "latency_p50_ms": percentiles.get(("latency", index), (None, None))[0],
+                "latency_p95_ms": percentiles.get(("latency", index), (None, None))[1],
             })
             request_level.append({
                 "bucket": bucket_at,
@@ -4990,71 +5000,15 @@ class BillingService:
                 "models": self._usage_rows(models),
                 "api_keys": {
                     "count": key_hashes_count,
-                    "requests": key_requests,
-                    "tokens": key_tokens,
-                    "cost": format_usd_nano(key_cost_nano),
+                    "requests": totals["requests"],
+                    "tokens": totals["tokens"],
+                    "cost": format_usd_nano(totals["cost_nano"]),
                 },
                 "upstream_accounts": self._usage_rows(accounts),
                 "ai_providers": self._usage_rows(providers),
             },
             "source": "billing-panel",
-        }
-
-    @staticmethod
-    def _sanitize_realtime(raw: Any) -> dict[str, Any]:
-        if not isinstance(raw, dict):
-            return {}
-        current_usage = raw.get("current_usage") if isinstance(raw.get("current_usage"), dict) else {}
-        api_key_rows = current_usage.get("api_keys", []) if isinstance(current_usage.get("api_keys"), list) else []
-        api_key_aggregate = {
-            "count": len(api_key_rows),
-            "requests": sum(int(item.get("requests") or 0) for item in api_key_rows if isinstance(item, dict)),
-            "tokens": sum(int(item.get("tokens") or 0) for item in api_key_rows if isinstance(item, dict)),
-            "cost": sum(float(item.get("cost") or 0) for item in api_key_rows if isinstance(item, dict)),
-        }
-        def safe_usage_rows(value: Any) -> list[dict[str, Any]]:
-            result = []
-            for item in value if isinstance(value, list) else []:
-                if isinstance(item, dict):
-                    result.append({
-                        "label": item.get("label"),
-                        "requests": item.get("requests"),
-                        "tokens": item.get("tokens"),
-                        "cost": item.get("cost"),
-                        "share": item.get("share"),
-                    })
-            return result
-
-        auth_files = safe_usage_rows(current_usage.get("auth_files"))
-        distributions = {}
-        raw_distributions = raw.get("response_distribution") if isinstance(raw.get("response_distribution"), dict) else {}
-        for name in ("ttft", "latency"):
-            item = raw_distributions.get(name) if isinstance(raw_distributions.get(name), dict) else {}
-            distributions[name] = {
-                "average_line": item.get("average_line", []),
-                "total_particles": item.get("total_particles", 0),
-                "sampled": item.get("sampled", False),
-                "max_particles": item.get("max_particles", 0),
-            }
-        return {
-            "window": raw.get("window"),
-            "timezone": raw.get("timezone"),
-            "bucket_seconds": raw.get("bucket_seconds"),
-            "window_start": raw.get("window_start"),
-            "window_end": raw.get("window_end"),
-            "token_velocity": raw.get("token_velocity", []),
-            "response_level": raw.get("response_level", []),
-            "request_level": raw.get("request_level", []),
-            "cache_level": raw.get("cache_level", []),
-            "token_efficiency": raw.get("token_efficiency", []),
-            "response_distribution": distributions,
-            "current_usage": {
-                "models": safe_usage_rows(current_usage.get("models")),
-                "api_keys": api_key_aggregate,
-                "upstream_accounts": auth_files,
-                "ai_providers": safe_usage_rows(current_usage.get("ai_providers")),
-            },
-        }
+        }, totals
 
     def _local_sync_status(self) -> list[dict[str, Any]]:
         with self.db.session() as session:
@@ -5082,7 +5036,7 @@ class BillingService:
                 "limit_reached": accounts["inspection"].get("limit_reached", 0),
                 "failed": accounts["inspection"].get("other_failed", 0),
             }
-        except (httpx.HTTPError, BillingDependencyError, BillingError):
+        except BillingError:
             account_status = {"available": False, "error": "CPA 上游账号额度不可用"}
         try:
             cpa = self.cpa.health()
@@ -5121,12 +5075,12 @@ class BillingService:
             version_id = selected_cycle.pricing_version_id if selected_cycle else self._active_pricing_id(session)
         with ThreadPoolExecutor(max_workers=4, thread_name_prefix="site-status") as executor:
             cpa_future = executor.submit(self.cpa.health)
-            reconciliation_future = executor.submit(self.reconciliation)
+            reconciliation_future = executor.submit(lambda: dict(self._ttl_cached("reconciliation", self.reconciliation)))
             accounts_future = executor.submit(self.accounts_snapshot)
-            usage_future = executor.submit(self.usage_summary)
+            usage_future = executor.submit(lambda: dict(self._ttl_cached("usage_summary", self.usage_summary)))
 
-            overview = self._local_overview(version_id, range_start_ms, range_end_ms)
-            realtime = self._local_realtime(version_id, range_start_ms, range_end_ms, range_name)
+            realtime, totals = self._local_realtime_with_totals(version_id, range_start_ms, range_end_ms, range_name)
+            overview = self._local_overview(version_id, range_start_ms, range_end_ms, totals)
             errors: list[str] = []
             try:
                 cpa = cpa_future.result()
@@ -5150,7 +5104,7 @@ class BillingService:
                         "quota_count": len(item["quota"]),
                     } for item in accounts["accounts"]],
                 }
-            except (httpx.HTTPError, BillingDependencyError, BillingError):
+            except BillingError:
                 account_status = {"available": False, "error": "CPA 上游账号额度不可用"}
                 errors.append("accounts")
             usage = usage_future.result()
@@ -5236,7 +5190,7 @@ class BillingService:
         cycle_name: str,
         pool_id: int,
         user_id: int,
-    ) -> BillingCycle:
+    ) -> tuple[BillingCycle, bool]:
         cycle = session.scalar(select(BillingCycle).where(BillingCycle.name == cycle_name))
         if cycle is None or cycle.status == "closed":
             raise BillingError("账期不存在或已经关闭")
@@ -5246,18 +5200,17 @@ class BillingService:
         pool = session.get(ResourcePool, pool_id)
         configured = session.get(CyclePoolCost, {"cycle_id": cycle.id, "pool_id": pool_id})
         has_upstream = session.scalar(
-            select(func.count()).select_from(CycleUpstreamCost).where(CycleUpstreamCost.cycle_id == cycle.id)
-        ) or 0
+            select(CycleUpstreamCost.cycle_id).where(CycleUpstreamCost.cycle_id == cycle.id).limit(1)
+        ) is not None
         if pool is None:
             raise BillingError("资源池未配置到该账期")
         if configured is None and not has_upstream:
             raise BillingError("资源池未配置到该账期")
-        return cycle
+        return cycle, has_upstream
 
-    def _manual_usage_group_id(self, session: Any, cycle: BillingCycle, group_id: int | None) -> int | None:
-        has_upstream = session.scalar(
-            select(func.count()).select_from(CycleUpstreamCost).where(CycleUpstreamCost.cycle_id == cycle.id)
-        ) or 0
+    def _manual_usage_group_id(
+        self, session: Any, cycle: BillingCycle, group_id: int | None, has_upstream: bool,
+    ) -> int | None:
         if not has_upstream:
             return None
         if group_id is not None:
@@ -5285,8 +5238,8 @@ class BillingService:
     ) -> int:
         normalized_reason = self._normalize_manual_usage_input(amount_nano_usd, reason)
         with self._manual_usage_lock, self.db.session() as session:
-            cycle = self._manual_usage_target(session, cycle_name, pool_id, user_id)
-            resolved_group_id = self._manual_usage_group_id(session, cycle, group_id)
+            cycle, has_upstream = self._manual_usage_target(session, cycle_name, pool_id, user_id)
+            resolved_group_id = self._manual_usage_group_id(session, cycle, group_id, has_upstream)
             current_manual = self._manual_usage_balance(session, cycle.id, pool_id, user_id)
             if current_manual + amount_nano_usd < 0:
                 raise BillingError("冲销金额不能超过该用户在此资源池的手动原始用量")
@@ -5335,8 +5288,8 @@ class BillingService:
             source_cycle = session.get(BillingCycle, row.cycle_id)
             if source_cycle is None or source_cycle.status == "closed":
                 raise BillingError("已关闭账期的补录不能修改")
-            target_cycle = self._manual_usage_target(session, cycle_name, pool_id, user_id)
-            resolved_group_id = self._manual_usage_group_id(session, target_cycle, group_id)
+            target_cycle, has_upstream = self._manual_usage_target(session, cycle_name, pool_id, user_id)
+            resolved_group_id = self._manual_usage_group_id(session, target_cycle, group_id, has_upstream)
             before = self._manual_usage_state(row, source_cycle.name)
             source_group = (row.cycle_id, row.pool_id, row.telegram_user_id)
             target_group = (target_cycle.id, pool_id, user_id)
@@ -5426,6 +5379,11 @@ class BillingService:
             keys = list(session.scalars(select(APIKey).order_by(APIKey.id)))
             key_map = {key.id: key for key in keys}
             cycles = list(session.scalars(select(BillingCycle).order_by(BillingCycle.start_at_ms.desc())))
+            cycle_map = {cycle.id: cycle for cycle in cycles}
+            active_key_counts: dict[int | None, int] = defaultdict(int)
+            for key in keys:
+                if key.status == "active":
+                    active_key_counts[key.current_owner_id] += 1
             gradients = list(session.scalars(select(GradientRule).order_by(GradientRule.active.desc(), GradientRule.id)))
             gradient_map = {rule.id: rule for rule in gradients}
             pricing_versions = list(session.scalars(select(PricingVersion).order_by(PricingVersion.id.desc())))
@@ -5437,9 +5395,11 @@ class BillingService:
                 .order_by(ModelPriceRule.model)
             )) if active_pricing else []
             pools = list(session.scalars(select(ResourcePool).order_by(ResourcePool.id)))
-            assignments = list(session.scalars(
+            assignments_by_pool: dict[int, list[PoolAssignmentRule]] = defaultdict(list)
+            for rule in session.scalars(
                 select(PoolAssignmentRule).order_by(PoolAssignmentRule.priority, PoolAssignmentRule.id)
-            ))
+            ):
+                assignments_by_pool[rule.pool_id].append(rule)
             cycle_pool_costs: dict[int, list[dict[str, Any]]] = defaultdict(list)
             cycle_upstream_costs: dict[int, list[dict[str, Any]]] = defaultdict(list)
             cycle_groups: dict[int, list[dict[str, Any]]] = defaultdict(list)
@@ -5448,14 +5408,23 @@ class BillingService:
             groups = list(session.scalars(select(UpstreamAccountGroup).order_by(UpstreamAccountGroup.is_default.desc(), UpstreamAccountGroup.id)))
             group_map = {group.id: group for group in groups}
             account_configs = list(session.scalars(select(UpstreamAccountConfig)))
+            account_counts: dict[int, int] = defaultdict(int)
+            for item in account_configs:
+                account_counts[item.group_id] += 1
+            gradient_use_counts: dict[int, int] = defaultdict(int)
+            for cycle in cycles:
+                if cycle.status != "closed":
+                    gradient_use_counts[cycle.gradient_rule_id] += 1
+            for group in groups:
+                gradient_use_counts[group.gradient_rule_id] += 1
             for item in session.scalars(select(CyclePoolCost).order_by(CyclePoolCost.cycle_id, CyclePoolCost.pool_id)):
                 cycle_pool_costs[item.cycle_id].append({
                     "pool_id": item.pool_id,
                     "pool": pool_map[item.pool_id].name if item.pool_id in pool_map else str(item.pool_id),
-                    "fixed_cost_cents": int(item.fixed_cost_cents),
-                    "fixed_cost": format_cents(int(item.fixed_cost_cents)),
+                    "fixed_cost_cents": item.fixed_cost_cents,
+                    "fixed_cost": format_cents(item.fixed_cost_cents),
                 })
-            costs = {cycle_id: int(total or 0) for cycle_id, total in session.execute(
+            costs = {cycle_id: total for cycle_id, total in session.execute(
                 select(CyclePoolCost.cycle_id, func.sum(CyclePoolCost.fixed_cost_cents)).group_by(CyclePoolCost.cycle_id)
             )}
             for item in session.scalars(select(CycleUpstreamCost).order_by(
@@ -5485,11 +5454,17 @@ class BillingService:
                     "group": item.group_name,
                     "gradient_rule_id": item.gradient_rule_id,
                     "gradient_rule": gradient_map[item.gradient_rule_id].name if item.gradient_rule_id in gradient_map else None,
-                    "is_default": bool(item.is_default),
-                    "fixed_cost": format_cents(int(item.fixed_cost_cents or 0)),
-                    "dynamic_cost": format_cents(int(item.dynamic_cost_cents or 0)),
-                    "member_amount": format_cents(int(item.member_amount_cents or 0)),
+                    "is_default": item.is_default,
+                    "fixed_cost": format_cents(item.fixed_cost_cents),
+                    "dynamic_cost": format_cents(item.dynamic_cost_cents),
+                    "member_amount": format_cents(item.member_amount_cents),
                 })
+            cycle_fixed_costs = {
+                cycle.id: costs.get(cycle.id, 0) + sum(
+                    item["fixed_cost_cents"] or 0 for item in cycle_upstream_costs.get(cycle.id, [])
+                )
+                for cycle in cycles
+            }
             return {
                 "cycles": [{"id": cycle.id, "name": cycle.name, "start": self._format_timestamp(cycle.start_at_ms),
                             "end": self._format_timestamp(cycle.end_at_ms), "status": cycle.status,
@@ -5502,12 +5477,8 @@ class BillingService:
                             "upstream_costs": cycle_upstream_costs.get(cycle.id, []),
                             "groups": cycle_groups.get(cycle.id, []),
                             "billing_model": "upstream_channels" if cycle_upstream_costs.get(cycle.id) else "legacy_pool_fixed",
-                            "fixed_cost_cents": costs.get(cycle.id, 0) + sum(
-                                int(item["fixed_cost_cents"] or 0) for item in cycle_upstream_costs.get(cycle.id, [])
-                            ),
-                            "fixed_cost": format_cents(costs.get(cycle.id, 0) + sum(
-                                int(item["fixed_cost_cents"] or 0) for item in cycle_upstream_costs.get(cycle.id, [])
-                            ))}
+                            "fixed_cost_cents": cycle_fixed_costs[cycle.id],
+                            "fixed_cost": format_cents(cycle_fixed_costs[cycle.id])}
                            for cycle in cycles],
                 "sync": [{"source": source.name, "last_event_id": checkpoint.last_event_id,
                           "last_event_at": self._format_timestamp(checkpoint.last_event_at_ms),
@@ -5520,12 +5491,12 @@ class BillingService:
                            "registered": bool(user.registered_at_ms), "manual_allowed": user.manual_allowed,
                            "is_admin": bool(user.is_admin or user.telegram_user_id in self.settings.admin_user_ids),
                            "configured_admin": user.telegram_user_id in self.settings.admin_user_ids,
-                           "active_keys": sum(1 for key in keys if key.current_owner_id == user.telegram_user_id and key.status == "active")}
+                           "active_keys": active_key_counts[user.telegram_user_id]}
                           for user in users.values()],
                 "keys": [{"id": key.id, "masked": key.masked_value, "name": key.display_name,
                           "status": key.status, "owner_id": key.current_owner_id,
                           "owner": self._user_name(users.get(key.current_owner_id), key.current_owner_id or "未绑定"),
-                          "present_in_cpa": bool(key.present_in_cpa),
+                          "present_in_cpa": key.present_in_cpa,
                           "last_seen_in_cpa_at": self._iso_timestamp(key.last_seen_in_cpa_at_ms),
                           "billing_multiplier_ppm": key.billing_multiplier_ppm,
                           "billing_multiplier": None if key.billing_multiplier_ppm is None else format(
@@ -5551,7 +5522,7 @@ class BillingService:
                         "auth_index_pattern": rule.auth_index_pattern,
                         "model_pattern": rule.model_pattern,
                         "active": rule.active,
-                    } for rule in assignments if rule.pool_id == pool.id],
+                    } for rule in assignments_by_pool[pool.id]],
                 } for pool in pools],
                 "gradients": [{
                     "id": rule.id,
@@ -5561,19 +5532,15 @@ class BillingService:
                     "active": rule.active,
                     "created_at": self._iso_timestamp(rule.created_at_ms),
                     "updated_at": self._iso_timestamp(rule.updated_at_ms),
-                    "open_cycle_count": sum(
-                        1 for cycle in cycles if cycle.gradient_rule_id == rule.id and cycle.status != "closed"
-                    ) + sum(
-                        1 for group in groups if group.gradient_rule_id == rule.id
-                    ),
+                    "open_cycle_count": gradient_use_counts[rule.id],
                 } for rule in gradients],
                 "upstream_groups": [{
                     "id": group.id,
                     "name": group.name,
-                    "is_default": bool(group.is_default),
+                    "is_default": group.is_default,
                     "gradient_rule_id": group.gradient_rule_id,
                     "gradient_rule": gradient_map[group.gradient_rule_id].name if group.gradient_rule_id in gradient_map else None,
-                    "account_count": sum(1 for item in account_configs if item.group_id == group.id),
+                    "account_count": account_counts[group.id],
                     "created_at": self._iso_timestamp(group.created_at_ms),
                     "updated_at": self._iso_timestamp(group.updated_at_ms),
                 } for group in groups],
@@ -5602,14 +5569,14 @@ class BillingService:
                     },
                     "models": [self._model_price_payload(rule) for rule in active_pricing_rules],
                 },
-                "adjustments": [{"cycle": next((cycle.name for cycle in cycles if cycle.id == row.cycle_id), str(row.cycle_id)),
+                "adjustments": [{"cycle": cycle_map[row.cycle_id].name if row.cycle_id in cycle_map else str(row.cycle_id),
                                  "user_id": row.telegram_user_id, "amount": format_cents(row.amount_cents),
                                  "reason": row.reason, "operator": row.operator_user_id,
                                  "at": self._format_timestamp(row.created_at_ms)}
                                 for row in session.scalars(select(Adjustment).order_by(Adjustment.id.desc()).limit(100))],
                 "manual_usage_adjustments": [{
                     "id": row.id,
-                    "cycle": next((cycle.name for cycle in cycles if cycle.id == row.cycle_id), str(row.cycle_id)),
+                    "cycle": cycle_map[row.cycle_id].name if row.cycle_id in cycle_map else str(row.cycle_id),
                     "pool_id": row.pool_id,
                     "pool": pool_map[row.pool_id].name if row.pool_id in pool_map else str(row.pool_id),
                     "group_id": row.group_id,
@@ -5623,7 +5590,7 @@ class BillingService:
                     "created_at": self._format_timestamp(row.created_at_ms),
                     "updated_at": None if row.updated_at_ms is None else self._format_timestamp(row.updated_at_ms),
                     "at": self._format_timestamp(row.updated_at_ms or row.created_at_ms),
-                    "editable": next((cycle.status != "closed" for cycle in cycles if cycle.id == row.cycle_id), False),
+                    "editable": row.cycle_id in cycle_map and cycle_map[row.cycle_id].status != "closed",
                 } for row in session.scalars(
                     select(ManualUsageAdjustment).order_by(ManualUsageAdjustment.id.desc())
                 )],
@@ -5670,12 +5637,12 @@ class BillingService:
                 .outerjoin(RatedEvent, join_condition)
             ).one()
             return {
-                "total_requests": int(row[0] or 0),
-                "total_tokens": int(row[1] or 0),
-                "total_cost": format_usd_nano(int(row[2] or 0)),
-                "recent_requests": int(row[3] or 0),
-                "recent_tokens": int(row[4] or 0),
-                "recent_cost": format_usd_nano(int(row[5] or 0)),
+                "total_requests": row[0],
+                "total_tokens": row[1] or 0,
+                "total_cost": format_usd_nano(row[2] or 0),
+                "recent_requests": row[3] or 0,
+                "recent_tokens": row[4] or 0,
+                "recent_cost": format_usd_nano(row[5] or 0),
             }
 
     def rankings(self, since_ms: int | None = None, until_ms: int | None = None,
@@ -5713,18 +5680,20 @@ class BillingService:
                 .group_by(KeyOwnershipPeriod.telegram_user_id)
                 .order_by(func.sum(RatedEvent.rated_weight_nano_usd).desc())
             ).all()
-            usage = {user_id: (int(requests or 0), int(tokens or 0), int(cost or 0))
-                     for user_id, requests, tokens, cost in rows}
+            usage = {user_id: (requests, tokens, cost or 0) for user_id, requests, tokens, cost in rows}
+            key_counts = dict(session.execute(
+                select(APIKey.current_owner_id, func.count())
+                .where(APIKey.current_owner_id.is_not(None), APIKey.status == "active")
+                .group_by(APIKey.current_owner_id)
+            ).all())
             users = list(session.scalars(select(TelegramUser).where(TelegramUser.registered_at_ms.is_not(None))))
             result = []
             for user in users:
                 requests, tokens, cost = usage.get(user.telegram_user_id, (0, 0, 0))
-                key_count = session.scalar(select(func.count()).select_from(APIKey).where(
-                    APIKey.current_owner_id == user.telegram_user_id, APIKey.status == "active")) or 0
                 result.append({"telegram_user_id": user.telegram_user_id,
                                "name": self._user_name(user, user.telegram_user_id), "requests": requests,
                                "tokens": tokens, "cost": format_usd_nano(cost), "cost_nano": cost,
-                               "key_count": int(key_count)})
+                               "key_count": key_counts.get(user.telegram_user_id, 0)})
             unowned_filters = [KeyOwnershipPeriod.telegram_user_id.is_(None)]
             if since_ms is not None:
                 unowned_filters.append(RawUsageEvent.occurred_at_ms >= since_ms)
@@ -5749,13 +5718,13 @@ class BillingService:
                     APIKey.display_name,
                 )
             ):
-                cost_nano = int(cost or 0)
+                cost_nano = cost or 0
                 result.append({
                     "telegram_user_id": None,
                     "api_key_id": key_id,
                     "name": display_name or masked or (mask_hash(str(key_hash)) if key_hash else "未知 API Key"),
-                    "requests": int(requests or 0),
-                    "tokens": int(tokens or 0),
+                    "requests": requests,
+                    "tokens": tokens,
                     "cost": format_usd_nano(cost_nano),
                     "cost_nano": cost_nano,
                     "key_count": 1,
@@ -5825,10 +5794,10 @@ class BillingService:
                 group_key = (kind_value, identity_value)
                 item = series.setdefault(group_key, {
                     "name": display_name or (mask_hash(identity_value) if identity_value != "unknown" else "未知 API Key"),
-                    "values": {}, "total": int(total),
+                    "values": {}, "total": total,
                 })
-                label = labels[int(index)]
-                item["values"][label] = item["values"].get(label, 0) + int(tokens or 0)
+                label = labels[index]
+                item["values"][label] = item["values"].get(label, 0) + tokens
         return labels, list(series.values())
 
     def model_usage(self, limit: int = 20) -> list[dict[str, Any]]:
@@ -5839,7 +5808,7 @@ class BillingService:
                                               RatedEvent, and_(RatedEvent.raw_event_id == RawUsageEvent.id,
                                                                RatedEvent.pricing_version_id == self._event_pricing_version(version_id)))
                                    .group_by(RawUsageEvent.model).order_by(func.sum(RatedEvent.rated_weight_nano_usd).desc()).limit(limit)).all()
-            return [{"model": model, "requests": int(requests or 0), "tokens": int(tokens or 0), "cost": format_usd_nano(int(cost or 0))}
+            return [{"model": model, "requests": requests, "tokens": tokens, "cost": format_usd_nano(cost or 0)}
                     for model, requests, tokens, cost in rows]
 
     def account_usage(self, limit: int = 20) -> list[dict[str, Any]]:
@@ -5850,12 +5819,31 @@ class BillingService:
                                    .outerjoin(RatedEvent, and_(RatedEvent.raw_event_id == RawUsageEvent.id,
                                                               RatedEvent.pricing_version_id == self._event_pricing_version(version_id))).group_by(label)
                                    .order_by(func.sum(RatedEvent.rated_weight_nano_usd).desc()).limit(limit)).all()
+            names = [row[0] for row in rows]
+            has_quota_data = or_(RawUsageEvent.response_metadata_json.is_not(None), RawUsageEvent.quota_used_percent.is_not(None),
+                                 RawUsageEvent.quota_recover_at_ms.is_not(None))
+            quota_columns = (RawUsageEvent.id, RawUsageEvent.occurred_at_ms, RawUsageEvent.quota_used_percent,
+                             RawUsageEvent.quota_plan_type, RawUsageEvent.quota_recover_at_ms, RawUsageEvent.response_metadata_json)
+            # An event belongs to a name through either its account snapshot or its source label.
+            candidates = (
+                select(RawUsageEvent.account_snapshot.label("name"), *quota_columns)
+                .where(RawUsageEvent.account_snapshot.in_(names), has_quota_data)
+                .union_all(
+                    select(RawUsageEvent.source_label.label("name"), *quota_columns)
+                    .where(RawUsageEvent.source_label.in_(names), has_quota_data)
+                )
+                .subquery()
+            )
+            ranked = select(candidates, func.row_number().over(
+                partition_by=candidates.c.name,
+                order_by=(candidates.c.occurred_at_ms.desc(), candidates.c.id.desc()),
+            ).label("position")).subquery()
+            latest_by_name = {row.name: row for row in session.execute(
+                select(ranked).where(ranked.c.position == 1)
+            )} if names else {}
             result = []
             for name, requests, tokens, cost in rows:
-                latest = session.scalar(select(RawUsageEvent).where(
-                    or_(RawUsageEvent.account_snapshot == name, RawUsageEvent.source_label == name),
-                    or_(RawUsageEvent.response_metadata_json.is_not(None), RawUsageEvent.quota_used_percent.is_not(None), RawUsageEvent.quota_recover_at_ms.is_not(None)),
-                ).order_by(RawUsageEvent.occurred_at_ms.desc()))
+                latest = latest_by_name.get(name)
                 quota = "暂无"
                 if latest:
                     parts = []
@@ -5875,7 +5863,7 @@ class BillingService:
                         except (TypeError, json.JSONDecodeError):
                             pass
                     quota = " ".join(parts) or "暂无"
-                result.append({"name": name, "requests": int(requests or 0), "tokens": int(tokens or 0), "cost": format_usd_nano(int(cost or 0)), "quota": quota})
+                result.append({"name": name, "requests": requests, "tokens": tokens, "cost": format_usd_nano(cost or 0), "quota": quota})
             return result
 
     def set_manual_allowed(self, user_id: int, allowed: bool) -> None:
@@ -5917,18 +5905,22 @@ class BillingService:
                 session.add(key)
             key.display_name = name[:120]
 
-    def update_cycle_time(self, name: str, start: str, end: str) -> None:
-        zone = ZoneInfo(self.settings.timezone)
-        start_dt, end_dt = datetime.fromisoformat(start), datetime.fromisoformat(end)
-        if start_dt.tzinfo is None: start_dt = start_dt.replace(tzinfo=zone)
-        if end_dt.tzinfo is None: end_dt = end_dt.replace(tzinfo=zone)
-        if end_dt <= start_dt:
+    def _cycle_time_range_ms(self, start: str, end: str) -> tuple[int, int]:
+        try:
+            start_ms, end_ms = self._local_time_ms(start), self._local_time_ms(end)
+        except ValueError as exc:
+            raise BillingError("cycle time is invalid") from exc
+        if end_ms <= start_ms:
             raise BillingError("cycle end must be after start")
+        return start_ms, end_ms
+
+    def update_cycle_time(self, name: str, start: str, end: str) -> None:
+        start_ms, end_ms = self._cycle_time_range_ms(start, end)
         with self.db.session() as session:
             cycle = session.scalar(select(BillingCycle).where(BillingCycle.name == name))
             if cycle is None or cycle.status == "closed":
                 raise BillingError("cycle is missing or closed")
-            cycle.start_at_ms, cycle.end_at_ms = int(start_dt.timestamp() * 1000), int(end_dt.timestamp() * 1000)
+            cycle.start_at_ms, cycle.end_at_ms = start_ms, end_ms
             self._invalidate_cycle_previews(session, [cycle.id])
 
     def list_cycles(self) -> list[dict[str, Any]]:
@@ -6001,32 +5993,31 @@ class BillingService:
                     ),
                 )
             ).one()
-            raw_count = int(counts[0] or 0)
-            rated_count = int(counts[1] or 0)
-            dead = session.scalar(select(func.count()).select_from(DeadLetter).where(DeadLetter.resolved_at_ms.is_(None))) or 0
-            unowned = int(counts[2] or 0)
-            unassigned = int(counts[3] or 0)
+            raw_count, rated_count = counts[0], counts[1]
+            dead = session.scalar(select(func.count()).select_from(DeadLetter).where(DeadLetter.resolved_at_ms.is_(None)))
+            unowned = counts[2] or 0
+            unassigned = counts[3] or 0
             checkpoint_state = session.execute(select(
                 func.max(SyncCheckpoint.last_success_at_ms),
                 func.sum(case((SyncCheckpoint.last_error.is_not(None), 1), else_=0)),
             )).one()
-            sync_backlog = max(0, int(source_count) - int(raw_count))
-            raw_excess = max(0, int(raw_count) - int(source_count))
-            unpriced = max(0, int(raw_count) - int(rated_count))
-            last_sync_at_ms = int(checkpoint_state[0]) if checkpoint_state[0] is not None else None
+            sync_backlog = max(0, source_count - raw_count)
+            raw_excess = max(0, raw_count - source_count)
+            unpriced = max(0, raw_count - rated_count)
+            last_sync_at_ms = checkpoint_state[0]
             stale_after_ms = max(60_000, int(self.settings.worker_interval_seconds * 5_000))
             sync_stale = last_sync_at_ms is None or now_ms() - last_sync_at_ms > stale_after_ms
-            sync_has_error = int(checkpoint_state[1] or 0) > 0
+            sync_has_error = (checkpoint_state[1] or 0) > 0
             sync_degraded = sync_has_error or sync_backlog > 5_000 or (sync_backlog > 0 and sync_stale)
             integrity_ok = raw_excess == 0 and dead == 0 and unassigned == 0
             result = {
-                "cpamp_events": int(source_count),
-                "raw_events": int(raw_count),
-                "rated_events": int(rated_count),
+                "cpamp_events": source_count,
+                "raw_events": raw_count,
+                "rated_events": rated_count,
                 "unpriced_events": unpriced,
-                "dead_letters": int(dead),
-                "unowned_events": int(unowned),
-                "unassigned_events": int(unassigned),
+                "dead_letters": dead,
+                "unowned_events": unowned,
+                "unassigned_events": unassigned,
                 "sync_backlog": sync_backlog,
                 "raw_excess": raw_excess,
                 "sync_pending": sync_backlog > 0,
@@ -6192,14 +6183,10 @@ class BillingService:
     def _parse_admin_time(self, value: str | None, label: str) -> int | None:
         if value is None or not str(value).strip():
             return None
-        zone = ZoneInfo(self.settings.timezone)
         try:
-            parsed = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+            return self._local_time_ms(str(value).strip())
         except ValueError as exc:
             raise BillingError(f"{label}时间格式无效") from exc
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=zone)
-        return int(parsed.timestamp() * 1000)
 
     def _replace_cycle_group_snapshots(self, session: Any, cycle: BillingCycle, group_ids: set[int]) -> None:
         session.execute(delete(CycleGroup).where(CycleGroup.cycle_id == cycle.id))
@@ -6208,9 +6195,12 @@ class BillingService:
         missing = sorted(group_ids - set(by_id))
         if missing:
             raise BillingError("上游账号分组不存在")
+        gradients = {rule.id: rule for rule in session.scalars(
+            select(GradientRule).where(GradientRule.id.in_({group.gradient_rule_id for group in groups}))
+        )}
         for group_id in sorted(group_ids):
             group = by_id[group_id]
-            gradient = session.get(GradientRule, group.gradient_rule_id)
+            gradient = gradients.get(group.gradient_rule_id)
             if gradient is None:
                 raise BillingError(f"上游分组 {group.name} 的梯度规则不存在")
             session.add(CycleGroup(
@@ -6219,7 +6209,7 @@ class BillingService:
                 group_name=group.name,
                 gradient_rule_id=group.gradient_rule_id,
                 tiers_json=gradient.tiers_json,
-                is_default=bool(group.is_default),
+                is_default=group.is_default,
             ))
 
     def create_upstream_group(self, name: str, gradient_rule_id: int, reason: str, operator_id: str = "admin-token") -> int:
@@ -6344,7 +6334,7 @@ class BillingService:
             files = self.cpa.upstream_channels()
         except (httpx.HTTPError, BillingError) as exc:
             raise BillingDependencyError("CPA 上游账号服务不可用") from exc
-        identity = next((item for item in files if isinstance(item, dict) and str(item.get("id") or "") == account_id), None)
+        identity = next((item for item in files if str(item.get("id") or "") == account_id), None)
         if identity is None:
             raise BillingError("上游账号不存在或已失效")
         auth_type = self._upstream_auth_type(identity)
@@ -6454,14 +6444,11 @@ class BillingService:
             files = self.cpa.upstream_channels()
         except (httpx.HTTPError, BillingError) as exc:
             raise BillingDependencyError("CPA 上游账号服务不可用，无法冻结账期成本配置") from exc
-        by_id = {str(item.get("id") or ""): item for item in files if isinstance(item, dict)}
+        by_id = {str(item.get("id") or ""): item for item in files}
         existing_ids: set[str] = set()
         for item in existing or []:
-            account_id = str(item.get("id") or "")
-            if not account_id:
-                continue
-            existing_ids.add(account_id)
-            by_id.setdefault(account_id, item)
+            existing_ids.add(item["id"])
+            by_id.setdefault(item["id"], item)
         expected_ids = {
             account_id for account_id, item in by_id.items()
             if account_id and str(item.get("auth_index") or "").strip()
@@ -6517,8 +6504,8 @@ class BillingService:
                         try:
                             fixed_cost_cents = prorate_subscription_cost(
                                 mode=subscription_mode,
-                                period_cost_cents=int(period_cost_cents),
-                                start_ms=int(period_start_at_ms),
+                                period_cost_cents=period_cost_cents,
+                                start_ms=period_start_at_ms,
                                 end_ms=period_end_at_ms,
                                 recurring_unit=recurring_unit,
                                 recurring_interval=recurring_interval,
@@ -6637,7 +6624,7 @@ class BillingService:
             else:
                 for item in resolved_upstream:
                     session.add(CycleUpstreamCost(cycle_id=cycle.id, **item))
-                self._replace_cycle_group_snapshots(session, cycle, {int(item["group_id"]) for item in resolved_upstream})
+                self._replace_cycle_group_snapshots(session, cycle, {item["group_id"] for item in resolved_upstream})
             self._invalidate_cycle_previews(session, [cycle.id])
             session.add(AuditLog(
                 operator_type="web-admin", operator_id=operator_id, operation="cycle.configure",
@@ -6658,18 +6645,7 @@ class BillingService:
             raise BillingError("cycle name must use letters, numbers, dot, underscore, or hyphen")
         if fixed_cost_cents < 0:
             raise BillingError("fixed cost cannot be negative")
-        zone = ZoneInfo(self.settings.timezone)
-        try:
-            start_dt, end_dt = datetime.fromisoformat(start), datetime.fromisoformat(end)
-        except ValueError as exc:
-            raise BillingError("cycle time is invalid") from exc
-        if start_dt.tzinfo is None:
-            start_dt = start_dt.replace(tzinfo=zone)
-        if end_dt.tzinfo is None:
-            end_dt = end_dt.replace(tzinfo=zone)
-        start_ms, end_ms = int(start_dt.timestamp() * 1000), int(end_dt.timestamp() * 1000)
-        if end_ms <= start_ms:
-            raise BillingError("cycle end must be after start")
+        start_ms, end_ms = self._cycle_time_range_ms(start, end)
         resolved_upstream = None if upstream_costs is None else self._resolve_upstream_costs(
             upstream_costs, cycle_start_ms=start_ms, cycle_end_ms=end_ms, timezone=self.settings.timezone,
         )
@@ -6693,7 +6669,7 @@ class BillingService:
                 normalized_costs = {}
                 for item in resolved_upstream:
                     session.add(CycleUpstreamCost(cycle_id=cycle.id, **item))
-                self._replace_cycle_group_snapshots(session, cycle, {int(item["group_id"]) for item in resolved_upstream})
+                self._replace_cycle_group_snapshots(session, cycle, {item["group_id"] for item in resolved_upstream})
             elif pool_costs is None:
                 pool = session.scalar(select(ResourcePool).where(ResourcePool.name == "default-cpa"))
                 if pool is None:

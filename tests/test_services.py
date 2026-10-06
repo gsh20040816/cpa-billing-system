@@ -1069,11 +1069,11 @@ def test_cpa_accounts_are_sanitized_and_refresh_uses_public_account_ids(service,
     }
 
     quota["rate_limit"]["primary_window"]["reset_at"] = current + 3_600_000 + 4 * 60_000
-    jittered = service.accounts_snapshot()["accounts"][0]["quota"][0]
+    jittered = service.accounts_snapshot(force=True)["accounts"][0]["quota"][0]
     assert jittered["window_started_at"] == primary["window_started_at"]
 
     quota["rate_limit"]["primary_window"]["reset_at"] = current + 3_600_000 + 6 * 60_000
-    shifted = service.accounts_snapshot()["accounts"][0]["quota"][0]
+    shifted = service.accounts_snapshot(force=True)["accounts"][0]["quota"][0]
     assert shifted["window_started_at"] == datetime.fromtimestamp(
         (current - 4 * 3_600_000 + 6 * 60_000) / 1000,
         ZoneInfo("Asia/Shanghai"),
@@ -1321,28 +1321,6 @@ def test_pricing_snapshot_exposes_effective_rules_without_internal_auth_patterns
     assert snapshot["models"][0]["default"]["input"]["usd_per_million"] == "1"
     assert snapshot["billing"]["pools"][0]["fixed_cost_cents"] == 12345
     assert "auth_index_pattern" not in json.dumps(snapshot)
-
-
-def test_realtime_status_removes_key_ids_auth_indexes_and_request_particles(service) -> None:
-    sanitized = service._sanitize_realtime({
-        "current_usage": {
-            "models": [{"key": "internal-model-id", "label": "gpt-test", "requests": 1}],
-            "api_keys": [{"key": "42", "label": "sk-secret", "requests": 1, "tokens": 2, "cost": 0.1}],
-            "auth_files": [{"key": "raw-auth-index", "label": "account", "requests": 1}],
-            "ai_providers": [{"key": "provider-secret", "label": "provider", "requests": 1}],
-        },
-        "response_distribution": {
-            "ttft": {"average_line": [], "particles": [{"timestamp": "secret"}], "total_particles": 1},
-            "latency": {"average_line": [], "particles": [{"timestamp": "secret"}], "total_particles": 1},
-        },
-    })
-    serialized = json.dumps(sanitized)
-    assert "sk-secret" not in serialized
-    assert "raw-auth-index" not in serialized
-    assert "provider-secret" not in serialized
-    assert "internal-model-id" not in serialized
-    assert '"particles"' not in serialized
-    assert '"timestamp": "secret"' not in serialized
 
 
 def test_request_history_exposes_and_filters_average_tps(service, settings) -> None:
@@ -1870,7 +1848,7 @@ def test_upstream_price_sync_rerates_open_cycles_only(service, settings, monkeyp
     realtime = service._local_realtime(active_id, 0, 172_800_000, "all")
     assert realtime["current_usage"]["models"][0]["cost"] == history["cost"]
     with service.db.session() as session:
-        account_usage = service._account_usage_aggregate(session, active_id, "auth")
+        account_usage = service._account_usage_aggregates(session, active_id, ["auth"])["auth"]
     assert account_usage["unpriced"] == 0
     assert account_usage["cost"] == history["cost"]
     with service.db.session() as session:
@@ -2756,3 +2734,278 @@ def test_request_filter_options_collects_distinct_values_in_one_pass(service, se
         "models": [], "tiers": [], "providers": [], "failure_codes": [], "keys": [],
         "range": {"start": None, "end": None},
     }
+
+
+def _codex_files(count: int) -> list[dict]:
+    return [{
+        "id": f"codex-{index}",
+        "auth_index": f"auth-{index}",
+        "name": f"Codex {index}",
+        "type": "codex",
+        "provider": "codex",
+        "id_token": {"chatgpt_account_id": f"chatgpt-{index}"},
+        "disabled": False,
+    } for index in range(count)]
+
+
+def test_accounts_snapshot_is_cached_briefly_and_force_bypasses(service, monkeypatch) -> None:
+    files = _codex_files(1)
+    channel_calls: list[int] = []
+    usage_calls: list[str] = []
+    monkeypatch.setattr(service.cpa, "upstream_channels", lambda: channel_calls.append(1) or files)
+
+    def api_call(auth_index, method, url, headers=None, data=""):
+        usage_calls.append(auth_index)
+        return {"status_code": 200, "body": json.dumps({"rate_limit": {"primary_window": {
+            "used_percent": len(usage_calls), "limit_window_seconds": 18000, "reset_at": int(time.time()) + 3600,
+        }}})}
+
+    monkeypatch.setattr(service.cpa, "api_call", api_call)
+    monkeypatch.setattr(service.cpa, "codex_reset_credits", lambda *args, **kwargs: {"available_count": 0, "credits": []})
+
+    first = service.accounts_snapshot()
+    second = service.accounts_snapshot()
+    assert first["accounts"][0]["quota"][0]["used_percent"] == 1
+    for field in ("used_percent", "reset_at", "window_started_at", "label"):
+        assert second["accounts"][0]["quota"][0][field] == first["accounts"][0]["quota"][0][field]
+    assert "_reset_at_ms" not in json.dumps(second)
+    assert (len(channel_calls), len(usage_calls)) == (1, 1)
+
+    assert service.accounts_snapshot(force=True)["accounts"][0]["quota"][0]["used_percent"] == 2
+    assert service.accounts_snapshot()["accounts"][0]["quota"][0]["used_percent"] == 2
+    assert (len(channel_calls), len(usage_calls)) == (2, 2)
+
+    monkeypatch.setattr(BillingService, "_TTL_CACHE_SECONDS", 0.0)
+    service.accounts_snapshot(force=True)
+    assert service.accounts_snapshot()["accounts"][0]["quota"][0]["used_percent"] == 4
+    assert (len(channel_calls), len(usage_calls)) == (4, 4)
+
+
+def test_cpa_quota_probes_run_concurrently_and_keep_account_order(service, monkeypatch) -> None:
+    files = _codex_files(6)
+    files.insert(3, {"id": "key-1", "auth_index": "key-auth", "account_type": "api_key", "type": "codex-api-key", "provider": "codex"})
+    files.append({"id": "", "auth_index": "orphan-auth", "type": "codex", "provider": "codex"})
+    monkeypatch.setattr(service.cpa, "upstream_channels", lambda: files)
+    lock = threading.Lock()
+    state = {"active": 0, "peak": 0}
+    headers_by_auth: dict[str, dict] = {}
+
+    def api_call(auth_index, method, url, headers=None, data=""):
+        with lock:
+            state["active"] += 1
+            state["peak"] = max(state["peak"], state["active"])
+            headers_by_auth[auth_index] = headers
+        time.sleep(0.02 * (6 - int(auth_index.split("-")[1])))
+        with lock:
+            state["active"] -= 1
+        return {"status_code": 200, "body": json.dumps({"plan_type": auth_index})}
+
+    monkeypatch.setattr(service.cpa, "api_call", api_call)
+    monkeypatch.setattr(service.cpa, "codex_reset_credits", lambda auth_index, account_id, force=False: {
+        "available_count": 1, "credits": [{"id": f"credit-{account_id}"}],
+    })
+
+    items = service._cpa_accounts_raw(force=True)["quota"]["items"]
+    assert [item["account_id"] for item in items] == ["codex-0", "codex-1", "codex-2", "key-1", "codex-3", "codex-4", "codex-5"]
+    assert [item["status"] for item in items] == ["completed"] * 3 + ["unsupported"] + ["completed"] * 3
+    assert [item["quota"].get("plan_type") for item in items if item["status"] == "completed"] == [
+        f"auth-{index}" for index in range(6)
+    ]
+    assert items[0]["reset_credits"] == [{"id": "credit-chatgpt-0"}]
+    assert state["peak"] > 1
+    assert headers_by_auth["auth-2"] == CPAClient._codex_headers("chatgpt-2")
+    assert "orphan-auth" not in headers_by_auth
+
+
+def test_account_usage_is_grouped_per_auth_index_and_quota_window(service, settings, monkeypatch) -> None:
+    current = int(time.time() * 1000)
+    files = _codex_files(3)
+    monkeypatch.setattr(service.cpa, "upstream_channels", lambda: files)
+    monkeypatch.setattr(service.cpa, "codex_reset_credits", lambda *args, **kwargs: {"available_count": 0, "credits": []})
+    monkeypatch.setattr(service.cpa, "api_call", lambda *args, **kwargs: {"status_code": 200, "body": json.dumps({
+        "rate_limit": {"primary_window": {"used_percent": 10, "limit_window_seconds": 3600, "reset_at": current + 1_800_000}},
+    })})
+    insert_event(settings, "k", current - 1_000, event_hash="a-in-1", auth_index="auth-0")
+    insert_event(settings, "k", current - 1_000_000, event_hash="a-in-2", auth_index="auth-0")
+    insert_event(settings, "k", current - 2_000_000, event_hash="a-out", auth_index="auth-0")
+    insert_event(settings, "k", current - 500, event_hash="b-in", auth_index="auth-1")
+    service.sync_cpamp()
+    service.rate_events()
+
+    accounts = {item["id"]: item for item in service.accounts_snapshot()["accounts"]}
+    with service.db.session() as session:
+        expected = service._account_usage_aggregates(session, service._active_pricing_id(session), ["auth-0", "auth-1", "auth-2"])
+    assert [accounts[f"codex-{index}"]["usage"]["requests"] for index in range(3)] == [3, 1, 0]
+    assert accounts["codex-0"]["usage"] == expected["auth-0"]
+    assert accounts["codex-2"]["usage"]["first_used_at"] is None
+    assert accounts["codex-2"]["usage"]["cost"] == "0.0000"
+    windows = [accounts[f"codex-{index}"]["quota"][0] for index in range(3)]
+    assert [item["window_usage_requests"] for item in windows] == [2, 1, 0]
+    assert [item["window_usage_tokens"] for item in windows] == [2200, 1100, 0]
+    single_cost = Decimal(expected["auth-1"]["cost"])
+    assert Decimal(windows[0]["window_usage_cost"]) == 2 * single_cost
+    assert windows[2]["window_usage_cost"] == "0.0000"
+    assert windows[2]["available_estimate"]["reason"] == "zero_cost"
+
+
+def test_upstream_quota_reset_probes_only_target_account(service, monkeypatch) -> None:
+    files = _codex_files(3)
+    monkeypatch.setattr(service.cpa, "upstream_channels", lambda: files)
+    probed: list[str] = []
+
+    def api_call(auth_index, method, url, headers=None, data=""):
+        probed.append(auth_index)
+        return {"status_code": 200, "body": json.dumps({"rate_limit": {"secondary_window": {
+            "used_percent": 100, "limit_reached": True, "allowed": False, "limit_window_seconds": 7 * 24 * 60 * 60,
+        }}})}
+
+    credit_calls = []
+
+    def reset_credits(auth_index, account_id, force=False):
+        credit_calls.append((auth_index, force))
+        return {"available_count": 1, "credits": [{"id": "credit"}]}
+
+    consumed = []
+    monkeypatch.setattr(service.cpa, "api_call", api_call)
+    monkeypatch.setattr(service.cpa, "codex_reset_credits", reset_credits)
+    monkeypatch.setattr(service.cpa, "consume_codex_reset_credit", lambda *args: consumed.append(args) or {"code": "reset", "windows_reset": 1})
+
+    with pytest.raises(BillingError, match="二次确认"):
+        service.reset_account_quota("codex-1", "reason", confirmations=1)
+    with pytest.raises(BillingError, match="不存在"):
+        service.reset_account_quota("missing", "reason", confirmations=3)
+    files[2]["disabled"] = True
+    with pytest.raises(BillingError, match="已停用"):
+        service.reset_account_quota("codex-2", "reason", confirmations=3)
+    assert consumed == []
+
+    service.accounts_snapshot()
+    probed.clear()
+    result = service.reset_account_quota("codex-1", "reason", confirmations=2)
+    assert result["required_confirmations"] == 2
+    assert probed == ["auth-1"]
+    assert credit_calls[-1] == ("auth-1", True)
+    assert consumed == [("auth-1", "chatgpt-1")]
+    service.accounts_snapshot()
+    assert len(probed) == 4, "a successful reset must drop the cached account snapshot"
+
+
+def test_realtime_percentiles_match_nearest_rank_definition(service, settings) -> None:
+    import math
+    import random
+
+    def nearest_rank(values: list[int], percentile: float) -> int | None:
+        if not values:
+            return None
+        ordered = sorted(values)
+        return ordered[max(0, min(len(ordered) - 1, math.ceil(percentile * len(ordered)) - 1))]
+
+    rng = random.Random(7)
+    expected: dict[int, dict[str, list[int]]] = {}
+    for bucket in range(22):
+        values = expected.setdefault(bucket, {"ttft": [], "latency": []})
+        for index in range(bucket):
+            ttft = None if index % 5 == 4 else rng.randint(1, 40)
+            latency = None if index % 7 == 6 else rng.randint(50, 60)
+            if ttft is not None:
+                values["ttft"].append(ttft)
+            if latency is not None:
+                values["latency"].append(latency)
+            insert_event(settings, "k", bucket * 60_000 + index, event_hash=f"p-{bucket}-{index}", ttft_ms=ttft, latency_ms=latency)
+    service.sync_cpamp()
+    with service.db.session() as session:
+        version_id = service._active_pricing_id(session)
+    realtime = service._local_realtime(version_id, 0, 60 * 60_000, "custom")
+    for bucket, item in enumerate(realtime["response_level"]):
+        values = expected.get(bucket, {"ttft": [], "latency": []})
+        assert item["ttft_p50_ms"] == nearest_rank(values["ttft"], 0.50), bucket
+        assert item["ttft_p95_ms"] == nearest_rank(values["ttft"], 0.95), bucket
+        assert item["latency_p50_ms"] == nearest_rank(values["latency"], 0.50), bucket
+        assert item["latency_p95_ms"] == nearest_rank(values["latency"], 0.95), bucket
+
+
+def test_site_status_overview_totals_match_standalone_overview(service, settings, monkeypatch) -> None:
+    current = int(time.time() * 1000)
+    insert_event(settings, "key-a", current - 1_000, event_hash="o-1")
+    insert_event(settings, "key-b", current - 2_000, event_hash="o-2", failed=True, fail_status_code=500)
+    insert_event(settings, "", current - 3_000, event_hash="o-3", model="unpriced-model")
+    service.sync_cpamp()
+    service.rate_events()
+    monkeypatch.setattr(service.cpa, "auth_files", lambda: [])
+
+    status = service.site_status("60m")
+    start_ms = int(datetime.fromisoformat(status["range"]["start"]).timestamp() * 1000)
+    end_ms = int(datetime.fromisoformat(status["range"]["end"]).timestamp() * 1000)
+    with service.db.session() as session:
+        version_id = service._active_pricing_id(session)
+    assert status["overview"] == service._local_overview(version_id, start_ms, end_ms)
+    summary = status["overview"]["summary"]
+    assert (summary["request_count"], summary["unpriced_events"]) == (3, 1)
+    assert status["overview"]["service_health"]["total_failure"] == 1
+    api_keys = status["realtime"]["current_usage"]["api_keys"]
+    assert api_keys == {"count": 2, "requests": 3, "tokens": summary["token_count"], "cost": summary["total_cost"]}
+    assert status["billing"]["usage"] == service.usage_summary()
+    assert status["billing"]["reconciliation"] == service.reconciliation()
+
+
+def test_rankings_count_active_keys_per_user_in_one_pass(service, settings) -> None:
+    create_owner(service, "rank-a", 2, 0)
+    create_owner(service, "rank-b", 3, 0)
+    with service.db.session() as session:
+        session.add(APIKey(cpamp_hash=cpamp_key_hash("rank-a2"), login_fingerprint="f2b", masked_value="m", status="active",
+                           current_owner_id=2, created_at_ms=0))
+        session.add(APIKey(cpamp_hash=cpamp_key_hash("rank-a3"), login_fingerprint="f2c", masked_value="m", status="revoked",
+                           current_owner_id=2, created_at_ms=0))
+        session.get(APIKey, 2).status = "revoked"
+        session.add(TelegramUser(telegram_user_id=9, last_seen_at_ms=0))
+    insert_event(settings, cpamp_key_hash("rank-a"), 1_000, event_hash="r-1")
+    insert_event(settings, cpamp_key_hash("rank-a"), 2_000, event_hash="r-2")
+    insert_event(settings, cpamp_key_hash("rank-b"), 3_000, event_hash="r-3")
+    insert_event(settings, "unowned-hash", 4_000, event_hash="r-4")
+    service.sync_cpamp()
+    service.rate_events()
+
+    rows = service.rankings()
+    by_user = {row["telegram_user_id"]: row for row in rows}
+    assert rows[0]["telegram_user_id"] == 2
+    assert set(by_user) == {2, 3, None}
+    assert (by_user[2]["requests"], by_user[2]["tokens"], by_user[2]["key_count"]) == (2, 2200, 2)
+    assert (by_user[3]["requests"], by_user[3]["key_count"]) == (1, 0)
+    assert (by_user[None]["requests"], by_user[None]["key_count"]) == (1, 1)
+    assert Decimal(by_user[2]["cost"]) == 2 * Decimal(by_user[3]["cost"])
+
+
+def test_account_usage_quota_uses_latest_event_matching_snapshot_or_source_label(service, settings) -> None:
+    insert_event(settings, "k", 1_000, event_hash="q-1", account_snapshot="acct-1", source_label="x")
+    insert_event(settings, "k", 1_500, event_hash="q-5", account_snapshot="acct-1", source_label="z")
+    insert_event(settings, "k", 2_000, event_hash="q-2", account_snapshot="acct-1", source_label="acct-2")
+    insert_event(settings, "k", 3_000, event_hash="q-3", account_snapshot=None, source_label="acct-2")
+    insert_event(settings, "k", 4_000, event_hash="q-4", account_snapshot="acct-3", source_label="y")
+    service.sync_cpamp()
+    service.rate_events()
+    with service.db.session() as session:
+        events = {row.event_hash: row for row in session.scalars(select(RawUsageEvent))}
+        events["q-1"].quota_used_percent, events["q-1"].quota_plan_type = 42_000_000, "pro"
+        events["q-5"].quota_used_percent = 10_000_000
+        events["q-2"].response_metadata_json = json.dumps({
+            "x-codex-primary-used-percent": 12, "x-codex-secondary-used-percent": 30,
+        })
+        events["q-4"].quota_plan_type = None
+
+    rows = {row["name"]: row for row in service.account_usage()}
+    assert rows["acct-1"]["quota"] == "5h=12% week=30%"
+    assert rows["acct-1"]["requests"] == 3
+    assert rows["acct-2"]["quota"] == "5h=12% week=30%"
+    assert rows["acct-2"]["requests"] == 1
+    assert rows["acct-3"]["quota"] == "暂无"
+
+
+def test_update_cycle_time_rejects_invalid_input_with_billing_error(service) -> None:
+    service.create_cycle("editable", "1970-01-01T08:00", "1970-01-02T08:00", 0)
+    with pytest.raises(BillingError, match="cycle time is invalid"):
+        service.update_cycle_time("editable", "not-a-time", "1970-01-02T08:00")
+    with pytest.raises(BillingError, match="end must be after start"):
+        service.update_cycle_time("editable", "1970-01-02T08:00", "1970-01-02T08:00")
+    service.update_cycle_time("editable", "1970-01-01T00:00Z", "1970-01-03T08:00")
+    cycle = next(item for item in service.list_cycles() if item["name"] == "editable")
+    assert (cycle["start_at_ms"], cycle["end_at_ms"]) == (0, 2 * 86_400_000)
