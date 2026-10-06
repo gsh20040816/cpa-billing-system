@@ -57,7 +57,7 @@ const sortItems = [
   { title: '成本从高到低', value: 'cost_desc' },
   { title: '延迟从高到低', value: 'latency_desc' },
   { title: 'TTFT 从高到低', value: 'ttft_desc' },
-  { title: '真实 TPS 从高到低', value: 'tps_desc' },
+  { title: '平均 TPS 从高到低', value: 'tps_desc' },
 ]
 const longContextItems = [
   { title: '全部上下文', value: '' },
@@ -75,7 +75,7 @@ const headers = computed(() => [
   { title: 'Input', key: 'input_tokens', align: 'end' },
   { title: '缓存读取', key: 'cache_read', align: 'end' },
   { title: 'Output', key: 'output_tokens', align: 'end' },
-  { title: '真实 TPS', key: 'tps', align: 'end' },
+  { title: '平均 TPS', key: 'tps', align: 'end' },
   { title: 'TTFT', key: 'ttft_ms', align: 'end' },
   { title: '延迟', key: 'latency_ms', align: 'end' },
   { title: '成本', key: 'cost', align: 'end' },
@@ -250,8 +250,8 @@ onBeforeUnmount(filterReload.cancel)
             <v-text-field v-model="filters.max_ttft" label="最大 TTFT ms" type="number" min="0" />
             <v-text-field v-model="filters.min_latency" label="最小延迟 ms" type="number" min="0" />
             <v-text-field v-model="filters.max_latency" label="最大延迟 ms" type="number" min="0" />
-            <v-text-field v-model="filters.min_tps" label="最小真实 TPS" type="number" min="0" step="0.01" />
-            <v-text-field v-model="filters.max_tps" label="最大真实 TPS" type="number" min="0" step="0.01" />
+            <v-text-field v-model="filters.min_tps" label="最小平均 TPS" type="number" min="0" step="0.01" />
+            <v-text-field v-model="filters.max_tps" label="最大平均 TPS" type="number" min="0" step="0.01" />
             <v-select v-model="filters.sort" :items="sortItems" label="排序" />
           </div>
           <div class="d-flex align-center justify-space-between ga-4 flex-wrap mt-4">
@@ -331,8 +331,7 @@ onBeforeUnmount(filterReload.cancel)
             <div><span>Reasoning</span><strong class="mono">{{ number(detail.tokens.reasoning) }}</strong></div>
             <div><span>TTFT</span><strong class="mono">{{ duration(detail.ttft_ms) }}</strong></div>
             <div><span>延迟</span><strong class="mono">{{ duration(detail.latency_ms) }}</strong></div>
-            <div><span>生成阶段</span><strong class="mono">{{ duration(detail.generation_ms) }}</strong></div>
-            <div><span>真实 TPS</span><strong class="mono">{{ detail.tps === null ? '-' : Number(detail.tps).toFixed(2) }}</strong></div>
+            <div><span>平均 TPS</span><strong class="mono">{{ detail.tps === null ? '-' : Number(detail.tps).toFixed(2) }}</strong><small class="data-muted">输出 tokens / 总延迟秒数（含首字等待）</small></div>
             <div><span>总 Tokens</span><strong class="mono">{{ number(detail.tokens.total) }}</strong></div>
             <div><span>等效成本</span><strong class="mono">{{ detail.cost === null ? '未计价' : money(detail.cost) }}</strong></div>
           </div>

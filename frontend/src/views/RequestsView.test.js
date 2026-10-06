@@ -42,7 +42,7 @@ const event = {
   latency_ms: 24350,
   ttft_ms: 949,
   generation_ms: 23401,
-  tps: 34.15,
+  tps: 32.81,
   cost: '0.0630',
   pricing_status: 'priced',
 }

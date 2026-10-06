@@ -49,7 +49,7 @@ from cpa_billing.services import BillingError, BillingService, CPAClient
 def insert_event(settings, key_hash: str, timestamp_ms: int, *, event_hash: str = "e1", input_tokens: int = 1000,
                  cached_tokens: int = 100, output_tokens: int = 100, tier: str = "default",
                  model: str = "gpt-test", failed: bool = False, fail_status_code: int | None = None,
-                 latency_ms: int = 100, ttft_ms: int = 10, cache_tokens: int = 0,
+                 latency_ms: int | None = 100, ttft_ms: int | None = 10, cache_tokens: int = 0,
                  cache_read_tokens: int = 0, cache_creation_tokens: int = 0,
                  reasoning_effort: str | None = None, account_snapshot: str | None = "account", auth_index: str = "auth",
                  source_label: str = "masked") -> None:
@@ -1347,7 +1347,7 @@ def test_realtime_status_removes_key_ids_auth_indexes_and_request_particles(serv
     assert '"timestamp": "secret"' not in serialized
 
 
-def test_request_history_exposes_and_filters_true_tps(service, settings) -> None:
+def test_request_history_exposes_and_filters_average_tps(service, settings) -> None:
     create_owner(service, "key", 2, 0)
     insert_event(
         settings,
@@ -1360,12 +1360,38 @@ def test_request_history_exposes_and_filters_true_tps(service, settings) -> None
     service.sync_cpamp()
     service.rate_events()
 
-    history = service.request_history(2, min_tps=49, max_tps=51, sort="tps_desc")
+    history = service.request_history(2, min_tps=47, max_tps=48, sort="tps_desc")
     assert history["pagination"]["total"] == 1
     assert history["items"][0]["generation_ms"] == 2000
-    assert history["items"][0]["tps"] == 50.0
+    assert history["items"][0]["tps"] == 47.62
     assert history["summary"]["input_tokens"] == 1000
     assert history["summary"]["output_tokens"] == 100
+
+
+
+@pytest.mark.parametrize("ttft_ms", [None, 0, 500, 2000, 3000])
+def test_request_history_tps_ignores_ttft(service, settings, ttft_ms) -> None:
+    create_owner(service, "key", 2, 0)
+    insert_event(settings, cpamp_key_hash("key"), 1000, event_hash="slow",
+                 output_tokens=100, latency_ms=2000, ttft_ms=ttft_ms)
+    insert_event(settings, cpamp_key_hash("key"), 2000, event_hash="fast",
+                 output_tokens=100, latency_ms=1000, ttft_ms=None)
+    service.sync_cpamp()
+    history = service.request_history(2, sort="tps_desc")
+    assert [item["tps"] for item in history["items"]] == [100.0, 50.0]
+    filtered = service.request_history(2, min_tps=49, max_tps=51)
+    assert filtered["pagination"]["total"] == 1
+    assert filtered["items"][0]["request_id"] == "request-slow"
+
+
+@pytest.mark.parametrize("latency_ms,output_tokens", [(None, 100), (0, 100), (-1, 100), (1000, 0)])
+def test_request_history_tps_requires_positive_latency_and_output(service, settings, latency_ms, output_tokens) -> None:
+    create_owner(service, "key", 2, 0)
+    insert_event(settings, cpamp_key_hash("key"), 1000,
+                 output_tokens=output_tokens, latency_ms=latency_ms, ttft_ms=None)
+    service.sync_cpamp()
+    assert service.request_history(2)["items"][0]["tps"] is None
+    assert service.request_history(2, min_tps=0)["pagination"]["total"] == 0
 
 
 def test_request_history_exposes_one_effective_cache_read_value(service, settings) -> None:

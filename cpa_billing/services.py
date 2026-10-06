@@ -3340,16 +3340,14 @@ class BillingService:
                 )
             active_version_id = self._active_pricing_id(session)
             effective_version_id = self._event_pricing_version(active_version_id)
-            generation_ms_expression = RawUsageEvent.latency_ms - RawUsageEvent.ttft_ms
             tps_expression = case(
                 (
                     and_(
                         RawUsageEvent.output_tokens > 0,
                         RawUsageEvent.latency_ms.is_not(None),
-                        RawUsageEvent.ttft_ms.is_not(None),
-                        generation_ms_expression > 0,
+                        RawUsageEvent.latency_ms > 0,
                     ),
-                    RawUsageEvent.output_tokens * 1000.0 / generation_ms_expression,
+                    RawUsageEvent.output_tokens * 1000.0 / RawUsageEvent.latency_ms,
                 ),
                 else_=None,
             )
@@ -3496,8 +3494,8 @@ class BillingService:
                     candidate_generation_ms = int(event.latency_ms) - int(event.ttft_ms)
                     if candidate_generation_ms > 0:
                         generation_ms = candidate_generation_ms
-                        if event.output_tokens > 0:
-                            tps = round(int(event.output_tokens) * 1000 / candidate_generation_ms, 2)
+                if event.latency_ms is not None and event.latency_ms > 0 and event.output_tokens > 0:
+                    tps = round(int(event.output_tokens) * 1000 / int(event.latency_ms), 2)
                 key_payload = {
                     "id": key.id if key else None,
                     "masked": key.masked_value if key else mask_hash(event.api_key_hash or ""),
