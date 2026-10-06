@@ -55,8 +55,11 @@ The Compose services pull the published image instead of building it on the serv
 
 ```bash
 docker compose pull
+docker compose run --rm --no-deps --entrypoint alembic billing-server upgrade head
 docker compose up -d
 ```
+
+Back up the database before upgrading. Run migrations with the new image before restarting services; `/healthz` alone does not verify schema compatibility or worker progress. After deployment, check `docker compose logs --since 2m billing-worker` for successful sync/rating iterations and confirm the unpriced backlog drains.
 
 Set `BILLING_IMAGE` in `.env` to deploy a version or commit-specific tag instead of `latest`:
 
