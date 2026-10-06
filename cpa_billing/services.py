@@ -29,6 +29,8 @@ from .context_prices import context_prices_for_rule, cpamp_rules, nano_rate, nor
 from .database import Database, now_ms
 from .domain import (
     NANO_USD,
+    DecimalInputError,
+    decimal_units,
     format_cents,
     format_usd_nano,
     format_yuan_per_usd,
@@ -1541,12 +1543,9 @@ class BillingService:
         if value is None or not value.strip():
             return None
         try:
-            multiplier = Decimal(value.strip())
-        except InvalidOperation as exc:
-            raise BillingError("按量倍率格式无效") from exc
-        if not multiplier.is_finite() or multiplier < 0 or multiplier > 1000:
-            raise BillingError("按量倍率必须在 0 到 1000 之间")
-        return int((multiplier * 1_000_000).to_integral_value(rounding=ROUND_HALF_UP))
+            return decimal_units(value.strip(), 6, maximum=1000)
+        except DecimalInputError as exc:
+            raise BillingError("按量倍率格式无效" if exc.kind == "format" else "按量倍率必须在 0 到 1000 之间") from exc
 
     def update_unowned_key_profile(self, key_id: int, name: str | None, multiplier: str | None,
                                    reason: str | None, operator_id: str = "admin-token") -> dict[str, Any]:
