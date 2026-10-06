@@ -1071,11 +1071,11 @@ def test_cpa_accounts_are_sanitized_and_refresh_uses_public_account_ids(service,
     }
 
     quota["rate_limit"]["primary_window"]["reset_at"] = current + 3_600_000 + 4 * 60_000
-    jittered = service.accounts_snapshot()["accounts"][0]["quota"][0]
+    jittered = service.accounts_snapshot(force=True)["accounts"][0]["quota"][0]
     assert jittered["window_started_at"] == primary["window_started_at"]
 
     quota["rate_limit"]["primary_window"]["reset_at"] = current + 3_600_000 + 6 * 60_000
-    shifted = service.accounts_snapshot()["accounts"][0]["quota"][0]
+    shifted = service.accounts_snapshot(force=True)["accounts"][0]["quota"][0]
     assert shifted["window_started_at"] == datetime.fromtimestamp(
         (current - 4 * 3_600_000 + 6 * 60_000) / 1000,
         ZoneInfo("Asia/Shanghai"),
@@ -1872,7 +1872,7 @@ def test_upstream_price_sync_rerates_open_cycles_only(service, settings, monkeyp
     realtime = service._local_realtime(active_id, 0, 172_800_000, "all")
     assert realtime["current_usage"]["models"][0]["cost"] == history["cost"]
     with service.db.session() as session:
-        account_usage = service._account_usage_aggregate(session, active_id, "auth")
+        account_usage = service._account_usage_aggregates(session, active_id, ["auth"])["auth"]
     assert account_usage["unpriced"] == 0
     assert account_usage["cost"] == history["cost"]
     with service.db.session() as session:
