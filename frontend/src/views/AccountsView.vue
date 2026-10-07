@@ -162,20 +162,24 @@ const autoRefresh = useAutoRefresh((silent) => load(silent), { interval: 60_000 
                 <div class="quota-row__meta">
                   <div v-if="quota.usage_filter?.mode === 'only_model'">模型范围：仅 {{ (quota.usage_filter.display_models || quota.usage_filter.models).join('、') }}</div>
                   <div v-else-if="quota.usage_filter?.mode === 'all_except_models'">模型范围：普通用量（排除 {{ (quota.usage_filter.display_models || quota.usage_filter.models).join('、') }}）</div>
+                  <div v-else-if="quota.usage_filter?.mode === 'upstream_scope'">范围：以该上游额度窗口为准</div>
                   <div v-else>模型范围：全部模型</div>
-                  <div>统计自 {{ dateTime(quota.window_started_at) }}</div>
+                  <div v-if="quota.local_usage_supported !== false">统计自 {{ dateTime(quota.window_started_at) }}</div>
                   <div>本窗口恢复 {{ dateTime(quota.reset_at) }}</div>
-                  <div>{{ number(quota.window_usage_requests) }} 请求 · {{ number(quota.window_usage_tokens) }} tokens</div>
-                  <div>{{ money(quota.window_usage_cost) }} 本窗口等效成本</div>
-                  <div class="quota-estimate">
-                    <span>本周期预估总额度</span>
-                    <strong v-if="quota.available_estimate?.status === 'estimated'" class="mono">{{ estimatedTotalQuotaText(quota.available_estimate) }}</strong>
-                    <span v-else>{{ availableQuotaUnavailableText(quota.available_estimate) }}</span>
-                    <span>本周期剩余额度</span>
-                    <strong v-if="quota.available_estimate?.status === 'estimated'" class="mono">{{ remainingQuotaText(quota.available_estimate) }}</strong>
-                    <span v-else>{{ availableQuotaUnavailableText(quota.available_estimate) }}</span>
-                    <small v-if="quota.available_estimate?.status === 'estimated'">{{ remainingQuotaPercentText(quota.available_estimate) }}；按使用率 ±0.5% 估算</small>
-                  </div>
+                  <template v-if="quota.local_usage_supported !== false">
+                    <div>{{ number(quota.window_usage_requests) }} 请求 · {{ number(quota.window_usage_tokens) }} tokens</div>
+                    <div>{{ money(quota.window_usage_cost) }} 本窗口等效成本</div>
+                    <div class="quota-estimate">
+                      <span>本周期预估总额度</span>
+                      <strong v-if="quota.available_estimate?.status === 'estimated'" class="mono">{{ estimatedTotalQuotaText(quota.available_estimate) }}</strong>
+                      <span v-else>{{ availableQuotaUnavailableText(quota.available_estimate) }}</span>
+                      <span>本周期剩余额度</span>
+                      <strong v-if="quota.available_estimate?.status === 'estimated'" class="mono">{{ remainingQuotaText(quota.available_estimate) }}</strong>
+                      <span v-else>{{ availableQuotaUnavailableText(quota.available_estimate) }}</span>
+                      <small v-if="quota.available_estimate?.status === 'estimated'">{{ remainingQuotaPercentText(quota.available_estimate) }}；按使用率 ±0.5% 估算</small>
+                    </div>
+                  </template>
+                  <div v-else>此窗口仅展示上游使用率，不估算等效成本。</div>
                   <div v-if="quota.window_unpriced" class="data-error">{{ number(quota.window_unpriced) }} 条未计价</div>
                 </div>
               </div>

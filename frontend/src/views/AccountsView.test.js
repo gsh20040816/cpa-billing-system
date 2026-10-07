@@ -86,4 +86,25 @@ describe('AccountsView quota estimates', () => {
     expect(wrapper.text()).not.toContain('本周期预计可用额度')
     wrapper.unmount()
   })
+  it('shows scoped Claude quota without attributing all local costs to it', async () => {
+    const response = await api()
+    response.accounts[0].type = 'claude'
+    response.accounts[0].quota[0] = {
+      key: 'claude.seven_day_sonnet', label: 'Sonnet · 周', used_percent: 25,
+      reset_at: '2026-10-14T08:00:00+08:00', local_usage_supported: false,
+      usage_filter: { mode: 'upstream_scope' },
+    }
+    api.mockResolvedValue(response)
+    const wrapper = mount(AccountsView, {
+      attachTo: document.body, global: { plugins: [vuetify] },
+    })
+    await flushPromises()
+    expect(wrapper.text()).toContain('Sonnet · 周')
+    expect(wrapper.text()).toContain('25%')
+    expect(wrapper.text()).toContain('此窗口仅展示上游使用率，不估算等效成本。')
+    expect(wrapper.text()).not.toContain('模型范围：全部模型')
+    expect(wrapper.text()).not.toContain('本周期预估总额度')
+    wrapper.unmount()
+  })
+
 })

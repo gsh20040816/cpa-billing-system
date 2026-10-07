@@ -1156,10 +1156,10 @@ def test_xai_oauth_quota_uses_cpa_api_call(service, monkeypatch) -> None:
 
 def test_unknown_oauth_provider_stays_unsupported_without_quota_probe(service, monkeypatch) -> None:
     monkeypatch.setattr(service.cpa, "auth_files", lambda: [{
-        "id": "claude-account",
-        "auth_index": "claude-auth",
-        "type": "claude",
-        "provider": "claude",
+        "id": "unknown-account",
+        "auth_index": "unknown-auth",
+        "type": "unknown",
+        "provider": "unknown",
         "account_type": "oauth",
         "disabled": False,
     }])
@@ -3009,3 +3009,87 @@ def test_update_cycle_time_rejects_invalid_input_with_billing_error(service) -> 
     service.update_cycle_time("editable", "1970-01-01T00:00Z", "1970-01-03T08:00")
     cycle = next(item for item in service.list_cycles() if item["name"] == "editable")
     assert (cycle["start_at_ms"], cycle["end_at_ms"]) == (0, 2 * 86_400_000)
+
+
+def test_claude_oauth_quota_uses_cpa_management_proxy(service, monkeypatch) -> None:
+    identity = {"id": "claude-account", "auth_index": "private-auth-index", "provider": "claude",
+                "account_type": "oauth", "disabled": False}
+    payload = {
+        "five_hour": {"utilization": 0, "resets_at": "2026-10-07T06:00:00Z"},
+        "seven_day": {"utilization": 100, "resets_at": "2026-10-14T00:00:00Z"},
+        "seven_day_sonnet": {"utilization": 12.5, "resets_at": "2026-10-14T00:00:00Z"},
+        "seven_day_opus": None,
+        "seven_day_oauth_apps": {"utilization": "25", "resets_at": None},
+        "seven_day_future": {"utilization": 30, "resets_at": None},
+        "extra_usage": {"is_enabled": False},
+    }
+    calls = []
+
+    def request(method, path, **kwargs):
+        calls.append((method, path, kwargs))
+        assert method == "POST"
+        assert path == "/v0/management/api-call"
+        body = kwargs["json"]
+        assert body["auth_index"] == "private-auth-index"
+        assert body["method"] == "GET"
+        assert body["url"] == "https://api.anthropic.com/api/oauth/usage"
+        assert body["header"]["Authorization"] == "Bearer $TOKEN$"
+        assert body["header"]["anthropic-beta"] == "oauth-2025-04-20"
+        return {"status_code": 200, "body": json.dumps(payload)}
+
+    monkeypatch.setattr(service.cpa, "auth_files", lambda: [identity])
+    monkeypatch.setattr(service.cpa, "_request", request)
+    monkeypatch.setattr(service.cpa, "codex_reset_credits", lambda *a, **kw: pytest.fail("Claude must not query Codex reset credits"))
+    snapshot = service.accounts_snapshot()
+    account = snapshot["accounts"][0]
+    assert account["can_refresh"] is True
+    assert account["quota_status"] == "completed"
+    assert account["reset_credits_available"] is None
+    assert "private-auth-index" not in json.dumps(snapshot)
+    assert "$TOKEN$" not in json.dumps(snapshot)
+    rows = {q["key"]: q for q in account["quota"]}
+    assert len(rows) == 5
+    assert rows["claude.five_hour"]["used_percent"] == 0
+    assert rows["claude.five_hour"]["window_seconds"] == 18000
+    assert rows["claude.five_hour"]["allowed"] is True
+    assert rows["claude.seven_day"]["window_seconds"] == 604800
+    assert rows["claude.seven_day"]["limit_reached"] is True
+    assert rows["claude.seven_day"]["reset_at"] == "2026-10-14T08:00:00+08:00"
+    assert rows["claude.seven_day_sonnet"]["used_percent"] == 12.5
+    assert rows["claude.seven_day_sonnet"]["usage_filter"]["mode"] == "upstream_scope"
+    assert rows["claude.seven_day_sonnet"]["window_usage_cost"] is None
+    assert rows["claude.seven_day_sonnet"]["available_estimate"]["status"] == "unavailable"
+    assert rows["claude.seven_day"]["usage_filter"]["mode"] == "all_models"
+    assert len(calls) == 1
+    service.accounts_snapshot()
+    assert len(calls) == 1
+    assert service.refresh_account_quotas(["claude-account"])["accepted"] == 1
+    assert len(calls) == 2
+    identity["account_type"] = "api_key"
+    account = service.accounts_snapshot(force=True)["accounts"][0]
+    assert account["quota_status"] == "unsupported"
+    assert account["can_refresh"] is False
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize("status,body", [
+    (401, "unauthorized secret body"), (429, "rate limited"),
+    (200, "not json"), (200, "[]"), (200, "{}"),
+    (200, '{"five_hour":null}'),
+    (200, '{"five_hour":{"utilization":"NaN"}}'),
+    (200, '{"five_hour":{"utilization":true}}'),
+    (200, '{"five_hour":{"utilization":-1}}'),
+])
+def test_claude_invalid_quota_fails_without_leaking_body(service, monkeypatch, status, body) -> None:
+    monkeypatch.setattr(service.cpa, "auth_files", lambda: [
+        {"id": "claude", "auth_index": "private-auth", "type": "claude"},
+    ])
+    monkeypatch.setattr(service.cpa, "api_call", lambda *a, **kw: {"status_code": status, "body": body})
+    result = service.refresh_account_quotas(["claude"])
+    account = result["accounts"][0]
+    assert result["accepted"] == 0
+    assert len(result["rejected"]) == 1
+    assert account["quota_status"] == "failed"
+    assert account["quota"] == []
+    assert "secret body" not in json.dumps(result)
+    assert "private-auth" not in json.dumps(result)

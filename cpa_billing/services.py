@@ -103,6 +103,12 @@ CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 XAI_BILLING_CREDITS_URL = "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
 CODEX_OAUTH_PROVIDERS = {"codex"}
 XAI_OAUTH_PROVIDERS = {"xai", "grok"}
+# CPA proxies provider-native quota responses; these are not direct HTTP targets.
+OAUTH_QUOTA_URLS = {
+    "codex": CODEX_USAGE_URL,
+    "xai": XAI_BILLING_CREDITS_URL,
+    "claude": "https://api.anthropic.com/api/oauth/usage",
+}
 
 QUOTA_MODEL_ALIASES = {
     "codex_bengalfox": "gpt-5.3-codex-spark",
@@ -3719,6 +3725,51 @@ class BillingService:
         return f"{seconds / 3600:g} 小时"
 
     @staticmethod
+    def _claude_quota_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
+        rows = []
+        labels = {
+            "five_hour": "正常用量", "seven_day": "正常用量",
+            "seven_day_opus": "Opus", "seven_day_sonnet": "Sonnet",
+            "seven_day_oauth_apps": "OAuth 应用", "seven_day_cowork": "Cowork",
+            "iguana_necktie": "Fable 5",
+        }
+        for key, window in payload.items():
+            if key not in labels and not key.startswith("seven_day_"):
+                continue
+            if not isinstance(window, dict):
+                continue
+            value = window.get("utilization")
+            if isinstance(value, bool) or value is None:
+                continue
+            try:
+                percent = Decimal(str(value))
+            except InvalidOperation:
+                continue
+            if not percent.is_finite() or percent < 0:
+                continue
+            seconds = 18000 if key == "five_hour" else 604800
+            shared = key in {"five_hour", "seven_day"}
+            rows.append({
+                "key": f"claude.{key}",
+                "label": f"{labels.get(key, key.removeprefix('seven_day_'))} · {BillingService._quota_window_label(seconds)}",
+                "scope": "window" if shared else "feature",
+                "metric": None if shared else key,
+                "plan_type": None,
+                "used_percent": float(percent),
+                "allowed": percent < 100,
+                "limit_reached": percent >= 100,
+                "window_seconds": seconds,
+                "reset_at": window.get("resets_at"),
+                "reset_after_seconds": None,
+                "window_usage_tokens": None,
+                "window_usage_cost": None,
+                # Model-family/app windows overlap the overall weekly window.
+                # Billing events cannot reliably identify their exact membership.
+                "local_usage_supported": shared,
+            })
+        return rows
+
+    @staticmethod
     def _quota_rows(payload: Any) -> tuple[list[dict[str, Any]], int | None]:
         if not isinstance(payload, dict):
             return [], None
@@ -3786,6 +3837,10 @@ class BillingService:
                 })
             credits = payload.get("rateLimitResetCreditsAvailableCount")
             return rows, int(credits) if isinstance(credits, (int, float)) else None
+
+        claude_rows = BillingService._claude_quota_rows(payload)
+        if claude_rows:
+            return claude_rows, None
 
         xai_rows = BillingService._xai_billing_quota_rows(payload)
         if xai_rows:
@@ -4173,7 +4228,14 @@ class BillingService:
                 additional_metrics = tuple(sorted(additional_metric_labels))
                 windows: list[tuple[int | None, int, str | None, tuple[str, ...]]] = []
                 window_meta: list[tuple[int | None, int, str | None, str | None]] = []
+                local_quotas = []
                 for quota in account["quota"]:
+                    if quota.get("local_usage_supported") is False:
+                        quota.pop("_reset_at_ms", None)
+                        quota["usage_filter"] = {"mode": "upstream_scope", "models": [], "display_models": []}
+                        quota["available_estimate"] = {"status": "unavailable", "reason": "upstream_scope"}
+                        continue
+                    local_quotas.append(quota)
                     window_seconds = int(quota.get("window_seconds") or 0)
                     reset_at_ms = quota.pop("_reset_at_ms")
                     if reset_at_ms is None and quota.get("reset_after_seconds") is not None:
@@ -4196,7 +4258,7 @@ class BillingService:
                     window_meta.append((window_start_ms, window_end_ms, model_metric, model_label))
                 window_usage = self._account_window_usage(session, version_id, auth_index, windows) if windows else []
                 for quota, usage, (window_start_ms, window_end_ms, model_metric, model_label) in zip(
-                    account["quota"], window_usage, window_meta,
+                    local_quotas, window_usage, window_meta,
                 ):
                     if model_metric:
                         quota["usage_filter"] = {
@@ -4356,7 +4418,7 @@ class BillingService:
             return "codex"
         if provider in XAI_OAUTH_PROVIDERS:
             return "xai"
-        return None
+        return provider if provider in OAUTH_QUOTA_URLS else None
 
     @staticmethod
     def _cpa_xai_headers(item: dict[str, Any] | None = None) -> dict[str, str]:
@@ -4382,71 +4444,49 @@ class BillingService:
             headers["x-userid"] = str(user_id)
         return headers
 
-    def _cpa_xai_quota_item(
+    def _cpa_usage_quota_item(
         self,
+        provider: str,
         account_id: str,
         auth_index: str,
         refreshed_at: str | None,
-        item: dict[str, Any] | None = None,
+        headers: dict[str, str],
+        reset_credit_metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        reset_credit_metadata = {
+        """Shared CPA transport and error handling; only native payloads vary."""
+        result_item = {
+            "account_id": account_id,
+            "auth_index": auth_index,
+            "status": "failed",
+            "refreshed_at": refreshed_at,
+            "quota": {},
             "reset_credits_available": None,
             "reset_credits": [],
             "reset_credits_error": None,
+            **(reset_credit_metadata or {}),
         }
         try:
-            # CPA has no quota-provider plugin for xAI OAuth. Its management
-            # panel probes the same usage via /v0/management/api-call.
-            result = self.cpa.api_call(
-                auth_index,
-                "GET",
-                XAI_BILLING_CREDITS_URL,
-                self._cpa_xai_headers(item),
-            )
+            result = self.cpa.api_call(auth_index, "GET", OAUTH_QUOTA_URLS[provider], headers)
             status_code = int(result.get("status_code") or 0)
+            result_item["http_status_code"] = status_code or None
+            if not 200 <= status_code < 300:
+                result_item["error"] = f"上游额度接口返回 HTTP {status_code}"
+                return result_item
             body = result.get("body")
             payload = json.loads(body) if isinstance(body, str) and body.strip() else body
-            if status_code < 200 or status_code >= 300:
-                return {
-                    "account_id": account_id,
-                    "auth_index": auth_index,
-                    "status": "failed",
-                    "http_status_code": status_code or None,
-                    "error": f"上游额度接口返回 HTTP {status_code}",
-                    "refreshed_at": refreshed_at,
-                    "quota": {},
-                    **reset_credit_metadata,
-                }
-            if not isinstance(payload, dict) or not self._xai_billing_quota_rows(payload):
-                return {
-                    "account_id": account_id,
-                    "auth_index": auth_index,
-                    "status": "failed",
-                    "http_status_code": status_code,
-                    "error": "上游额度响应不是有效的 xAI billing 对象",
-                    "refreshed_at": refreshed_at,
-                    "quota": {},
-                    **reset_credit_metadata,
-                }
-            return {
-                "account_id": account_id,
-                "auth_index": auth_index,
-                "status": "completed",
-                "http_status_code": status_code,
-                "refreshed_at": refreshed_at,
-                "quota": payload,
-                **reset_credit_metadata,
-            }
-        except (BillingError, httpx.HTTPError, json.JSONDecodeError) as exc:
-            return {
-                "account_id": account_id,
-                "auth_index": auth_index,
-                "status": "failed",
-                "error": f"额度读取失败：{type(exc).__name__}",
-                "refreshed_at": refreshed_at,
-                "quota": {},
-                **reset_credit_metadata,
-            }
+            if not isinstance(payload, dict):
+                result_item["error"] = "上游额度响应不是 JSON 对象"
+                return result_item
+            if provider == "xai" and not self._xai_billing_quota_rows(payload):
+                result_item["error"] = "上游额度响应不是有效的 xAI billing 对象"
+                return result_item
+            if provider == "claude" and not self._claude_quota_rows(payload):
+                result_item["error"] = "上游额度响应没有有效的 Claude 额度窗口"
+                return result_item
+            return {**result_item, "status": "completed", "quota": payload}
+        except (BillingError, httpx.HTTPError, ValueError, TypeError) as exc:
+            result_item["error"] = f"额度读取失败：{type(exc).__name__}"
+            return result_item
 
     def _cpa_quota_item(self, item: dict[str, Any], refreshed_at: str | None, force: bool) -> dict[str, Any] | None:
         auth_index = str(item.get("auth_index") or "").strip()
@@ -4467,7 +4507,19 @@ class BillingService:
         if quota_provider is None:
             return unsupported
         if quota_provider == "xai":
-            return self._cpa_xai_quota_item(account_id, auth_index, refreshed_at, item)
+            return self._cpa_usage_quota_item(
+                quota_provider, account_id, auth_index, refreshed_at, self._cpa_xai_headers(item),
+            )
+        if quota_provider == "claude":
+            return self._cpa_usage_quota_item(
+                quota_provider, account_id, auth_index, refreshed_at,
+                {
+                    "Authorization": "Bearer $TOKEN$",
+                    "Content-Type": "application/json",
+                    "anthropic-beta": "oauth-2025-04-20",
+                    "User-Agent": "claude-cli/2.1.280 (external, cli)",
+                },
+            )
         id_token = item.get("id_token") if isinstance(item.get("id_token"), dict) else {}
         account_token_id = id_token.get("chatgpt_account_id") or id_token.get("chatgptAccountId")
         account_token_id = str(account_token_id) if account_token_id else None
@@ -4487,52 +4539,10 @@ class BillingService:
                 reset_credit_metadata["reset_credits_error"] = str(exc)
             else:
                 reset_credit_metadata["reset_credits_error"] = f"主动重置次数读取失败：{type(exc).__name__}"
-        try:
-            result = self.cpa.api_call(auth_index, "GET", CODEX_USAGE_URL, CPAClient._codex_headers(account_token_id))
-            status_code = int(result.get("status_code") or 0)
-            body = result.get("body")
-            payload = json.loads(body) if isinstance(body, str) and body.strip() else body
-        except (BillingError, httpx.HTTPError, json.JSONDecodeError) as exc:
-            return {
-                "account_id": account_id,
-                "auth_index": auth_index,
-                "status": "failed",
-                "error": f"额度读取失败：{type(exc).__name__}",
-                "refreshed_at": refreshed_at,
-                "quota": {},
-                **reset_credit_metadata,
-            }
-        if status_code < 200 or status_code >= 300:
-            return {
-                "account_id": account_id,
-                "auth_index": auth_index,
-                "status": "failed",
-                "http_status_code": status_code or None,
-                "error": f"上游额度接口返回 HTTP {status_code}",
-                "refreshed_at": refreshed_at,
-                "quota": {},
-                **reset_credit_metadata,
-            }
-        if not isinstance(payload, dict):
-            return {
-                "account_id": account_id,
-                "auth_index": auth_index,
-                "status": "failed",
-                "http_status_code": status_code,
-                "error": "上游额度响应不是 JSON 对象",
-                "refreshed_at": refreshed_at,
-                "quota": {},
-                **reset_credit_metadata,
-            }
-        return {
-            "account_id": account_id,
-            "auth_index": auth_index,
-            "status": "completed",
-            "http_status_code": status_code,
-            "refreshed_at": refreshed_at,
-            "quota": payload,
-            **reset_credit_metadata,
-        }
+        return self._cpa_usage_quota_item(
+            quota_provider, account_id, auth_index, refreshed_at,
+            CPAClient._codex_headers(account_token_id), reset_credit_metadata,
+        )
 
     _CPA_QUOTA_FETCH_WORKERS = 8
     _TTL_CACHE_SECONDS = 30.0
