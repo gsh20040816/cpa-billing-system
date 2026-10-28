@@ -1,0 +1,128 @@
+\section{系统测试与性能优化}
+
+\subsection{测试方法与环境}
+
+测试分为自动化测试和性能测试两部分：
+\begin{itemize}
+  \item \textbf{自动化测试}：后端使用 pytest，前端使用 Vitest。每个后端用例都在独立的空数据库上运行，网关和用量库的外部调用一律被拦截，并用临时 SQLite 文件模拟用量库。测试夹具读取环境变量 \code{BILLING\_TEST\_DATABASE\_URL}，同一套用例可以在 SQLite 或 PostgreSQL 上运行，每个用例前重建 \code{public} 模式。GitHub Actions 中配置了 SQLite、PostgreSQL 17 两个矩阵任务，每次提交都会运行。
+  \item \textbf{性能测试}：在 Apple M 系列笔记本（PostgreSQL 17.11 默认配置）上进行。
+\end{itemize}
+
+\subsection{功能测试}
+
+后端共 183 个测试用例，覆盖了第 2 章的全部功能需求。表~\ref{tab:functest} 按模块列出代表性用例。
+
+\begin{longtable}{@{}p{0.15\textwidth}p{0.5\textwidth}p{0.27\textwidth}@{}}
+\caption{代表性功能测试用例}\label{tab:functest}\\
+\toprule 模块 & 用例 & 预期 \\ \midrule\endfirsthead
+\toprule 模块 & 用例 & 预期 \\ \midrule\endhead
+认证 & 未注册用户的密钥登录；仅持有未绑定密钥的访客访问管理接口 & 拒绝；访客只看到本密钥数据 \\
+认证 & 吊销登录所用密钥后继续请求；轮换管理员令牌 & 原会话立即失效 \\
+密钥 & 重置密钥后新旧密钥的归属期 & 旧期关闭、新期开启，首尾相接 \\
+密钥 & 转移密钥后新产生的调用 & 归属到新主人，历史调用不变 \\
+采集 & 用量库同一事件重复出现；字段无法解析 & 只导入一次；进入死信并可重试 \\
+计价 & Priority 档 + 长上下文；Flex 档无定价时回退 & 使用对应档位/分段价；回退默认档 \\
+计价 & 价格同步后仅部分模型变价 & 未变价模型复制结果，变价模型重算，已关账账期不受影响 \\
+分摊 & 多个上游分组独立结算后求和 & 各组总额守恒，用户合计正确 \\
+分摊 & 按量密钥收入超过分组成本 & 成员分摊为 0，盈余单列 \\
+分摊 & 订阅跨月 & 按天数比例折算到账期 \\
+账单 & 手工用量在梯度之前计入、跨账期移动 & 两个账期都重新计算 \\
+账单 & 关账后再次预览 & 返回定稿账单，不重算 \\
+统计 & 小时分桶边界、历史归属下的用户曲线 & 跨小时的调用落入正确的桶 \\
+统计 & 延迟分位数、缓存命中率、自定义时间范围 & 与逐条计算的结果一致 \\
+\bottomrule
+\end{longtable}
+
+\paragraph{测试结果}
+\begin{itemize}
+  \item SQLite：183 个用例全部通过；
+  \item PostgreSQL：182 个通过，1 个按设计跳过（SQLite 专用的在线备份测试）；
+  \item 前端：40 个用例全部通过。
+\end{itemize}
+另外发现 1 个前端用例的期望值依赖运行机器的时区，在东八区或 UTC 下可以通过。
+
+\subsection{完整性与安全性测试}
+
+完整性测试（\code{tests/test\_integrity.py}）针对 5.1.3 节的每一条不变量和各类 CHECK 约束构造违例操作，断言数据库拒绝执行；同时验证合法操作仍然可以执行，例如首尾相接的归属交接、可选列的回填、关账后读取定稿账单。测试还检查视图返回的金额是否正确、触发器重复安装是否幂等。数据库角色权限的验证结果见表~\ref{tab:roletest}。
+
+\subsection{升级兼容性测试}
+
+生产环境中已经有数据的 SQLite 库要能平滑升级，这是“保证生产可用”的关键。测试方法如下：
+\begin{enumerate}
+  \item 导出改动前的主分支代码，运行其全部测试并保留每个用例留下的数据库，得到 149 个处于不同业务状态的库。这些状态包括开放账期、已关账账期、多价格版本、密钥转移、手工用量等。
+  \item 用新代码对这些库执行 \code{alembic stamp 0016} 和 \code{alembic upgrade head}，然后执行服务启动时的初始化流程。
+  \item 逐个检查 \code{PRAGMA integrity\_check}、\code{PRAGMA foreign\_key\_check}，确认 33 个触发器全部安装、5 个视图都能查询。
+\end{enumerate}
+结果：148 个库全部通过。剩下的 1 个是某个用例只打开过连接、没有建表的空库，不代表任何真实部署。此外还把一个包含已关账账期的库用 \code{copy-database} 复制到 PostgreSQL，目标库的迁移版本、视图中的账单金额都正确，直接修改定稿账单会被触发器拒绝。
+
+\subsection{性能测试}
+
+\subsubsection{测试数据与方法}
+
+测试脚本 \code{scripts/benchmark\_postgresql.py} 在空库上按生产模式建表，然后用 \code{COPY} 批量装入合成数据：
+\begin{itemize}
+  \item 规模：120 位用户、380 把密钥（其中 20 把未绑定，每 10 把中有 1 把在中途转手）、跨度 90 天的 100 万条调用记录，以及 150 万条计价记录（新旧两个价格版本）；
+  \item 分布：模型与用户的调用量都服从 Zipf 型长尾分布，Token 数服从对数正态分布；
+  \item 耗时：装载 33.5 秒，随后执行 \code{VACUUM ANALYZE}。
+\end{itemize}
+对系统中 6 类有代表性的查询，各执行 5 次 \code{EXPLAIN (ANALYZE, BUFFERS)}，取执行时间的中位数。“无索引”一组在事务内 \code{DROP INDEX} 后测量，然后回滚。PostgreSQL 的 DDL 是事务性的，回滚后索引自动恢复。
+
+\subsubsection{测试结果}
+
+\begin{table}[H]
+\centering\small
+\caption{有无索引时的查询耗时（100 万调用记录，中位数）}\label{tab:bench}
+\begin{tabularx}{\textwidth}{@{}lXrrr@{}}
+\toprule
+查询 & 业务场景 & 有索引/ms & 无索引/ms & 加速比 \\ \midrule
+Q1 & 某用户本期按模型的用量与费用 & 3.91 & 29.21 & 7.5 \\
+Q2 & 账期内按用户、资源池汇总计价用量 & 42.18 & 44.86 & 1.1 \\
+Q3 & 某密钥最近 50 条调用（分页）& 0.02 & 0.23 & 12.3 \\
+Q4 & 最近 24 小时按模型统计请求、失败、平均延迟 & 3.10 & 32.47 & 10.5 \\
+Q5 & 当前版本下尚未计价的调用（反连接）& 153.54 & 145.31 & 0.9 \\
+Q6 & 某时刻每把密钥的归属用户 & 0.23 & 5.31 & 22.6 \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  ybar, bar width=9pt, width=0.92\textwidth, height=6.2cm,
+  ymode=log, log origin=infty, ymin=0.01, ymax=400,
+  ylabel={执行时间 / ms（对数坐标）},
+  symbolic x coords={Q1,Q2,Q3,Q4,Q5,Q6}, xtick=data,
+  legend style={at={(0.5,1.02)},anchor=south,legend columns=2,draw=none,font=\small},
+  ymajorgrids, grid style={gray!25},
+  nodes near coords, every node near coord/.append style={font=\tiny,rotate=90,anchor=west},
+  point meta=rawy,
+]
+\addplot[fill=blue!45,draw=blue!60!black] coordinates {(Q1,3.91) (Q2,42.18) (Q3,0.02) (Q4,3.10) (Q5,153.54) (Q6,0.23)};
+\addplot[fill=orange!55,draw=orange!70!black] coordinates {(Q1,29.21) (Q2,44.86) (Q3,0.23) (Q4,32.47) (Q5,145.31) (Q6,5.31)};
+\legend{有索引, 无索引}
+\end{axis}
+\end{tikzpicture}
+\caption{索引对查询耗时的影响}\label{fig:bench}
+\end{figure}
+
+\subsubsection{结果分析}
+
+\paragraph{索引显著有效的查询（Q1、Q3、Q4、Q6）}
+\begin{itemize}
+  \item \textbf{Q1}：执行计划由“计价记录全表扫描”变为“\code{idx\_rated\_user\_time} 位图索引扫描 + 主键嵌套循环连接”。单用户一个月的数据不到全表的 1\%，耗时从 29 ms 降到 4 ms。
+  \item \textbf{Q4}：最近 24 小时的数据只占约 1\%，时间索引把顺序扫描变成范围扫描，耗时下降一个数量级。
+  \item \textbf{Q6}：每把密钥只需在复合索引 \code{(api\_key\_id, valid\_from\_ms, valid\_to\_ms)} 上定位一两行，不必再对归属期表排序扫描，加速 22 倍。
+  \item \textbf{Q3}：删除 \code{(api\_key\_hash, occurred\_at\_ms)} 索引后，优化器改用时间索引倒序扫描，并逐行过滤密钥。由于测试中这把密钥属于高频用户，很快就凑满 50 行，所以无索引时也只有 0.23 ms。对于低频密钥，这种扫描会退化为接近全表扫描。复合索引的价值在于让最坏情况与最好情况一样快。
+\end{itemize}
+
+\paragraph{索引作用不大的查询（Q2、Q5）}
+测试也给出了两个“索引没起作用”的结果，原因如下：
+\begin{itemize}
+  \item \textbf{Q2}：账期聚合本来就要读取一个账期的全部计价记录，约占全表的三分之一。此时顺序扫描比随机读索引更便宜，优化器在有索引时同样选择了顺序扫描，这个选择是正确的。这类查询的优化方向不是索引，而是减少执行次数。系统的做法是：账期开放时按需预览；关账后直接读取持久化的账单，不再聚合。
+  \item \textbf{Q5}：以全表反连接的方式查找“未计价记录”，两种情况都走哈希反连接，大约 150 ms。系统在实际运行中并不这样查询，而是在内存中维护每个价格版本已计价到的最大记录号，并配合重新计价范围表中的 \code{max\_raw\_event\_id}，只扫描记录号大于水位线的新记录，每轮只处理新增的数百行。这个测试说明了把“扫描全表的去重”改为“基于单调递增主键的增量处理”的必要性。
+\end{itemize}
+
+\subsubsection{SQL 改写优化}
+
+视图 \code{v\_daily\_user\_model\_usage} 按东八区日期分组，日期是由时间戳计算出来的表达式。在视图上用 \code{usage\_date BETWEEN …} 过滤时，条件作用在表达式上，无法下推为时间范围扫描。把查询改写为“先用 \code{occurred\_at\_ms} 的范围条件过滤、再计算日期分组”之后，同一报表的耗时从 7.08 ms 降到 1.11 ms。执行计划也从“计价记录位图扫描 + 价格版本哈希连接 + 调用记录嵌套循环”简化为单表的位图索引扫描。系统的统计接口都按改写后的方式编写，视图只供报表角色做即席查询。

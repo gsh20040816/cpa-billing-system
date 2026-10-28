@@ -1,0 +1,33 @@
+digraph architecture {
+  graph [rankdir=LR, fontname="PingFang SC", fontsize=11, nodesep=0.35, ranksep=0.6, newrank=true];
+  node [fontname="PingFang SC", fontsize=10, shape=box, style="rounded,filled", fillcolor="#f5f7fb", color="#5b6b88"];
+  edge [fontname="PingFang SC", fontsize=9, color="#5b6b88"];
+
+  subgraph cluster_client {
+    label="表示层"; style="rounded,dashed"; color="#9aa6bd";
+    browser [label="浏览器\nVue 3 + Vuetify + ECharts"];
+    telegram [label="Telegram 客户端"];
+  }
+  subgraph cluster_app {
+    label="应用层（Python 3.12）"; style="rounded,dashed"; color="#9aa6bd";
+    web [label="Web 服务\nFastAPI + Uvicorn\n会话 / CSRF / 权限"];
+    bot [label="Telegram Bot\n注册 / 密钥 / 查询"];
+    worker [label="后台任务\n同步 → 计价 → 密钥同步"];
+    service [label="业务服务层 BillingService\n计价 · 分摊 · 账单 · 审计", fillcolor="#e6edf9"];
+  }
+  subgraph cluster_data {
+    label="数据层"; style="rounded,dashed"; color="#9aa6bd";
+    db [label="计费数据库\nPostgreSQL 17（SQLite 兼容）\n约束 · 触发器 · 视图 · 角色", shape=cylinder, fillcolor="#fdf3e1"];
+  }
+  subgraph cluster_up {
+    label="外部系统"; style="rounded,dashed"; color="#9aa6bd";
+    cpa [label="API 网关 CPA\n密钥管理 / 额度查询"];
+    cpamp [label="用量库 CPAMP\nusage.sqlite（只读）", shape=cylinder];
+  }
+  browser -> web [label="HTTPS JSON"];
+  telegram -> bot [label="Bot API"];
+  web -> service; bot -> service; worker -> service;
+  service -> db [label="SQLAlchemy 2"];
+  worker -> cpamp [label="增量读取", style=dashed];
+  service -> cpa [label="管理 API", style=dashed];
+}

@@ -1,0 +1,146 @@
+\section{需求分析}
+
+\subsection{用户角色}
+
+系统的使用者按权限从低到高分为五类，另有一个无人值守的后台任务（表~\ref{tab:roles}）。
+
+\begin{table}[H]
+\centering\small
+\caption{用户角色与权限}\label{tab:roles}
+\begin{tabularx}{\textwidth}{@{}lXX@{}}
+\toprule
+角色 & 身份来源 & 主要权限 \\ \midrule
+匿名访问者 & 无 & 访问登录页、健康检查 \\
+只读访客 & 未绑定用户的 API 密钥登录 & 仅查看该密钥自己的请求明细与站点状态 \\
+成员 & 已注册用户名下的有效密钥登录；Telegram 私聊 & 查看账务总览、排行、价格规则、个人用量；新增、命名、重置、吊销自己的密钥 \\
+管理员 & 被授予管理权限的成员，或持有管理令牌者 & 全部成员权限；账期创建/预览/关账、账单调整、手工用量、改价与价格同步、梯度规则与上游成本配置、密钥转移与计费倍率、授予/撤销管理员 \\
+后台任务 & 部署配置 & 增量同步调用记录、计价、同步网关密钥 \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{功能需求}
+
+\begin{longtable}{@{}p{0.17\textwidth}p{0.77\textwidth}@{}}
+\caption{功能需求}\\
+\toprule 编号 & 需求 \\ \midrule\endfirsthead
+\toprule 编号 & 需求 \\ \midrule\endhead
+F1 用户与认证 & 群成员向机器人发送 \code{/register} 注册并获得第一把密钥；Web 端以密钥或独立的管理令牌登录，登录失败限流 \\
+F2 密钥管理 & 成员新增、命名、重置、吊销自己的密钥，明文只显示一次；管理员转移密钥（指定生效时间）、为未绑定的按量密钥设置倍率；每次归属变化形成带起止时间的历史 \\
+F3 调用采集 & 增量读取用量库，按源记录号与事件摘要去重；无法解析的记录进入死信等待重试 \\
+F4 价格与计价 & 同步、改价、重新发布都生成新价格版本；按“版本 + 模型 + 档位 + 上下文段”计价并保存明细；价格变动只重算未关账账期内变价的模型 \\
+F5 成本与规则 & 上游账号分组，每组一条梯度规则；包月账号配置订阅周期与费用（按天折算），按量渠道配置汇率 \\
+F6 账期与账单 & 创建账期时固化价格版本、规则与成本快照；开放期间随时预览，关账后定稿不可改；关账前可录入账单调整与手工用量 \\
+F7 统计查询 & 账务总览、排行、单用户按模型与档位用量、多条件请求明细、站点状态、上游额度，支持任意时间范围 \\
+F8 系统管理 & 审计日志（含前后值）、三方对账、备份、跨数据库迁移 \\
+\bottomrule
+\end{longtable}
+
+\subsection{非功能需求}
+
+\begin{itemize}
+  \item \textbf{正确性}：金额全部以整数存储（分、纳美元、百万分之一），所有舍入采用四舍五入并在分摊时保证总额守恒；
+  \item \textbf{可追溯}：任何一张已关账账单都能由数据库中的快照完整重算；
+  \item \textbf{性能}：常用页面查询在百万级调用记录下响应时间不超过 100 ms，同步与计价每 10 秒一轮；
+  \item \textbf{安全}：密钥不落明文，会话令牌只存摘要，所有写操作校验 CSRF，按角色控制数据可见范围；
+  \item \textbf{可维护}：数据库结构由迁移脚本管理，支持在线备份，支持从 SQLite 平滑迁移到 PostgreSQL。
+\end{itemize}
+
+\subsection{数据流图}
+
+图~\ref{fig:dfd0} 是系统的顶层（0 层）数据流图，系统与四个外部实体交换数据。图~\ref{fig:dfd1} 把系统分解为六个加工和六个数据存储。
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.92\textwidth]{dfd0.pdf}
+  \caption{顶层数据流图}\label{fig:dfd0}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[height=0.78\textheight]{dfd1.pdf}
+  \caption{1 层数据流图}\label{fig:dfd1}
+\end{figure}
+
+\subsection{数据字典}
+
+数据字典按结构化分析的五类条目给出。各数据存储对应的完整表结构（字段、类型、约束）见第 4 章与附录 A，由程序从数据库模型自动生成，保证与实现一致。
+
+\subsubsection{数据项（节选）}
+
+\begin{longtable}{@{}p{0.2\textwidth}p{0.2\textwidth}p{0.18\textwidth}p{0.34\textwidth}@{}}
+\caption{主要数据项}\\
+\toprule 数据项 & 类型与长度 & 取值范围 & 含义与约定 \\ \midrule\endfirsthead
+\toprule 数据项 & 类型与长度 & 取值范围 & 含义与约定 \\ \midrule\endhead
+时间戳（*\_ms） & 64 位整数 & $\ge 0$ & Unix 毫秒时间；区间统一左闭右开 \\
+等效费用（*\_nano\_usd） & 64 位整数 & $\ge 0$ & 单位 $10^{-9}$ 美元，计价结果不做中间舍入 \\
+单价（*\_nano\_per\_token） & 64 位整数 & $\ge 0$ & 纳美元/Token，等于“美元/百万 Token × 1000” \\
+金额（*\_cents） & 64 位整数 & 调整可为负 & 人民币分 \\
+倍率与汇率（*\_ppm） & 64 位整数 & $\ge 0$ & 百万分之一定点数，如 0.9 存为 900000 \\
+Token 计数 & 64 位整数 & $\ge 0$ & 输入、输出、推理、缓存读、缓存写、合计 \\
+密钥摘要 & 定长字符 64 & 十六进制 & SHA-256，用于与调用记录匹配 \\
+密钥状态 & 字符 20 & active、unowned、revoked、retired & 使用中/未绑定/已吊销/网关中已移除 \\
+账期状态 & 字符 20 & open、preview、closed & 开放/已预览/已关账 \\
+价格版本状态 & 字符 20 & draft、active、retired & 同一时刻至多一个 active \\
+服务档位 & 字符 40 & default、priority、flex & fast 视同 priority \\
+梯度规则 & JSON 文本 & 连续分段 & 形如 \code{[\{left:0,right:300,multiplier:1\},…]}，单位美元 \\
+\bottomrule
+\end{longtable}
+
+\subsubsection{数据结构}
+
+\begin{itemize}
+  \item \textbf{调用记录} = 记录号 + 发生时间 + 模型名 + 服务档位 + 密钥摘要 + 上游账号 + \{Token 计数\}$_6$ + 是否失败 + 延迟 + 首 Token 时间；
+  \item \textbf{模型价格} = 价格版本 + 模型名 + 默认四价 + [Priority 四价] + [Flex 四价] + [上下文分段价表]；
+  \item \textbf{账单} = 账期 + 用户 + 实际用量 + 加权用量 + 应付金额 + 调整金额 + \{账单明细\}；
+  \item \textbf{账单明细} = 资源池 + 分组 + 实际用量 + 加权用量 + 金额 + 密钥数；
+  \item \textbf{账期快照} = 价格版本 + 梯度规则副本 + \{上游账号成本\} + \{分组结算结果\}。
+\end{itemize}
+
+\subsubsection{数据流}
+
+\begin{longtable}{@{}p{0.17\textwidth}p{0.16\textwidth}p{0.16\textwidth}p{0.43\textwidth}@{}}
+\caption{主要数据流}\\
+\toprule 名称 & 来源 & 去向 & 组成与说明 \\ \midrule\endfirsthead
+\toprule 名称 & 来源 & 去向 & 组成与说明 \\ \midrule\endhead
+增量调用记录 & 用量库 & P1 & 源记录号大于检查点的调用记录，每批 1000 条 \\
+未计价记录 & D1 & P2 & 生效价格版本下尚无计价结果的调用记录，每批 500 条 \\
+生效价格 & D3 & P2 & 状态为 active 的价格版本及其模型价格 \\
+调用时刻归属 & D4 & P2 & 满足“生效时间 $\le t <$ 失效时间”的归属期 \\
+密钥操作请求 & 成员 & P3 & 操作类型 + 目标密钥 + 当前密钥复核 \\
+账期操作 & 管理员 & P5 & 账期名 + 起止时间 + 规则；或预览/关账/调整指令 \\
+账期用量 & D2 & P5 & 按用户 × 上游账号 × 资源池汇总的等效费用 \\
+账单与明细 & P5 & D5 & 每位用户一张账单及其按分组、资源池的明细 \\
+查询条件 & 成员 & P6 & 时间范围 + 用户/密钥/模型/档位/状态等筛选条件 \\
+\bottomrule
+\end{longtable}
+
+\subsubsection{数据存储}
+
+\begin{longtable}{@{}p{0.08\textwidth}p{0.2\textwidth}p{0.3\textwidth}p{0.34\textwidth}@{}}
+\caption{数据存储}\\
+\toprule 编号 & 名称 & 对应基本表 & 存取方式 \\ \midrule\endfirsthead
+\toprule 编号 & 名称 & 对应基本表 & 存取方式 \\ \midrule\endhead
+D1 & 原始调用记录 & raw\_usage\_events, dead\_letters, sync\_checkpoints & 只追加；按时间、密钥摘要检索 \\
+D2 & 计价记录 & rated\_events & 只追加；按版本+时间、用户+时间聚合 \\
+D3 & 价格版本与模型价格 & pricing\_versions, model\_price\_rules, pricing\_rerate\_scopes & 新建版本而非修改 \\
+D4 & 用户·密钥·归属期 & telegram\_users, api\_keys, key\_ownership\_periods 等 & 按密钥与时间点查询归属 \\
+D5 & 账期·成本快照·账单 & billing\_cycles, cycle\_*, statements, statement\_lines 等 & 关账后只读 \\
+D6 & 审计日志 & audit\_logs, reconciliation\_runs & 只追加 \\
+\bottomrule
+\end{longtable}
+
+\subsubsection{处理过程}
+
+\begin{longtable}{@{}p{0.14\textwidth}p{0.2\textwidth}p{0.58\textwidth}@{}}
+\caption{处理过程说明}\\
+\toprule 加工 & 输入/输出 & 处理逻辑 \\ \midrule\endfirsthead
+\toprule 加工 & 输入/输出 & 处理逻辑 \\ \midrule\endhead
+P1 用量同步 & 增量调用记录 / D1 & 校验源表结构指纹；读取检查点之后的记录；解析失败写死信；以“插入且忽略冲突”去重写入；推进检查点 \\
+P2 调用计价 & D1、D3、D4 / D2 & 匹配价格模型；确定服务档位与上下文分段；计算等效费用；按资源池规则与归属期确定资源池和用户；幂等写入 \\
+P3 密钥管理 & 操作请求 / D4、D6 & 先在网关增删密钥，再写数据库，失败时回滚网关；关闭旧归属期并开启新归属期；吊销使用该密钥的会话 \\
+P4 价格管理 & 价格数据 / D3、D6 & 生成新版本并退役旧版本；未关账账期切换到新版本；未变化模型的计价结果直接复制，变化模型重新计价 \\
+P5 账期结算 & D2、D3、上游账号 / D5 & 计算各分组成本，扣除按量密钥收入，梯度加权后用最大余数法分摊到分，生成账单与明细；关账时定稿 \\
+P6 统计查询 & D1、D2、D5 / 报表 & 按角色限定数据范围，在数据库中完成聚合、分页与分位数计算 \\
+\bottomrule
+\end{longtable}

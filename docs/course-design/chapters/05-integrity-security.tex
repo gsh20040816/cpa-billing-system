@@ -1,0 +1,142 @@
+\section{完整性与安全性设计}
+
+\subsection{完整性设计}
+
+\subsubsection{实体完整性}
+
+32 张基本表都定义了主键。按语义分为三类：
+\begin{itemize}
+  \item 代理键：自增整数，如调用记录、账单；
+  \item 自然键：如用户编号直接使用 Telegram 用户 ID，会话主键使用令牌摘要；
+  \item 复合键：如模型价格 \code{(pricing\_version\_id, model)}、账期分组结算 \code{(cycle\_id, group\_id)}。
+\end{itemize}
+另外，业务上需要唯一的属性都声明了 \code{UNIQUE}，包括账期名、价格版本名、密钥摘要、登录指纹，以及“每个账期每位用户一张账单” \code{(cycle\_id, telegram\_user\_id)}、“每条调用在每个版本下只计价一次” \code{(raw\_event\_id, pricing\_version\_id)}。
+
+\subsubsection{参照完整性}
+
+共声明 41 个外键，删除与更新均采用默认的 \code{NO ACTION}（拒绝），不使用级联删除：账务数据被引用就意味着已被账单或计价使用，级联删除会破坏可复现性。需要停用的主数据采用软删除（如规则置 \code{active = false}、密钥置 \code{revoked}）。唯一刻意不建外键的是账期快照中的 \code{group\_id}：分组允许删除，而已关账账期仍要保留当时的分组编号与名称。
+
+\subsubsection{用户定义完整性}
+
+\paragraph{非空与默认值}
+必填属性声明 \code{NOT NULL}，计数类属性默认为 0，布尔标志默认为 \code{false}。
+
+\paragraph{CHECK 约束}
+共 27 个 CHECK 约束，分为四类：
+\begin{itemize}
+  \item 状态枚举：密钥状态、账期状态、价格版本状态、密钥操作请求状态；
+  \item 非负量：8 类 Token 计数、四项基础单价、等效费用、账单明细与按量收费的金额、订阅费用与汇率；
+  \item 区间有序：账期结束晚于开始，归属期失效不早于生效，订阅结束晚于开始；
+  \item 非零：手工用量不为零。
+\end{itemize}
+
+\paragraph{部分唯一索引}
+“同一时刻至多一个生效的价格版本”和“至多一个默认上游分组”无法用普通 UNIQUE 表达，因为非生效版本可以有多个。用带 \code{WHERE} 条件的唯一索引实现，PostgreSQL 与 SQLite 都支持。
+
+\paragraph{触发器}
+有些规则涉及多行、多表或状态转换，声明式约束无法表达，用触发器实现（表~\ref{tab:triggers}）。PostgreSQL 中共 16 个触发器、5 个 PL/pgSQL 触发器函数；SQLite 中由于每个触发器只能对应一种操作，相同的规则展开为 33 个触发器。触发器违例时统一抛出 SQLSTATE \code{23000}（integrity\_constraint\_violation），应用层收到的是与违反 UNIQUE 约束同类的 \code{IntegrityError}。
+
+{\small
+\begin{longtable}{@{}p{0.28\textwidth}p{0.19\textwidth}p{0.12\textwidth}p{0.35\textwidth}@{}}
+\caption{PostgreSQL 触发器清单（BEFORE 行级触发器，由代码自动生成）}\label{tab:triggers}\\
+\toprule 触发器 & 表 & 事件 & 条件与动作 \\ \midrule\endfirsthead
+\toprule 触发器 & 表 & 事件 & 条件与动作 \\ \midrule\endhead
+\input{generated/triggers.tex}
+\end{longtable}
+}
+
+这些触发器保证的不变量及其业务含义如下：
+\begin{enumerate}
+  \item \textbf{审计日志只追加}：任何人都不能修改或删除审计记录；
+  \item \textbf{已关账账期冻结}：账期行本身，以及它的上游成本快照、分组结算、调整、手工用量都不能再增删改；
+  \item \textbf{定稿账单冻结}：\code{final = true} 的账单、按量收费及其明细不可修改。关账操作本身把 \code{final} 从 \code{false} 改为 \code{true}，触发器的条件是 \code{OLD.final}，所以这一步可以执行；
+  \item \textbf{已关账账期使用的价格冻结}：被已关账账期引用的价格版本，其模型价格不能修改或删除；
+  \item \textbf{调用与计价记录不可篡改}：调用记录中与计费有关的列（Token、模型、时间、密钥、上游账号等）不可修改，也不可删除；用量库后来补充的“推理强度”“服务档位来源”等可选列允许从空值回填。计价记录不可修改；
+  \item \textbf{退役价格版本不可复活}；
+  \item \textbf{同一密钥的归属期不重叠}：插入新归属期时检查是否与已有区间相交（区间为左闭右开，首尾相接视为不相交）。
+\end{enumerate}
+
+第 7 条需要考虑并发：两个事务同时为同一密钥插入归属期时，各自的 \code{EXISTS} 检查都看不到对方未提交的行。因此触发器函数先对密钥行加 \code{FOR UPDATE} 锁，把同一密钥上的插入串行化：
+
+\begin{lstlisting}[language=PLpgSQL]
+CREATE OR REPLACE FUNCTION billing_key_ownership_guard() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM 1 FROM api_keys WHERE id = NEW.api_key_id FOR UPDATE;
+    IF EXISTS (
+        SELECT 1 FROM key_ownership_periods p
+        WHERE p.api_key_id = NEW.api_key_id
+          AND (p.valid_to_ms IS NULL OR p.valid_to_ms > NEW.valid_from_ms)
+          AND (NEW.valid_to_ms IS NULL OR NEW.valid_to_ms > p.valid_from_ms)
+    ) THEN
+        RAISE EXCEPTION 'integrity: key ownership periods overlap'
+            USING ERRCODE = 'integrity_constraint_violation';
+    END IF;
+    RETURN NEW;
+END $$;
+CREATE TRIGGER trg_key_ownership_no_overlap BEFORE INSERT ON key_ownership_periods
+    FOR EACH ROW EXECUTE FUNCTION billing_key_ownership_guard();
+\end{lstlisting}
+
+触发器的设计要满足一个前提：不能误拦正常的业务流程。为此先通读了所有写数据库的代码路径，确认关账后不存在对账期子表的写入、审计日志从不更新等事实，然后把触发器装进测试数据库，在 SQLite 和 PostgreSQL 上运行全部 183 个测试用例，没有一个被误拦。设计过程中也发现，最初“模型价格一律不可修改”的规则过严，会妨碍对尚未结算的价格进行修正。后来把它收窄为“已关账账期引用的价格不可修改”，这也正是“历史账单可核对”真正需要的语义。
+
+\subsection{安全性设计}
+
+\subsubsection{应用层安全}
+
+\paragraph{身份认证}
+系统不保存任何密码。成员凭 API 密钥登录，数据库中只存两种不可逆值：
+\begin{itemize}
+  \item 密钥的 SHA-256 摘要，用于与网关的调用记录匹配；
+  \item 用服务端密钥计算的 HMAC 指纹，用于登录查找。
+\end{itemize}
+这样，即使数据库泄露，攻击者也既无法还原密钥，也无法离线枚举登录指纹。管理员令牌通过环境变量配置，比对时使用常数时间比较。
+
+\paragraph{会话管理}
+会话令牌为 32 字节随机数，数据库只保存其 HMAC，Cookie 设置 \code{Secure}、\code{HttpOnly} 和 \code{SameSite} 属性。每次请求都会重新校验：登录所用的密钥被吊销或转让后，会话立即失效；管理员令牌轮换后，旧的管理员会话也随之失效。所有写请求都要校验 CSRF 令牌。登录失败按 IP 限流，60 秒内最多 8 次。
+
+\paragraph{分级授权}
+每个接口声明所需的角色（表~\ref{tab:roles}）。只读访客的查询在服务层被强制限定为本密钥的数据。管理接口一律要求管理员会话，并把操作者、操作对象、修改前后值写入审计日志。
+
+\paragraph{凭据隔离}
+上游账号的 OAuth 令牌只由网关保管。本系统通过网关的代理接口查询额度，请求中只放占位符，从不读取或返回真实凭据；返回给浏览器的上游账号编号也经过脱敏。
+
+\subsubsection{数据库层安全}
+
+PostgreSQL 部署时，用脚本 \code{deployment/postgresql/roles.sql} 建立四个数据库角色，按最小权限原则授权（表~\ref{tab:dbroles}）。
+
+\begin{table}[H]
+\centering\small
+\caption{数据库角色与权限}\label{tab:dbroles}
+\begin{tabularx}{\textwidth}{@{}lX@{}}
+\toprule
+角色 & 权限 \\ \midrule
+billing\_owner & 不可登录；拥有全部表、视图、函数，执行迁移和 DDL 时通过 \code{SET ROLE} 切换为此角色 \\
+billing\_app & 应用服务账号：全部表的 SELECT/INSERT/UPDATE/DELETE；收回审计日志、对账记录的 UPDATE/DELETE 权限，收回调用记录、计价记录、归属期的 DELETE 权限；无 DDL 权限 \\
+billing\_report & 报表账号：只读 5 个视图、账单与规则类表、用户表的“编号/用户名/注册时间”三列（列级授权）；不能读取密钥表、会话表、审计日志 \\
+billing\_auditor & 审计账号：继承 billing\_report，另可读取审计日志、对账记录、死信与同步检查点 \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+权限与触发器构成两道防线。即使有人删除了触发器，\code{billing\_app} 也无权修改审计日志；而 \code{billing\_app} 自身也没有删除触发器的权限，因为它不是表的属主。下表是在测试库上以各角色实际执行 SQL 的结果：
+
+\begin{table}[H]
+\centering\small
+\caption{角色权限验证结果}\label{tab:roletest}
+\begin{tabularx}{\textwidth}{@{}llX@{}}
+\toprule
+角色 & 语句 & 结果 \\ \midrule
+billing\_app & 应用启动（建表检查、触发器检查） & 成功（对象已存在时不执行 DDL）\\
+billing\_app & \code{INSERT INTO audit\_logs …} & 成功 \\
+billing\_app & \code{UPDATE audit\_logs …} & 拒绝：permission denied \\
+billing\_app & \code{DELETE FROM raw\_usage\_events} & 拒绝：permission denied \\
+billing\_app & \code{CREATE TABLE …} / \code{DROP TRIGGER …} & 拒绝：无模式权限 / 非属主 \\
+billing\_report & \code{SELECT … FROM v\_user\_cycle\_bills} & 成功 \\
+billing\_report & \code{SELECT username FROM telegram\_users} & 成功（授权列）\\
+billing\_report & \code{SELECT * FROM telegram\_users} & 拒绝（含未授权列）\\
+billing\_report & \code{SELECT cpamp\_hash FROM api\_keys} & 拒绝 \\
+billing\_auditor & \code{SELECT … FROM audit\_logs} & 成功 \\
+billing\_auditor & \code{SELECT * FROM web\_sessions} & 拒绝 \\
+\bottomrule
+\end{tabularx}
+\end{table}

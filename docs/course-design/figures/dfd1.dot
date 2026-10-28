@@ -1,0 +1,25 @@
+digraph dfd1 {
+  graph [rankdir=TB, fontname="PingFang SC", nodesep=0.25, ranksep=0.45];
+  node [fontname="PingFang SC", fontsize=13];
+  edge [fontname="PingFang SC", fontsize=11.5, color="#4a5670"];
+
+  node [shape=box];
+  cpamp [label="用量库 CPAMP"]; member [label="成员用户"]; admin [label="管理员"]; cpa [label="API 网关 CPA"];
+
+  node [shape=circle, style=filled, fillcolor="#e6edf9", fixedsize=true, width=1.35];
+  p1 [label="1\n用量同步"]; p2 [label="2\n调用计价"]; p3 [label="3\n密钥与\n归属管理"];
+  p4 [label="4\n价格与\n规则管理"]; p5 [label="5\n账期结算\n与分摊"]; p6 [label="6\n统计查询"];
+
+  node [shape=record, style=filled, fillcolor="#fdf3e1", fixedsize=false, width=0];
+  d1 [label="D1|原始调用记录"]; d2 [label="D2|计价记录"]; d3 [label="D3|价格版本与模型价格"];
+  d4 [label="D4|用户·密钥·归属期"]; d5 [label="D5|账期·成本快照·账单"]; d6 [label="D6|审计日志"];
+
+  cpamp -> p1 [label="增量调用记录"]; p1 -> d1 [label="去重后记录"];
+  d1 -> p2 [label="未计价记录"]; d3 -> p2 [label="生效价格"]; d4 -> p2 [label="调用时刻归属"]; p2 -> d2 [label="等效费用"];
+  member -> p3 [label="注册/新增/重置/吊销"]; admin -> p3 [label="转移/倍率"]; p3 -> cpa [label="密钥同步"];
+  p3 -> d4; p3 -> d6 [label="操作记录"]; p3 -> member [label="新密钥（仅显示一次）"];
+  cpamp -> p4 [label="模型价格"]; admin -> p4 [label="改价/梯度规则/上游成本"]; p4 -> d3; p4 -> d6;
+  admin -> p5 [label="创建/预览/关账/调整"]; d2 -> p5 [label="账期用量"]; d3 -> p5; cpa -> p5 [label="上游账号"];
+  p5 -> d5 [label="账单与明细"]; p5 -> d6; p5 -> admin [label="分摊结果"];
+  d1 -> p6; d2 -> p6; d5 -> p6; member -> p6 [label="查询条件"]; p6 -> member [label="用量/排行/账单"];
+}

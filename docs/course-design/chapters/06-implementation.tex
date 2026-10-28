@@ -1,0 +1,112 @@
+\section{数据库建立与系统实现}
+
+\subsection{数据库建立}
+
+数据库结构由 SQLAlchemy 模型声明，用 Alembic 迁移脚本管理演进。项目至今共有 17 个迁移版本，从初始模式逐步加入了管理员会话、梯度规则、手工用量、上游分组与订阅、显式上下文分段价等功能。最新的第 17 个迁移加入了本次课程设计完善的完整性对象：部分唯一索引、触发器和视图。新建一个 PostgreSQL 数据库的步骤如下：
+
+\begin{lstlisting}[language=bash]
+createdb billing
+export BILLING_DATABASE_URL=postgresql+psycopg://billing_owner@localhost/billing
+alembic upgrade head                      # 建表、约束、索引、触发器、视图
+psql -d billing -v app_password="'...'" -v report_password="'...'" \
+     -v auditor_password="'...'" -f deployment/postgresql/roles.sql   # 角色与授权
+\end{lstlisting}
+
+已有数据的 SQLite 部署可以用 \code{cpa-billing copy-database <PostgreSQL URL>} 整库迁移。该命令要求目标库为空：先按当前模型建表并写入与源库相同的迁移版本号，再按外键依赖顺序分批复制 32 张表，然后重置自增序列，最后安装触发器。触发器放在数据复制之后安装，原因是如果先装，已关账账期在补录自身历史数据时就会被“冻结”规则拒绝。CHECK 约束和外键则在复制过程中逐行生效，所以历史数据中的任何违规都会被发现。
+
+迁移 0017 面向已有数据的生产库，写成了防御式：建立部分唯一索引前，先检查历史数据是否已有冲突，若有则跳过并告警，不让整个升级失败；触发器只约束之后的写入，不受历史数据影响。
+
+\subsection{多数据库方言适配}
+
+原系统只在 SQLite 上运行。移植到 PostgreSQL 时，用 PostgreSQL 运行全部测试，暴露出以下几类差异，都在数据访问层集中处理（表~\ref{tab:dialect}）。
+
+\begin{longtable}{@{}p{0.25\textwidth}p{0.33\textwidth}p{0.34\textwidth}@{}}
+\caption{SQLite 与 PostgreSQL 的差异及处理}\label{tab:dialect}\\
+\toprule 差异 & 现象 & 处理 \\ \midrule\endfirsthead
+\toprule 差异 & 现象 & 处理 \\ \midrule\endhead
+布尔字面量 & 迁移脚本中 \code{SET flag = 1} 在 PostgreSQL 报类型错误 & 改写为 \code{true}（SQLite 3.23 起同样支持）\\
+取回新行主键 & \code{cursor.lastrowid} 在 psycopg 中不可用 & 改为 \code{INSERT … RETURNING id} \\
+插入时忽略冲突 & \code{INSERT OR IGNORE} 是 SQLite 语法 & 按方言生成 \code{INSERT … ON CONFLICT DO NOTHING} \\
+批量插入行数 & psycopg 批量插入的 \code{rowcount} 为 $-1$ & PostgreSQL 下加 \code{RETURNING id} 后计数 \\
+标量最大/最小 & SQLite 的多参数 \code{max(a,b)} 在 PostgreSQL 中是聚合函数 & 自定义 \code{greatest/least} 表达式，按方言编译 \\
+整数除法 & SQLAlchemy 对整数 \code{/} 生成 \code{CAST(… AS NUMERIC)}，PostgreSQL 再转整数时四舍五入，小时分桶错位 & 改用地板除 \code{//}，两种数据库都生成整数除法 \\
+聚合结果类型 & PostgreSQL 的 \code{SUM(bigint)}、\code{AVG} 返回 NUMERIC，到 Python 中是 \code{Decimal} & 注册 NUMERIC 加载器：整数值转 int，非整数转 float，与 SQLite 一致 \\
+JSON 取值 & \code{json\_extract} 仅 SQLite 支持 & PostgreSQL 使用 \code{json\_extract\_path\_text} \\
+迁移版本表 & Alembic 默认 \code{VARCHAR(32)}，现有版本号长 39 个字符 & 服务端数据库预建 \code{VARCHAR(64)} 的版本表 \\
+部分索引 & 只声明了 \code{sqlite\_where} & 同时声明 \code{postgresql\_where} \\
+\bottomrule
+\end{longtable}
+
+\subsection{计价算法}
+
+设一次调用的输入 Token 为 $I$，输出为 $O$，缓存读取为 $R_0$，缓存写入为 $W$，网关报告的缓存命中数为 $C$。不同上游对缓存的报告口径不一，因此先统一为“缓存读取量” $R$，再求“未命中输入” $U$：
+\[
+R = \max\bigl(C - R_0 - W,\ 0\bigr) + R_0,\qquad U = \max(I - R - W,\ 0)
+\]
+单价按以下顺序确定：
+\begin{enumerate}
+  \item 选模型：从“实际解析的模型名、请求的模型名、记录的模型名”中，取第一个在生效价格版本里有定价的；
+  \item 选档位：请求声明 priority 时取 Priority 档，否则依次采用响应档位、记录档位，缺省为 default 档；
+  \item 选上下文段：在该档位的上下文分段价中，取阈值严格小于输入长度的最高一段，整次调用的四项单价都用这一段，不跨段拆分。
+\end{enumerate}
+记四项单价为 $p_{in}, p_{out}, p_{r}, p_{w}$（纳美元/Token），等效费用为
+\[
+\text{rated\_weight\_nano\_usd} = U\,p_{in} + R\,p_{r} + W\,p_{w} + O\,p_{out}.
+\]
+计算明细（所用模型、档位、各项 Token 与单价）以 JSON 形式保存在计价记录中，账单上的任何一分钱都可以追溯到具体调用和具体单价。
+
+计价结果写入时以 \code{(raw\_event\_id, pricing\_version\_id)} 为冲突键执行“插入并忽略冲突”，因此后台任务即使重复执行也不会重复计价。价格更新时，对价格未变化的模型，直接用一条 \code{INSERT … SELECT} 把旧版本的计价结果复制到新版本；只有价格变化的模型，才交给后台任务重新计价。
+
+\subsection{分摊算法}
+
+\paragraph{分组成本}
+每个上游分组在账期内的总成本 $T$ 由两部分组成：
+\begin{itemize}
+  \item 包月账号：订阅费按“订阅周期与账期的重叠时长 / 订阅周期时长”的比例折算；
+  \item 按量渠道：该渠道上的等效美元用量乘以人民币/美元汇率。
+\end{itemize}
+未绑定成员的按量密钥按“用量 × 倍率”单独收费，记为 $M$。成员需要分摊的部分是 $\max(T-M, 0)$。
+
+\paragraph{梯度加权}
+梯度规则把实际用量（美元）划分为连续的若干段，每段一个倍率，按累进方式计算加权用量：
+\[
+B(a) = \sum_k \operatorname{round}\Bigl(\max\bigl(0, \min(a, r_k) - l_k\bigr)\cdot m_k\Bigr)
+\]
+其中 $[l_k, r_k)$ 为第 $k$ 段区间，$m_k$ 为该段倍率。默认规则为：
+\begin{itemize}
+  \item 0–300 美元，倍率 1；
+  \item 300–800 美元，倍率 0.9；
+  \item 800–1400 美元，倍率 0.8；
+  \item 1400–2000 美元，倍率 0.7；
+  \item 2000 美元以上，倍率 0.6。
+\end{itemize}
+效果是用量越大，边际单价越低。重度用户摊薄了固定的订阅成本，理应获得一定折扣；同时，因为是累进计算，用量多的人付出的总额仍然更多。
+
+\paragraph{最大余数法}
+用加权用量作为权重，把待分摊金额（单位：分）分到每个人。先按比例向下取整，再把剩余的几分钱按余数从大到小依次补给各人，余数相同时按用户编号排序，从而保证各人金额之和严格等于待分摊总额。
+
+\paragraph{算例}
+某分组本期待分摊 1000.00 元，三位成员的实际用量分别为 A = 500、B = 150、C = 2500 美元。按默认规则：
+\begin{itemize}
+  \item $B_A = 300 + 200\times0.9 = 480$；
+  \item $B_B = 150$；
+  \item $B_C = 300 + 500\times0.9 + 600\times0.8 + 600\times0.7 + 500\times0.6 = 1950$；
+\end{itemize}
+权重合计 2580。以分为单位：
+\begin{itemize}
+  \item A：$\lfloor 100000\times480/2580\rfloor = 18604$，余数 1680；
+  \item B：$\lfloor 100000\times150/2580\rfloor = 5813$，余数 2460；
+  \item C：$\lfloor 100000\times1950/2580\rfloor = 75581$，余数 1020。
+\end{itemize}
+三者合计 99998，还差 2 分，按余数从大到小补给 B 和 A。最终 A 付 186.05 元、B 付 58.14 元、C 付 755.81 元，合计恰为 1000.00 元。与直接按实际用量比例分摊相比，C 的单价由约 0.317 元/美元降为 0.302 元/美元。
+
+\subsection{应用程序实现}
+
+\paragraph{Web 接口与界面}
+Web 服务共 53 个路由：认证与会话 7 个，管理功能约 25 个，其余为账务查询、个人密钥、请求明细、站点状态与上游账号。统计（包括延迟分位数、按小时分桶）、分页和条数上限都在 SQL 中完成，应用层只做格式化。前端单页应用（Vue 3 + Vuetify + ECharts）共 9 个页面：账务总览、请求明细、站点状态、上游账号、排行、价格与规则、我的密钥、用户详情和管理控制台。
+
+\paragraph{Telegram 机器人与命令行}
+机器人提供注册、密钥管理（\code{/mykey}、\code{/resetkey}、\code{/revoke}）、用量与账单查询（\code{/usage}、\code{/billing}、\code{/chart}）以及管理员命令。命令行工具提供 \code{init}、\code{sync}、\code{preview}、\code{close-cycle}、\code{reconcile}、\code{sync-prices}，以及本次新增的 \code{backup} 和 \code{copy-database}。
+
+\paragraph{代码规模}
+后端 Python 约 1.0 万行，前端约 5400 行，迁移脚本 17 个，后端测试 183 个。

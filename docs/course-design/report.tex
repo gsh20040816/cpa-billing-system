@@ -1,0 +1,96 @@
+% 数据库系统原理课程设计 —— 系统设计与开发报告
+% 构建：在本目录执行 make（需要 XeLaTeX、latexmk 与 Graphviz）
+\documentclass[UTF8,zihao=-4,fontset=mac,a4paper]{ctexart}
+
+% ---------- 封面信息（提交前填写） ----------
+\newcommand{\studentname}{（姓名）}
+\newcommand{\studentid}{（学号）}
+\newcommand{\advisor}{（指导教师）}
+\newcommand{\reportdate}{2026 年 11 月}
+% --------------------------------------------
+
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{graphicx,booktabs,longtable,tabularx,array,multirow,amsmath,amssymb,xcolor,caption,enumitem,float}
+\usepackage{listings}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.18}
+\usepackage[hidelinks,bookmarksnumbered]{hyperref}
+
+\graphicspath{{build/figures/}}
+\setlength{\parskip}{0.2em}
+\linespread{1.3}
+\setlist{nosep,leftmargin=2em}
+\captionsetup{font=small,labelsep=quad}
+\ctexset{
+  section={format=\Large\heiti,name={第,章},number=\chinese{section}},
+  subsection={format=\large\heiti},
+  subsubsection={format=\normalsize\heiti},
+}
+\renewcommand{\thesubsection}{\arabic{section}.\arabic{subsection}}
+\renewcommand{\thesubsubsection}{\thesubsection.\arabic{subsubsection}}
+\renewcommand{\thefigure}{\arabic{section}-\arabic{figure}}
+\renewcommand{\thetable}{\arabic{section}-\arabic{table}}
+\counterwithin*{figure}{section}
+\counterwithin*{table}{section}
+
+\lstset{basicstyle=\ttfamily\footnotesize,breaklines=true,frame=tb,framesep=4pt,columns=fullflexible,
+  keywordstyle=\color{blue!60!black}\bfseries,commentstyle=\color{gray},showstringspaces=false,
+  xleftmargin=1em,xrightmargin=1em}
+\lstdefinelanguage{PLpgSQL}[]{SQL}{morekeywords={RETURNS,LANGUAGE,TRIGGER,PERFORM,RAISE,EXCEPTION,USING,ERRCODE,
+  REPLACE,FUNCTION,IF,THEN,END,RETURN,EXISTS,BEFORE,EACH,ROW,EXECUTE,GRANT,REVOKE,ROLE,OLD,NEW,WHEN,LATERAL}}
+
+\newcommand{\code}[1]{\texttt{\small #1}}
+% Long identifiers such as trg_cycle_upstream_costs_closed may break after an underscore.
+\DeclareRobustCommand{\_}{\textunderscore\allowbreak}
+\setlength{\emergencystretch}{2em}
+
+\begin{document}
+
+\begin{titlepage}
+  \centering
+  \vspace*{2.5cm}
+  {\Large 同济大学计算机科学与技术学院\par}
+  \vspace{0.8cm}
+  {\Large 数据库系统原理课程设计\par}
+  \vspace{2.2cm}
+  {\heiti\fontsize{26pt}{36pt}\selectfont 大模型 API 用量统计\\[0.3em] 与费用分摊系统\par}
+  \vspace{0.8cm}
+  {\Large 系统设计与开发报告\par}
+  \vspace{3cm}
+  \begin{tabular}{rl}
+    姓\quad 名： & \studentname \\[0.6em]
+    学\quad 号： & \studentid \\[0.6em]
+    指导教师： & \advisor \\[0.6em]
+    数据库系统： & PostgreSQL 17（兼容 SQLite 3） \\[0.6em]
+    开发语言： & Python 3.12 / JavaScript（Vue 3） \\
+  \end{tabular}
+  \vfill
+  {\large \reportdate\par}
+\end{titlepage}
+
+\pagenumbering{Roman}
+\begin{abstract}
+本系统面向多人共享大模型 API 服务的场景：一组成员共同购买若干上游账号（包月订阅或按量计费的 API 渠道），通过统一的 API 网关分发个人密钥，月末需要按各人实际用量公平分摊总成本。系统管理用户、API 密钥及其历史归属、调用记录、版本化的模型价格、上游成本与梯度分摊规则，实现调用级计价、按用户/模型/时间的用量统计、共享成本分摊和月度账单生成。设计上以“账单可复现、可核对”为核心目标：价格按版本保存，计价结果记录所用版本，账期关账时固化成本快照与梯度规则，并由数据库触发器保证已关账数据不可篡改。数据库采用 PostgreSQL，逻辑模式共 32 张基本表、5 个视图，满足 3NF（快照字段为有意保留的历史事实），并通过 CHECK 约束、部分唯一索引、16 个触发器和四级数据库角色落实完整性与安全性设计。系统在 100 万条调用记录规模下完成了索引与 SQL 改写的性能测试，常用查询在 5 ms 内返回。
+
+\noindent\textbf{关键词：}大模型 API；用量统计；成本分摊；PostgreSQL；触发器；数据库设计
+\end{abstract}
+\newpage
+
+\tableofcontents
+\newpage
+\pagenumbering{arabic}
+
+\input{chapters/01-definition}
+\input{chapters/02-requirements}
+\input{chapters/03-architecture}
+\input{chapters/04-database}
+\input{chapters/05-integrity-security}
+\input{chapters/06-implementation}
+\input{chapters/07-testing}
+\input{chapters/08-operation}
+
+\appendix
+\ctexset{section={name={附录,},number=\Alph{section}}}
+\input{chapters/appendix}
+
+\end{document}
