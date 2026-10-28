@@ -32,6 +32,8 @@ class Settings:
     session_ttl_seconds: int
     sub2_state_file: Path
     sub2_postgres_dsn: str | None
+    # SQLAlchemy URL of the billing database; None keeps the SQLite file at database_path.
+    database_url: str | None = None
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -66,4 +68,5 @@ class Settings:
             session_ttl_seconds=int(os.getenv("BILLING_SESSION_TTL_SECONDS", "43200")),
             sub2_state_file=Path(os.getenv("SUB2API_TG_STATE_FILE", "/legacy-sub2/sub2api-tg.state.json")),
             sub2_postgres_dsn=os.getenv("SUB2API_POSTGRES_DSN") or None,
+            database_url=os.getenv("BILLING_DATABASE_URL", "").strip() or None,
         )

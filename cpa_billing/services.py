@@ -20,13 +20,15 @@ from typing import Any, Iterator
 from zoneinfo import ZoneInfo
 
 import httpx
-from sqlalchemy import Integer, String, and_, case, cast, delete, func, insert, literal, not_, or_, select, union, update
+from sqlalchemy import JSON, Integer, String, and_, case, cast, delete, func, insert, literal, not_, or_, select, union, update
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
 
 from .config import Settings
 from .context_prices import context_prices_for_rule, cpamp_rules, nano_rate, normalize_context_prices, select_context_price
 from .database import Database, now_ms
+from .sql import greatest, least
 from .domain import (
     NANO_USD,
     DecimalInputError,
@@ -580,6 +582,14 @@ class BillingService:
             self._ensure_default_upstream_group(session)
         self.import_cpamp_prices("cpamp-initial")
 
+    def _insert_ignoring_conflicts(self, session: Any, table: Any, rows: list[dict[str, Any]], index_elements: list[str] | None = None) -> int:
+        """INSERT ... ON CONFLICT DO NOTHING in the billing database's dialect; returns the inserted row count."""
+        if self.db.dialect == "postgresql":
+            # psycopg reports no rowcount for batched inserts; count the returned keys instead.
+            statement = postgresql_insert(table).on_conflict_do_nothing(index_elements=index_elements).returning(table.c.id)
+            return len(session.execute(statement, rows).all())
+        return session.execute(sqlite_insert(table).on_conflict_do_nothing(index_elements=index_elements), rows).rowcount
+
     def _cpamp(self) -> sqlite3.Connection:
         uri = f"file:{self.settings.cpamp_database_path}?mode=ro"
         connection = sqlite3.connect(uri, uri=True, timeout=15)
@@ -746,7 +756,7 @@ class BillingService:
                         session.add(DeadLetter(source_id=source.id, source_event_id=row["id"], error=str(exc), payload_json="{}", created_at_ms=now_ms()))
                 if events:
                     # Rows already imported (same source id or event hash) are skipped, as before.
-                    imported += session.execute(insert(RawUsageEvent.__table__).prefix_with("OR IGNORE"), events).rowcount
+                    imported += self._insert_ignoring_conflicts(session, RawUsageEvent.__table__, events)
                 if rows:
                     checkpoint.last_event_id = rows[-1]["id"]
                     checkpoint.last_event_at_ms = int(rows[-1]["timestamp_ms"])
@@ -926,7 +936,10 @@ class BillingService:
         if previous_version_id is None or not ranges or not unchanged_models:
             return cycles
         # The target version was created in this transaction, so it has no rated events yet.
-        price_model = func.json_extract(RatedEvent.calculation_json, "$.price_model")
+        if self.db.dialect == "postgresql":
+            price_model = func.json_extract_path_text(cast(RatedEvent.calculation_json, JSON), "price_model")
+        else:
+            price_model = func.json_extract(RatedEvent.calculation_json, "$.price_model")
         columns = (
             "raw_event_id", "pricing_version_id", "pool_id", "telegram_user_id", "occurred_at_ms",
             "rated_weight_nano_usd", "long_context_applied", "service_tier", "calculation_json", "rated_at_ms",
@@ -1415,10 +1428,7 @@ class BillingService:
                         "calculation_json": json.dumps(detail, separators=(",", ":")),
                         "rated_at_ms": now_ms(),
                     })
-                rated = session.execute(
-                    sqlite_insert(RatedEvent.__table__).on_conflict_do_nothing(index_elements=["raw_event_id", "pricing_version_id"]),
-                    rows,
-                ).rowcount
+                rated = self._insert_ignoring_conflicts(session, RatedEvent.__table__, rows, ["raw_event_id", "pricing_version_id"])
         if rated_through is not None:
             self._rated_through[selected_version_id] = max(self._rated_through.get(selected_version_id, 0), rated_through)
         return rated
@@ -4108,10 +4118,10 @@ class BillingService:
         version_id: int,
         auth_indexes: list[str],
     ) -> dict[str, dict[str, Any]]:
-        compatible_cached = func.max(
-            func.max(RawUsageEvent.cached_tokens, RawUsageEvent.cache_tokens)
-            - func.max(RawUsageEvent.cache_read_tokens, 0)
-            - func.max(RawUsageEvent.cache_creation_tokens, 0),
+        compatible_cached = greatest(
+            greatest(RawUsageEvent.cached_tokens, RawUsageEvent.cache_tokens)
+            - greatest(RawUsageEvent.cache_read_tokens, 0)
+            - greatest(RawUsageEvent.cache_creation_tokens, 0),
             0,
         )
         rows = {row[0]: tuple(row[1:]) for row in session.execute(
@@ -4831,13 +4841,13 @@ class BillingService:
                 raw_table.c.occurred_at_ms < end_ms,
             )
             bucket_expression = cast(
-                (raw_table.c.occurred_at_ms - literal(start_ms)) / literal(bucket_ms),
+                (raw_table.c.occurred_at_ms - literal(start_ms)) // literal(bucket_ms),
                 Integer,
             )
-            cache_read_expression = func.max(raw_table.c.cache_read_tokens, 0)
-            cache_creation_expression = func.max(raw_table.c.cache_creation_tokens, 0)
-            compatible_cached_expression = func.max(
-                func.max(raw_table.c.cached_tokens, raw_table.c.cache_tokens)
+            cache_read_expression = greatest(raw_table.c.cache_read_tokens, 0)
+            cache_creation_expression = greatest(raw_table.c.cache_creation_tokens, 0)
+            compatible_cached_expression = greatest(
+                greatest(raw_table.c.cached_tokens, raw_table.c.cache_tokens)
                 - cache_read_expression
                 - cache_creation_expression,
                 0,
@@ -5778,7 +5788,7 @@ class BillingService:
                 )),
                 else_=func.coalesce(func.nullif(APIKey.display_name, ""), func.nullif(APIKey.masked_value, "")),
             )
-            bucket = func.min(hours, cast((RawUsageEvent.occurred_at_ms - start) / literal(3_600_000), Integer))
+            bucket = least(hours, cast((RawUsageEvent.occurred_at_ms - start) // literal(3_600_000), Integer))
             hourly = (
                 select(kind.label("kind"), identity.label("identity"), name.label("name"),
                        bucket.label("bucket"), func.sum(RawUsageEvent.total_tokens).label("tokens"))

@@ -711,7 +711,7 @@ def test_user_session_is_invalidated_when_login_key_is_revoked(service) -> None:
 def test_admin_token_rotation_invalidates_existing_admin_sessions(service, settings) -> None:
     token, _ = service.create_admin_session()
     assert service.get_admin_session(token) is not None
-    rotated = BillingService(replace(settings, admin_token="rotated-admin-token"), Database(settings.database_path))
+    rotated = BillingService(replace(settings, admin_token="rotated-admin-token"), Database(settings.database_url or settings.database_path))
     assert rotated.get_admin_session(token) is None
 
 
@@ -2475,7 +2475,7 @@ def test_rating_cursor_skips_rated_history_without_missing_events(service, setti
     assert service.rate_events(limit=2) == 1
     assert set(_rated_by_hash(service, active_id)) == {f"cursor-{index}" for index in range(5)} | {"cursor-new"}
     # A service without a cursor rescans from the start and finds nothing left to rate.
-    assert BillingService(settings, Database(settings.database_path)).rate_events() == 0
+    assert BillingService(settings, Database(settings.database_url or settings.database_path)).rate_events() == 0
 
 
 def test_rating_cursor_covers_scoped_rerate_and_new_events(service, settings) -> None:
@@ -2503,7 +2503,7 @@ def test_rating_cursor_covers_scoped_rerate_and_new_events(service, settings) ->
     rated = _rated_by_hash(service, result["version_id"])
     assert set(rated) == {f"changed-{i}" for i in range(3)} | {f"unchanged-{i}" for i in range(3)} | {"after-price-change"}
     assert all(json.loads(rated[f"changed-{i}"].calculation_json)["rates"][0] == 2_000 for i in range(3))
-    assert BillingService(settings, Database(settings.database_path)).rate_events() == 0
+    assert BillingService(settings, Database(settings.database_url or settings.database_path)).rate_events() == 0
 
 
 def test_cpamp_import_dead_letters_bad_rows_and_clamps_tokens(service, settings) -> None:

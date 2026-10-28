@@ -101,7 +101,7 @@ def upgrade() -> None:
         )
 
     gradient_id = bind.execute(
-        sa.text("select id from gradient_rules where active = 1 order by id limit 1")
+        sa.text("select id from gradient_rules where active = true order by id limit 1")
     ).scalar()
     if gradient_id is None:
         gradient_id = bind.execute(sa.text("select id from gradient_rules order by id limit 1")).scalar()
@@ -109,19 +109,19 @@ def upgrade() -> None:
         return
 
     existing_default = bind.execute(
-        sa.text("select id from upstream_account_groups where is_default = 1 order by id limit 1")
+        sa.text("select id from upstream_account_groups where is_default = true order by id limit 1")
     ).scalar()
     if existing_default is None:
         bind.execute(
             sa.text(
                 "insert into upstream_account_groups "
                 "(name, is_default, gradient_rule_id, created_at_ms, updated_at_ms) "
-                "values ('default', 1, :gradient_id, :now, :now)"
+                "values ('default', true, :gradient_id, :now, :now)"
             ),
             {"gradient_id": int(gradient_id), "now": now},
         )
         existing_default = bind.execute(
-            sa.text("select id from upstream_account_groups where is_default = 1 order by id limit 1")
+            sa.text("select id from upstream_account_groups where is_default = true order by id limit 1")
         ).scalar()
     default_id = int(existing_default)
     default_name = bind.execute(
@@ -203,7 +203,7 @@ def upgrade() -> None:
                 "fixed_cost_cents, dynamic_cost_cents, metered_amount_cents, residual_cost_cents, "
                 "member_amount_cents, surplus_cents, unallocated_cents"
                 ") values ("
-                ":cycle_id, :group_id, :group_name, :gradient_rule_id, :tiers_json, 1, "
+                ":cycle_id, :group_id, :group_name, :gradient_rule_id, :tiers_json, true, "
                 "0, 0, 0, 0, 0, 0, 0)"
             ),
             {

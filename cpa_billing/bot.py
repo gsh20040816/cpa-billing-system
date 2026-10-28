@@ -638,7 +638,7 @@ class BillingBot:
 async def run_bot() -> None:
     settings = Settings.from_env()
     asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=1, thread_name_prefix="billing-bot"))
-    db = Database(settings.database_path, pool_size=1, max_overflow=0)
+    db = Database(settings.database_url or settings.database_path, pool_size=1, max_overflow=0)
     service = BillingService(settings, db)
     try:
         service.bootstrap()
