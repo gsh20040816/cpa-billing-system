@@ -1,0 +1,47 @@
+\section{数据库表结构（数据字典）}\label{app:dictionary}
+
+本附录由 \code{tools/gen\_schema\_tex.py} 读取系统的 SQLAlchemy 模型自动生成，类型按 PostgreSQL 方言给出。“空”列中的 √ 表示允许为空；在“键”列中：
+\begin{itemize}
+  \item PK 为主键，FK 为外键，后接被引用的表；
+  \item UQ 为单列唯一约束，UQ* 表示该列参与复合唯一约束。
+\end{itemize}
+
+{\small
+\setlength{\LTpre}{0.3em}\setlength{\LTpost}{0.6em}
+\input{generated/data-dictionary.tex}
+}
+
+\section{源代码与交付物说明}
+
+\begin{table}[H]
+\centering\small
+\begin{tabularx}{\textwidth}{@{}lX@{}}
+\toprule
+路径 & 内容 \\ \midrule
+\code{cpa\_billing/models.py} & 数据库模型：表、约束、索引 \\
+\code{cpa\_billing/integrity.py} & 触发器与视图的定义和安装（SQLite / PostgreSQL）\\
+\code{cpa\_billing/services.py} & 业务服务层：同步、计价、分摊、账单、统计 \\
+\code{cpa\_billing/domain.py} & 梯度加权、最大余数法、订阅折算等纯算法 \\
+\code{cpa\_billing/web.py}, \code{bot.py}, \code{cli.py} & Web 接口、Telegram 机器人、命令行 \\
+\code{cpa\_billing/maintenance.py} & 备份与跨库复制 \\
+\code{migrations/versions/} & 17 个 Alembic 迁移脚本 \\
+\code{deployment/postgresql/roles.sql} & 数据库角色与授权 \\
+\code{scripts/benchmark\_postgresql.py} & 性能测试脚本 \\
+\code{frontend/src/} & Vue 3 前端 \\
+\code{tests/} & 后端自动化测试（含完整性与维护测试）\\
+\code{docs/course-design/} & 本报告的 \LaTeX{} 源文件、图源文件与生成工具 \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\section*{参考文献}
+\addcontentsline{toc}{section}{参考文献}
+\begin{enumerate}[label={[\arabic*]},leftmargin=2.5em]
+  \item 王珊，杜小勇，陈红．数据库系统概论（第 6 版）[M]．北京：高等教育出版社，2023．
+  \item Silberschatz A, Korth H F, Sudarshan S. Database System Concepts (7th ed.)[M]. McGraw-Hill, 2019.
+  \item PostgreSQL Global Development Group. PostgreSQL 17 Documentation: Triggers, Constraints, Privileges, Indexes[EB/OL]. https://www.postgresql.org/docs/17/
+  \item SQLAlchemy 2.1 Documentation[EB/OL]. https://docs.sqlalchemy.org/
+  \item Alembic Documentation[EB/OL]. https://alembic.sqlalchemy.org/
+  \item SQLite Documentation: CREATE TRIGGER, Partial Indexes[EB/OL]. https://www.sqlite.org/docs.html
+  \item Balinski M L, Young H P. Fair Representation: Meeting the Ideal of One Man, One Vote (2nd ed.)[M]. Brookings Institution Press, 2001.（最大余数法）
+\end{enumerate}

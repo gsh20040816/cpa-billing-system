@@ -1,0 +1,19 @@
+digraph dfd0 {
+  graph [rankdir=LR, fontname="PingFang SC", nodesep=0.5, ranksep=1.1];
+  node [fontname="PingFang SC", fontsize=10];
+  edge [fontname="PingFang SC", fontsize=9];
+
+  member [label="成员用户", shape=box];
+  admin [label="管理员", shape=box];
+  cpamp [label="用量库 CPAMP", shape=box];
+  cpa [label="API 网关 CPA", shape=box];
+  system [label="0\n大模型 API 用量统计\n与费用分摊系统", shape=circle, style=filled, fillcolor="#e6edf9", width=1.9, fixedsize=true];
+
+  cpamp -> system [label="调用记录\n模型价格"];
+  cpa -> system [label="密钥清单\n上游账号与额度"];
+  system -> cpa [label="密钥增删"];
+  member -> system [label="注册 / 登录\n密钥操作\n查询条件"];
+  system -> member [label="API 密钥\n用量统计\n月度账单"];
+  admin -> system [label="价格 / 规则 / 成本\n账期操作\n调整与转移"];
+  system -> admin [label="账期预览与账单\n对账结果\n审计日志"];
+}

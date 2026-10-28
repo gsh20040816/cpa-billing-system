@@ -1,0 +1,31 @@
+graph er {
+  graph [layout=neato, overlap=false, splines=true, sep="+14", fontname="PingFang SC", start=5];
+  node [fontname="PingFang SC", fontsize=10];
+  edge [fontname="PingFang SC", fontsize=9, len=1.25];
+
+  node [shape=box, style=filled, fillcolor="#e6edf9", color="#3d4f75"];
+  user [label="用户"]; key [label="API 密钥"]; raw [label="调用记录"]; version [label="价格版本"]; price [label="模型价格"];
+  pool [label="资源池"]; cycle [label="账期"]; statement [label="账单"]; line [label="账单明细"];
+  group [label="上游分组"]; account [label="上游账号"]; rule [label="梯度规则"]; adjust [label="账单调整"];
+
+  node [shape=diamond, style=filled, fillcolor="#fdf3e1", color="#8a6a2f", fontsize=9];
+  owns [label="归属期"]; issues [label="使用"]; rated [label="计价"]; contains [label="包含"];
+  adopts [label="采用"]; bills [label="出账"]; has_lines [label="组成"]; assigned [label="归入"];
+  uses_rule [label="遵循"]; snapshot [label="成本快照"]; adjusts [label="调整"];
+
+  node [shape=ellipse, style=solid, color="#6b7280", fontsize=8.5];
+  owns_from [label="生效时间"]; owns_to [label="失效时间"]; rated_cost [label="等效费用"]; rated_owner [label="归属用户"];
+  snap_cost [label="成本金额"];
+
+  user -- owns [label="1"]; owns -- key [label="N"]; owns -- owns_from; owns -- owns_to;
+  key -- issues [label="1"]; issues -- raw [label="N"];
+  version -- contains [label="1"]; contains -- price [label="N"];
+  raw -- rated [label="M"]; rated -- version [label="N"]; rated -- pool [label="N:1"]; rated -- rated_cost; rated -- rated_owner;
+  cycle -- adopts [label="N"]; adopts -- version [label="1"];
+  cycle -- bills [label="1"]; bills -- statement [label="N"]; user -- bills [label="1"];
+  statement -- has_lines [label="1"]; has_lines -- line [label="N"]; line -- pool [label="N:1"];
+  account -- assigned [label="N"]; assigned -- group [label="1"];
+  group -- uses_rule [label="N"]; uses_rule -- rule [label="1"];
+  cycle -- snapshot [label="M"]; snapshot -- account [label="N"]; snapshot -- snap_cost;
+  cycle -- adjusts [label="1"]; adjusts -- adjust [label="N"]; user -- adjusts [label="1"];
+}

@@ -51,8 +51,8 @@ def upgrade() -> None:
                 "model_price_rules",
                 sa.Column(name, sa.Boolean(), nullable=False, server_default=sa.true() if default else sa.false()),
             )
-    connection.execute(sa.text("update model_price_rules set cache_read_configured = 1 where cache_read_nano_per_token != 0"))
-    connection.execute(sa.text("update model_price_rules set cache_creation_configured = 1 where cache_creation_nano_per_token != 0"))
+    connection.execute(sa.text("update model_price_rules set cache_read_configured = true where cache_read_nano_per_token != 0"))
+    connection.execute(sa.text("update model_price_rules set cache_creation_configured = true where cache_creation_nano_per_token != 0"))
 
     if not inspector.has_table("gradient_rules"):
         op.create_table(
@@ -87,11 +87,11 @@ def upgrade() -> None:
         result = connection.execute(
             sa.text(
                 "insert into gradient_rules(name,description,tiers_json,active,created_at_ms,updated_at_ms) "
-                "values(:name,:description,:tiers,1,:now,:now)"
+                "values(:name,:description,:tiers,true,:now,:now) returning id"
             ),
             {"name": "default-gradient", "description": "Default progressive allocation rule", "tiers": default_json, "now": now},
         )
-        default_id = result.lastrowid
+        default_id = result.scalar_one()
     cycles = connection.execute(sa.text("select id,name,tiers_json from billing_cycles order by id")).mappings().all()
     for cycle in cycles:
         tiers = cycle["tiers_json"] or default_json
@@ -106,11 +106,11 @@ def upgrade() -> None:
             result = connection.execute(
                 sa.text(
                     "insert into gradient_rules(name,description,tiers_json,active,created_at_ms,updated_at_ms) "
-                    "values(:name,:description,:tiers,1,:now,:now)"
+                    "values(:name,:description,:tiers,true,:now,:now) returning id"
                 ),
                 {"name": name, "description": "Imported from legacy billing cycle", "tiers": tiers, "now": now},
             )
-            rule_id = result.lastrowid
+            rule_id = result.scalar_one()
         connection.execute(
             sa.text("update billing_cycles set gradient_rule_id=:rule_id where id=:cycle_id"),
             {"rule_id": rule_id, "cycle_id": cycle["id"]},

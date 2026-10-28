@@ -1,0 +1,20 @@
+digraph modules {
+  graph [rankdir=TB, fontname="PingFang SC", nodesep=0.12, ranksep=0.45, splines=ortho];
+  node [fontname="PingFang SC", fontsize=9.5, shape=box, style="filled", fillcolor="#f5f7fb", color="#5b6b88"];
+  edge [arrowhead=none, color="#5b6b88"];
+
+  root [label="大模型 API 用量统计与费用分摊系统", fillcolor="#e6edf9", fontsize=11];
+  m1 [label="用户与\n认证"]; m2 [label="密钥\n管理"]; m3 [label="用量\n采集计价"]; m4 [label="价格与\n规则"]; m5 [label="账期\n与账单"]; m6 [label="统计\n查询"]; m7 [label="系统\n管理"];
+  root -> {m1 m2 m3 m4 m5 m6 m7};
+
+  node [fontsize=8.5, fillcolor="white", width=0.25];
+  a1 [label="Bot\n注册"]; a2 [label="密钥\n登录"]; a3 [label="管理员\n登录"]; a4 [label="权限\n分级"];
+  b1 [label="新增\n命名"]; b2 [label="重置\n吊销"]; b3 [label="归属\n转移"]; b4 [label="按量\n倍率"];
+  c1 [label="增量\n同步"]; c2 [label="去重\n死信"]; c3 [label="计价\n重算"];
+  d1 [label="价格\n版本"]; d2 [label="梯度\n规则"]; d3 [label="上游\n成本"];
+  e1 [label="账期\n创建"]; e2 [label="预览\n关账"]; e3 [label="调整\n手工量"];
+  f1 [label="总览\n排行"]; f2 [label="请求\n明细"]; f3 [label="站点\n状态"];
+  g1 [label="审计\n对账"]; g2 [label="备份\n迁移"];
+  m1 -> {a1 a2 a3 a4}; m2 -> {b1 b2 b3 b4}; m3 -> {c1 c2 c3}; m4 -> {d1 d2 d3};
+  m5 -> {e1 e2 e3}; m6 -> {f1 f2 f3}; m7 -> {g1 g2};
+}

@@ -1,0 +1,118 @@
+\section{数据库详细设计}
+
+\subsection{逻辑结构设计}
+
+\subsubsection{E-R 图向关系模式的转换}
+
+转换遵循以下规则：每个实体转换为一个关系，实体标识符成为主键；1:N 联系把“1”端主键作为“N”端的外键；带属性的 M:N 联系和带时间属性的 1:N 联系转换为独立关系。为便于阅读，下面用下划线表示主键，用 \# 表示外键，并省略次要属性。
+
+\begin{itemize}
+  \item 用户（\underline{用户编号}，用户名，是否管理员，注册时间，……）
+  \item API 密钥（\underline{密钥编号}，密钥摘要，登录指纹，脱敏值，状态，\#当前归属用户，计费倍率，……）
+  \item 归属期（\underline{归属期编号}，\#密钥编号，\#用户编号，生效时间，失效时间，来源，原因）
+  \item 调用记录（\underline{记录编号}，\#数据源，源记录号，事件摘要，发生时间，模型，服务档位，密钥摘要，上游账号，各类 Token，是否失败，延迟，……）
+  \item 价格版本（\underline{版本编号}，版本名，状态，来源，生效时间）
+  \item 模型价格（\underline{\#版本编号，模型名}，默认四价，Priority 四价，Flex 四价，上下文分段价）
+  \item 计价记录（\underline{编号}，\#记录编号，\#版本编号，\#资源池，\#归属用户，发生时间，等效费用，计费档位，计算明细）
+  \item 上游分组（\underline{分组编号}，名称，是否默认，\#梯度规则）
+  \item 上游账号成本配置（\underline{上游账号}，\#分组编号，订阅方式，订阅起止，每期费用，汇率）
+  \item 账期（\underline{账期编号}，账期名，起止时间，状态，\#价格版本，\#梯度规则，梯度规则快照，关账时间，关账人）
+  \item 账期上游成本快照（\underline{\#账期编号，上游账号}，账号名，类型，成本金额，汇率，分组快照，订阅快照，……）
+  \item 账期分组结算（\underline{\#账期编号，分组编号}，分组名快照，梯度快照，固定成本，按量成本，待分摊成本，……）
+  \item 账单（\underline{账单编号}，\#账期编号，\#用户编号，实际用量，加权用量，应付金额，调整金额，是否定稿）
+  \item 账单明细（\underline{明细编号}，\#账单编号，\#资源池，分组，实际用量，加权用量，金额，密钥数）
+  \item 账单调整（\underline{编号}，\#账期编号，\#用户编号，金额，原因，操作人，时间）
+\end{itemize}
+
+完整的逻辑模式共 32 张基本表，按主题分为用户与密钥（6 张）、调用记录（5 张）、价格（5 张）、分摊（3 张）、账单（9 张）、安全与审计（4 张）。核心表之间的主外键关系如图~\ref{fig:schema} 所示，每张表的全部字段见附录 A。
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=\textwidth,height=0.62\textheight,keepaspectratio]{schema.pdf}
+  \caption{核心关系模式与参照关系（由模型元数据自动生成）}\label{fig:schema}
+\end{figure}
+
+\subsubsection{规范化分析}
+
+以几张代表性的关系为例分析函数依赖。
+
+\paragraph{调用记录 raw\_usage\_events}
+候选键为 \code{id}、\code{(source\_id, source\_event\_id)}、\code{(source\_id, event\_hash)}，其余属性完全依赖于每个候选键；“模型 → 价格”不成立（价格还依赖版本），故无部分与传递依赖，属于 BCNF。
+
+\paragraph{模型价格 model\_price\_rules}
+各单价依赖于整个主键 \code{(pricing\_version\_id, model)}，属于 BCNF。
+
+\paragraph{归属期 key\_ownership\_periods}
+在“同一密钥归属期互不重叠”的约束下，\code{(api\_key\_id, valid\_from\_ms)} 也是候选键；没有非主属性依赖于非键属性，属于 3NF。
+
+\paragraph{账单 statements}
+\code{amount\_cents} 在数值上等于明细与调整之和，但关账后它代表“已通知并结清的金额”这一事实，不应随调整记录的误删而改变。保留该属性，并由触发器冻结定稿账单及明细，避免更新异常。
+
+\paragraph{快照属性}
+\code{cycle\_groups.group\_name}、\code{billing\_cycles.tiers\_json} 等看似重复主数据，似乎构成传递依赖“(账期, 分组) → 分组 → 分组名”。但分组可以改名或删除、规则可以修改，“分组编号 → 分组名”跨账期并不成立；快照记录的是关账时的取值，依赖于 \code{(cycle\_id, group\_id)} 整体，不构成传递依赖。
+
+\paragraph{计价记录 rated\_events}
+\code{occurred\_at\_ms} 可由 \code{raw\_event\_id} 推出，是为“版本 + 时间区间”聚合查询有意保留的冗余（见第 7 章 Q1、Q2）；调用记录不可修改，故不会不一致。\code{telegram\_user\_id} 则是计价时按归属期固化的事实，并非冗余。
+
+综上，全部基本表达到 3NF，多数达到 BCNF；仅有的冗余是历史快照或只读数据上的性能冗余，一致性由约束与触发器保证。
+
+\subsection{物理结构设计}
+
+\subsubsection{数据类型选择}
+
+\begin{itemize}
+  \item 所有时间统一为 \code{BIGINT} 毫秒时间戳，不使用 \code{TIMESTAMP}：一是可以直接与用量库对齐，二是避免时区在两种数据库中的语义差异。按时区展示由应用层和视图完成。
+  \item 金额与费用使用 \code{BIGINT} 定点整数（见 3.4.4 节），倍率与汇率使用 \code{BIGINT} 百万分之一。
+  \item 结构多变、只整体读写的数据（梯度规则、上下文分段价、计算明细、审计前后值）用 \code{TEXT} 存 JSON，不参与查询条件。
+  \item 摘要类字段使用 \code{VARCHAR(64)}，名称类字段按业务上限设置长度。
+\end{itemize}
+
+\subsubsection{索引设计}
+
+PostgreSQL 中共建立 61 个索引，其中主键 32 个，其余为唯一约束、外键查询和统计查询所需的索引。主要的非主键索引如表~\ref{tab:indexes} 所示。
+
+\begin{longtable}{@{}p{0.3\textwidth}p{0.3\textwidth}p{0.32\textwidth}@{}}
+\caption{主要索引设计}\label{tab:indexes}\\
+\toprule 索引 & 列 & 服务的查询 \\ \midrule\endfirsthead
+\toprule 索引 & 列 & 服务的查询 \\ \midrule\endhead
+唯一 (source\_id, source\_event\_id) & raw\_usage\_events & 同步去重、死信重试定位 \\
+唯一 (source\_id, event\_hash) & raw\_usage\_events & 同一事件重复导出时的去重 \\
+idx\_raw\_events\_time & (occurred\_at\_ms) & 站点状态、时间窗统计 \\
+idx\_raw\_events\_key\_time & (api\_key\_hash, occurred\_at\_ms) & 某密钥请求明细，按时间倒序分页 \\
+idx\_raw\_events\_missing\_* & (source\_id, source\_event\_id) WHERE 列 IS NULL & 部分索引：只索引待回填的行，回填完成后几乎不占空间 \\
+唯一 (raw\_event\_id, pricing\_version\_id) & rated\_events & 计价幂等（冲突即跳过）\\
+idx\_rated\_version\_time\_owner\_pool & (version, time, user, pool) & 账期聚合：版本 + 时间区间 + 分组键 \\
+idx\_rated\_user\_time & (telegram\_user\_id, occurred\_at\_ms) & 单用户用量查询 \\
+idx\_rated\_cycle & (occurred\_at\_ms, pool\_id, user) & 按时间与资源池的聚合 \\
+idx\_ownership\_key\_period & (api\_key\_id, valid\_from\_ms, valid\_to\_ms) & 某时刻密钥归属的查找 \\
+idx\_api\_keys\_owner\_status & (current\_owner\_id, status) & 用户的有效密钥列表 \\
+uq\_pricing\_versions\_single\_active & (status) WHERE status = 'active' & 部分唯一索引：至多一个生效版本 \\
+uq\_upstream\_account\_groups\_single\_default & (is\_default) WHERE is\_default & 部分唯一索引：至多一个默认分组 \\
+idx\_manual\_usage\_cycle\_group\_pool\_user & (cycle, group, pool, user) & 账期手工用量汇总 \\
+\bottomrule
+\end{longtable}
+
+索引设计遵循三条原则：（1）复合索引的列顺序为“等值条件列在前、范围条件列在后、分组列随后”，例如 \code{(pricing\_version\_id, occurred\_at\_ms, telegram\_user\_id, pool\_id)}；（2）写入量最大的两张表（调用记录、计价记录）的索引控制在五六个以内，避免拖慢同步；（3）用部分索引表达“只关心少数行”的需求，既省空间又能表达约束。
+
+\subsubsection{视图设计}
+
+为报表与只读角色提供 5 个视图。视图隐藏了密钥摘要、登录指纹等敏感列，并把整数金额换算为元和美元。
+
+\begin{table}[H]
+\centering\small
+\caption{视图}
+\begin{tabularx}{\textwidth}{@{}lX@{}}
+\toprule
+视图 & 内容 \\ \midrule
+v\_user\_cycle\_bills & 每位用户每个账期的账单：实际用量、加权用量、调整、应付金额、是否定稿 \\
+v\_statement\_line\_details & 账单明细及其资源池名、分组名 \\
+v\_cycle\_group\_summary & 每个账期每个分组的成本核对：总成本、按量收入、待分摊、已分摊、盈余、未分摊 \\
+v\_daily\_user\_model\_usage & 生效价格版本下按日（东八区）、用户、模型统计的请求数、失败数、Token 与费用 \\
+v\_api\_key\_owners & 密钥与当前归属用户，不含摘要与指纹 \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsubsection{存储与运行参数}
+
+PostgreSQL 部署时，调用记录和计价记录这两张大表保持默认的 \code{fillfactor = 100}：它们只追加、几乎不更新，页面可以填满。后台任务批量写入后定期依赖 autovacuum 更新统计信息。单机 SQLite 部署时，连接级设置包括：WAL 日志模式（读写并发）、\code{foreign\_keys=on}（启用参照完整性检查）、\code{synchronous=normal}，以及让大排序的临时数据落盘的 \code{temp\_store=file}。

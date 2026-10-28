@@ -8,6 +8,12 @@ class Base(DeclarativeBase):
     pass
 
 
+TOKEN_COLUMNS = (
+    "input_tokens", "output_tokens", "reasoning_tokens", "cached_tokens",
+    "cache_tokens", "cache_read_tokens", "cache_creation_tokens", "total_tokens",
+)
+
+
 class CPAMPSource(Base):
     __tablename__ = "cpamp_sources"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -31,11 +37,15 @@ class RawUsageEvent(Base):
     __table_args__ = (
         UniqueConstraint("source_id", "source_event_id"),
         UniqueConstraint("source_id", "event_hash"),
+        *(CheckConstraint(f"{column} >= 0", name=f"ck_raw_usage_events_{column}_nonnegative") for column in TOKEN_COLUMNS),
         Index("idx_raw_events_time", "occurred_at_ms"),
         Index("idx_raw_events_key_time", "api_key_hash", "occurred_at_ms"),
         # Partial indexes: CPAMP backfills look up rows not yet checked (migration 0016).
         *(
-            Index(f"idx_raw_events_missing_{column}", "source_id", "source_event_id", sqlite_where=text(f"{column} IS NULL"))
+            Index(
+                f"idx_raw_events_missing_{column}", "source_id", "source_event_id",
+                sqlite_where=text(f"{column} IS NULL"), postgresql_where=text(f"{column} IS NULL"),
+            )
             for column in ("reasoning_effort", "request_service_tier", "response_service_tier")
         ),
     )
@@ -120,7 +130,11 @@ class AllowedChat(Base):
 
 class APIKey(Base):
     __tablename__ = "api_keys"
-    __table_args__ = (Index("idx_api_keys_owner_status", "current_owner_id", "status"),)
+    __table_args__ = (
+        Index("idx_api_keys_owner_status", "current_owner_id", "status"),
+        CheckConstraint("status IN ('active', 'unowned', 'revoked', 'retired')", name="ck_api_keys_status"),
+        CheckConstraint("billing_multiplier_ppm IS NULL OR billing_multiplier_ppm >= 0", name="ck_api_keys_multiplier_nonnegative"),
+    )
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     cpamp_hash: Mapped[str] = mapped_column(String(64), unique=True)
     login_fingerprint: Mapped[str | None] = mapped_column(String(64), unique=True)
@@ -137,7 +151,10 @@ class APIKey(Base):
 
 class KeyOwnershipPeriod(Base):
     __tablename__ = "key_ownership_periods"
-    __table_args__ = (Index("idx_ownership_key_period", "api_key_id", "valid_from_ms", "valid_to_ms"),)
+    __table_args__ = (
+        Index("idx_ownership_key_period", "api_key_id", "valid_from_ms", "valid_to_ms"),
+        CheckConstraint("valid_to_ms IS NULL OR valid_to_ms >= valid_from_ms", name="ck_key_ownership_periods_order"),
+    )
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     api_key_id: Mapped[int] = mapped_column(ForeignKey("api_keys.id"))
     telegram_user_id: Mapped[int] = mapped_column(ForeignKey("telegram_users.telegram_user_id"))
@@ -151,6 +168,9 @@ class KeyOwnershipPeriod(Base):
 
 class KeyActionRequest(Base):
     __tablename__ = "key_action_requests"
+    __table_args__ = (
+        CheckConstraint("status IN ('pending', 'processing', 'completed')", name="ck_key_action_requests_status"),
+    )
     token_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
     telegram_user_id: Mapped[int] = mapped_column(ForeignKey("telegram_users.telegram_user_id"))
     action: Mapped[str] = mapped_column(String(20))
@@ -164,6 +184,14 @@ class KeyActionRequest(Base):
 
 class PricingVersion(Base):
     __tablename__ = "pricing_versions"
+    __table_args__ = (
+        CheckConstraint("status IN ('draft', 'active', 'retired')", name="ck_pricing_versions_status"),
+        # At most one version prices new usage at any time.
+        Index(
+            "uq_pricing_versions_single_active", "status", unique=True,
+            sqlite_where=text("status = 'active'"), postgresql_where=text("status = 'active'"),
+        ),
+    )
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String(80), unique=True)
     status: Mapped[str] = mapped_column(String(20), default="draft")
@@ -183,6 +211,10 @@ class PricingRerateScope(Base):
 
 class ModelPriceRule(Base):
     __tablename__ = "model_price_rules"
+    __table_args__ = tuple(
+        CheckConstraint(f"{column} >= 0", name=f"ck_model_price_rules_{column}_nonnegative")
+        for column in ("input_nano_per_token", "output_nano_per_token", "cache_read_nano_per_token", "cache_creation_nano_per_token")
+    )
     pricing_version_id: Mapped[int] = mapped_column(ForeignKey("pricing_versions.id"), primary_key=True)
     model: Mapped[str] = mapped_column(String(160), primary_key=True)
     input_nano_per_token: Mapped[int] = mapped_column(BigInteger)
@@ -239,6 +271,7 @@ class RatedEvent(Base):
         ),
         Index("idx_rated_cycle", "occurred_at_ms", "pool_id", "telegram_user_id"),
         Index("idx_rated_user_time", "telegram_user_id", "occurred_at_ms"),
+        CheckConstraint("rated_weight_nano_usd >= 0", name="ck_rated_events_weight_nonnegative"),
     )
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     raw_event_id: Mapped[int] = mapped_column(ForeignKey("raw_usage_events.id"))
@@ -266,6 +299,13 @@ class GradientRule(Base):
 
 class UpstreamAccountGroup(Base):
     __tablename__ = "upstream_account_groups"
+    __table_args__ = (
+        # Exactly one group receives accounts that were never assigned.
+        Index(
+            "uq_upstream_account_groups_single_default", "is_default", unique=True,
+            sqlite_where=text("is_default"), postgresql_where=text("is_default"),
+        ),
+    )
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String(80), unique=True)
     is_default: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -276,6 +316,14 @@ class UpstreamAccountGroup(Base):
 
 class UpstreamAccountConfig(Base):
     __tablename__ = "upstream_account_configs"
+    __table_args__ = (
+        CheckConstraint("period_cost_cents IS NULL OR period_cost_cents >= 0", name="ck_upstream_account_configs_cost_nonnegative"),
+        CheckConstraint("rate_ppm IS NULL OR rate_ppm >= 0", name="ck_upstream_account_configs_rate_nonnegative"),
+        CheckConstraint(
+            "period_end_at_ms IS NULL OR period_start_at_ms IS NULL OR period_end_at_ms > period_start_at_ms",
+            name="ck_upstream_account_configs_period_order",
+        ),
+    )
     account_id: Mapped[str] = mapped_column(String(200), primary_key=True)
     group_id: Mapped[int] = mapped_column(ForeignKey("upstream_account_groups.id"))
     subscription_mode: Mapped[str | None] = mapped_column(String(20))
@@ -290,6 +338,10 @@ class UpstreamAccountConfig(Base):
 
 class BillingCycle(Base):
     __tablename__ = "billing_cycles"
+    __table_args__ = (
+        CheckConstraint("status IN ('open', 'preview', 'closed')", name="ck_billing_cycles_status"),
+        CheckConstraint("end_at_ms > start_at_ms", name="ck_billing_cycles_period_order"),
+    )
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String(80), unique=True)
     start_at_ms: Mapped[int] = mapped_column(BigInteger)
@@ -307,6 +359,7 @@ class BillingCycle(Base):
 
 class CyclePoolCost(Base):
     __tablename__ = "cycle_pool_costs"
+    __table_args__ = (CheckConstraint("fixed_cost_cents >= 0", name="ck_cycle_pool_costs_nonnegative"),)
     cycle_id: Mapped[int] = mapped_column(ForeignKey("billing_cycles.id"), primary_key=True)
     pool_id: Mapped[int] = mapped_column(ForeignKey("resource_pools.id"), primary_key=True)
     fixed_cost_cents: Mapped[int] = mapped_column(BigInteger)
@@ -369,6 +422,12 @@ class Statement(Base):
 
 class StatementLine(Base):
     __tablename__ = "statement_lines"
+    __table_args__ = (
+        CheckConstraint(
+            "actual_weight_nano_usd >= 0 AND billed_weight_nano_usd >= 0 AND amount_cents >= 0 AND api_key_count >= 0",
+            name="ck_statement_lines_nonnegative",
+        ),
+    )
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     statement_id: Mapped[int] = mapped_column(ForeignKey("statements.id"))
     pool_id: Mapped[int] = mapped_column(ForeignKey("resource_pools.id"))
@@ -381,7 +440,13 @@ class StatementLine(Base):
 
 class MeteredKeyCharge(Base):
     __tablename__ = "metered_key_charges"
-    __table_args__ = (UniqueConstraint("cycle_id", "pool_id", "api_key_id"),)
+    __table_args__ = (
+        UniqueConstraint("cycle_id", "pool_id", "api_key_id"),
+        CheckConstraint(
+            "actual_weight_nano_usd >= 0 AND multiplier_ppm >= 0 AND amount_cents >= 0",
+            name="ck_metered_key_charges_nonnegative",
+        ),
+    )
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     cycle_id: Mapped[int] = mapped_column(ForeignKey("billing_cycles.id"))
     pool_id: Mapped[int] = mapped_column(ForeignKey("resource_pools.id"))

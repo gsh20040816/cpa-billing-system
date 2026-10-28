@@ -47,6 +47,24 @@ Apply database migrations before starting a new application version:
 alembic upgrade head
 ```
 
+## Database
+
+SQLite at `BILLING_DATABASE_PATH` remains the default. Setting `BILLING_DATABASE_URL` (for example `postgresql+psycopg://billing_app:...@db/billing`) uses PostgreSQL instead; the application code, migrations and tests are identical on both. `BILLING_DATABASE_PATH`'s directory still holds the service lock files.
+
+Billing invariants are enforced by the database, not only the services: CHECK constraints, single-active partial unique indexes, and triggers that keep `audit_logs` append-only, freeze closed cycles, final statements and the prices they used, make usage and rated events immutable, and reject overlapping key ownership. Reporting views (`v_user_cycle_bills`, `v_statement_line_details`, `v_cycle_group_summary`, `v_daily_user_model_usage`, `v_api_key_owners`) hide key hashes. Migration `0017` installs these on existing databases; it skips a partial unique index with a warning when historical rows already violate it. Every service start reinstalls missing triggers and views, which SQLite table rebuilds drop.
+
+```bash
+cpa-billing backup /backups/billing-$(date +%F).sqlite   # SQLite online backup, or pg_dump -Fc for PostgreSQL
+cpa-billing copy-database postgresql+psycopg://...      # copy a migrated database into an empty one
+psql -d billing -v app_password="'...'" -v report_password="'...'" -v auditor_password="'...'" \
+     -f deployment/postgresql/roles.sql                  # least-privilege PostgreSQL roles
+python scripts/benchmark_postgresql.py postgresql+psycopg://.../bench --report bench.md
+```
+
+PostgreSQL backups need `pg_dump` on the host running the command; the image does not include it. Run the backend suite against PostgreSQL with `BILLING_TEST_DATABASE_URL=postgresql+psycopg://.../billing_test pytest`; each test recreates the `public` schema of that database.
+
+The course-design report lives in `docs/course-design` (XeLaTeX + Graphviz; `make` writes `build/report.pdf`).
+
 ## Docker deployment
 
 Pushes to `main` publish `ghcr.io/gsh20040816/cpa-billing-system:latest`. Version tags matching `v*` also publish a matching image tag, and every published image receives an immutable `sha-<commit>` tag. Pull requests build the image without publishing it.

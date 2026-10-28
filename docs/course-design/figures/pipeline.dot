@@ -1,0 +1,10 @@
+digraph pipeline {
+  graph [rankdir=LR, fontname="PingFang SC", nodesep=0.25, ranksep=0.35];
+  node [fontname="PingFang SC", fontsize=9.5, shape=box, style="rounded,filled", fillcolor="#f5f7fb", color="#5b6b88"];
+  edge [fontname="PingFang SC", fontsize=8.5, color="#5b6b88"];
+
+  s1 [label="调用记录\n(Token)"]; s2 [label="选价\n版本·模型·档位·上下文段"]; s3 [label="等效费用\n纳美元"];
+  s4 [label="按调用时刻\n归属用户"]; s5 [label="账期聚合\n用户×分组×资源池"]; s6 [label="梯度加权\n累进倍率"];
+  s7 [label="分组成本\n固定+按量−按量密钥"]; s8 [label="最大余数法\n分到分"]; s9 [label="账单与明细\n关账定稿", fillcolor="#e6edf9"];
+  s1 -> s2 -> s3 -> s4 -> s5 -> s6 -> s8 -> s9; s7 -> s8;
+}

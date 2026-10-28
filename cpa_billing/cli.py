@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import time
 from pathlib import Path
 
@@ -13,9 +14,15 @@ from .migrate import migrate_legacy_bot
 from .services import BillingService
 
 
+def configured_database() -> Database:
+    """The billing database from the environment, without requiring service secrets."""
+    url = os.getenv("BILLING_DATABASE_URL", "").strip()
+    return Database(url or Path(os.getenv("BILLING_DATABASE_PATH", "/data/billing.sqlite")), pool_size=2, max_overflow=0)
+
+
 def build() -> tuple[Settings, BillingService]:
     settings = Settings.from_env()
-    database = Database(settings.database_path)
+    database = Database(settings.database_url or settings.database_path)
     service = BillingService(settings, database)
     service.bootstrap()
     return settings, service
@@ -71,6 +78,11 @@ def main() -> None:
     reprice.add_argument("--reason", required=True)
     sub.add_parser("sync-keys")
     sub.add_parser("bot")
+    backup = sub.add_parser("backup", help="write a consistent snapshot of the billing database")
+    backup.add_argument("destination", type=Path)
+    copy = sub.add_parser("copy-database", help="copy all billing data into an empty, migrated database")
+    copy.add_argument("target_url")
+    copy.add_argument("--batch-size", type=int, default=5000)
     serve = sub.add_parser("serve"); serve.add_argument("--host", default="0.0.0.0"); serve.add_argument("--port", type=int, default=18417)
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -87,9 +99,18 @@ def main() -> None:
         from .web import create_app
         uvicorn.run(create_app(), host=args.host, port=args.port, proxy_headers=True)
         return
+    if args.command == "backup":
+        from .maintenance import backup_database
+        print("backup written", backup_database(configured_database(), args.destination))
+        return
+    if args.command == "copy-database":
+        from .maintenance import copy_database
+        print(json.dumps(copy_database(configured_database(), Database(args.target_url, pool_size=2, max_overflow=0),
+                                       args.batch_size)))
+        return
     settings, service = build()
     if args.command == "init":
-        print("initialized", settings.database_path)
+        print("initialized", service.db.url)
     elif args.command == "sync":
         worker(service, settings.worker_interval_seconds, args.once)
     elif args.command == "migrate-legacy":

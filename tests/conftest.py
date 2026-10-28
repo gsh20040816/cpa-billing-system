@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from pathlib import Path
 
 import pytest
+
+from sqlalchemy import create_engine, text
 
 from cpa_billing.config import Settings
 from cpa_billing.database import Database
@@ -38,8 +41,22 @@ def create_cpamp(path: Path) -> None:
     db.commit(); db.close()
 
 
+TEST_DATABASE_URL = os.getenv("BILLING_TEST_DATABASE_URL", "").strip() or None
+
+
+def reset_test_database(url: str) -> None:
+    """Give each test an empty public schema on a server database."""
+    engine = create_engine(url)
+    with engine.begin() as connection:
+        connection.execute(text("DROP SCHEMA IF EXISTS public CASCADE"))
+        connection.execute(text("CREATE SCHEMA public"))
+    engine.dispose()
+
+
 @pytest.fixture
 def settings(tmp_path: Path) -> Settings:
+    if TEST_DATABASE_URL:
+        reset_test_database(TEST_DATABASE_URL)
     cpamp = tmp_path / "usage.sqlite"
     create_cpamp(cpamp)
     return Settings(database_path=tmp_path / "billing.sqlite", cpamp_database_path=cpamp, cpamp_source_name="test",
@@ -48,7 +65,8 @@ def settings(tmp_path: Path) -> Settings:
                     key_pepper="pepper", session_secret="session", admin_token="admin-secret-token", telegram_token="token",
                     admin_user_ids=frozenset({1}), allowed_group_ids=frozenset({-100}), public_base_url="https://billing.example",
                     api_key_prefix="sk-cpa", timezone="Asia/Shanghai", worker_interval_seconds=1,
-                    action_ttl_seconds=600, session_ttl_seconds=3600, sub2_state_file=tmp_path / "sub2.json", sub2_postgres_dsn=None)
+                    action_ttl_seconds=600, session_ttl_seconds=3600, sub2_state_file=tmp_path / "sub2.json", sub2_postgres_dsn=None,
+                    database_url=TEST_DATABASE_URL)
 
 
 @pytest.fixture(autouse=True)
@@ -63,7 +81,7 @@ def block_external_management_requests(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture
 def service(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> BillingService:
-    result = BillingService(settings, Database(settings.database_path))
+    result = BillingService(settings, Database(settings.database_url or settings.database_path))
     monkeypatch.setattr(result.cpa, "list_keys", lambda: [])
     monkeypatch.setattr(result.cpa, "add_key", lambda _: None)
     monkeypatch.setattr(result.cpa, "remove_key_hash", lambda _: None)

@@ -101,10 +101,11 @@ def test_bot_database_pool_and_disk_temporaries(settings):
     from sqlalchemy.exc import TimeoutError
     from cpa_billing.database import Database
 
-    db = Database(settings.database_path, pool_size=1, max_overflow=0, pool_timeout=0)
+    db = Database(settings.database_url or settings.database_path, pool_size=1, max_overflow=0, pool_timeout=0)
     try:
         with db.engine.connect() as connection:
-            assert connection.exec_driver_sql("pragma temp_store").scalar_one() == 1
+            if db.dialect == "sqlite":
+                assert connection.exec_driver_sql("pragma temp_store").scalar_one() == 1
             with pytest.raises(TimeoutError):
                 # With a connection already in use, another must wait rather
                 # than silently create an overflow connection.

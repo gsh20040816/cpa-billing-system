@@ -20,11 +20,11 @@ def upgrade() -> None:
         name = f"idx_raw_events_missing_{column}"
         if name not in existing:
             op.create_index(name, "raw_usage_events", ["source_id", "source_event_id"],
-                            sqlite_where=sa.text(f"{column} IS NULL"))
+                            sqlite_where=sa.text(f"{column} IS NULL"), postgresql_where=sa.text(f"{column} IS NULL"))
     # Imports now clamp negative CPAMP token counts; rating already treated them as zero.
     op.execute(
         "UPDATE raw_usage_events SET "
-        + ", ".join(f"{column} = max({column}, 0)" for column in TOKEN_COLUMNS)
+        + ", ".join(f"{column} = CASE WHEN {column} < 0 THEN 0 ELSE {column} END" for column in TOKEN_COLUMNS)
         + " WHERE " + " OR ".join(f"{column} < 0" for column in TOKEN_COLUMNS)
     )
 

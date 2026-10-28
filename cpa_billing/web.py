@@ -399,7 +399,7 @@ class WebAuth:
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or Settings.from_env()
-    database = Database(settings.database_path)
+    database = Database(settings.database_url or settings.database_path)
     service = BillingService(settings, database)
     service.bootstrap()
     app = FastAPI(title="CPA Billing", docs_url=None, redoc_url=None)
